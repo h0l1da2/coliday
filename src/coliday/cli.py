@@ -10,7 +10,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import config, gitops, jobs, members, projects, worker
+from coliday import config, gitops, jobs, members, projects, team, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import RESULT, EventRow, Job, Store
 
@@ -53,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("-C", "--dir", default=".", help="프로젝트 디렉토리 (기본: 현재 디렉토리)")
     run.add_argument("--no-worktree", action="store_true", help="worktree 없이 프로젝트 디렉토리에서 직접 작업")
     run.add_argument("-d", "--detach", action="store_true", help="시작만 하고 바로 돌아오기")
-    run.add_argument("--model", help="이 작업만 쓸 팀장 모델 (예: opus, sonnet). 기본: coliday model 설정")
+    run.add_argument("--model", help="이 작업만 쓸 팀장 에이전트·모델 (예: codex, claude:opus). 기본: coliday model 설정")
     run.set_defaults(func=_cmd_run)
 
     cont = sub.add_parser("continue", help="끝난 작업에 이어서 시키기 (같은 세션·같은 작업 디렉토리)")
@@ -69,9 +69,9 @@ def _parser() -> argparse.ArgumentParser:
     proj.add_argument("--name", help="add: 목록에 보일 이름 (기본: 폴더 이름). 이미 연결된 디렉토리면 이름만 바꾼다")
     proj.set_defaults(func=_cmd_project)
 
-    model = sub.add_parser("model", help="팀장·팀원 모델 보기/바꾸기 (다음 실행부터 적용)")
-    model.add_argument("role", nargs="?", help="lead(팀장) 또는 팀원 이름 (예: coder)")
-    model.add_argument("name", nargs="?", help="모델 (예: opus, sonnet, haiku, 전체 모델 id). codex 또는 codex:<모델> 이면 Codex CLI 로 실행")
+    model = sub.add_parser("model", help="기본 에이전트와 팀장·팀원의 에이전트·모델 보기/바꾸기 (다음 실행부터 적용)")
+    model.add_argument("role", nargs="?", help="default(기본 에이전트), lead(팀장) 또는 팀원 이름 (예: coder)")
+    model.add_argument("name", nargs="?", help="claude, codex, claude:<모델>, codex:<모델> (예: claude:opus, codex:gpt-6.1-sol). 모델 이름은 모두 소문자, 띄어쓰기 없이 하이픈")
     model.add_argument("--reset", action="store_true", help="해당 역할을 기본값으로 되돌리기")
     model.set_defaults(func=_cmd_model)
 
@@ -169,13 +169,15 @@ def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> 
 
 def _cmd_model(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     if args.role and bool(args.name) == args.reset:
-        raise JobError("모델 이름과 --reset 중 하나만 주세요. 예: coliday model coder sonnet / coliday model coder --reset")
+        raise JobError("모델과 --reset 중 하나만 주세요. 예: coliday model coder codex / coliday model coder --reset")
     if args.reset and not args.role:
         raise JobError("되돌릴 역할을 주세요. 예: coliday model coder --reset")
     if args.role:
         jobs.set_model(cfg, args.role, None if args.reset else args.name)
     for role, name, changed in jobs.model_rows(cfg):
         print(f"{_pad(role, 14)}  {_pad(name, 28)}  {'설정함' if changed else '기본값'}")
+        if role == team.DEFAULT_ROLE:
+            print("-" * 52)
     return 0
 
 

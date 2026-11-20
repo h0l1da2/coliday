@@ -20,6 +20,7 @@ from coliday.store import RESULT, Store
 def build_command(
     cfg: Config, agents_file: str, model: str | None, job_id: int, resume: str | None = None,
 ) -> list[str]:
+    """Claude 팀장 명령."""
     # 요청 본문은 stdin 으로 넘긴다 ('-' 로 시작하는 요청이 옵션으로 해석되지 않게).
     cmd = [
         cfg.claude_bin, "-p",
@@ -27,7 +28,7 @@ def build_command(
         "--permission-mode", cfg.permission_mode,
         "--permission-prompts", "none",
         "--agents", agents_file,
-        "--append-system-prompt", team.LEAD_PROMPT,
+        "--append-system-prompt", team.lead_prompt(cfg.max_attempts),
         "-n", f"coliday#{job_id}",
     ]
     if model:
@@ -45,7 +46,9 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
     job_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        resolved = team.resolve_agents(team.load_agents(cfg.agents_override), team.load_models(cfg.models_path))
+        resolved = team.resolve_agents(
+            team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), cfg.max_attempts
+        )
     except (OSError, ValueError) as exc:  # 잘못된 사용자 설정
         store.add_event(job_id, LEAD, "error", f"에이전트·모델 설정 오류: {exc}")
         store.finish_job(job_id, "failed", phase="에이전트·모델 설정 오류")
@@ -62,7 +65,7 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
         # Codex 팀장: 지시문을 요청 앞에 붙이고, 팀원 실행 요청은 members.Server 가 받는다.
         server = members.Server(cfg, job, resolved)
         cmd = build_codex_command(cfg, job.model, resume, server.directory)
-        prompt = f"{team.codex_lead_prompt(resolved, members.agent_command(job_id))}\n# 사용자 요청\n{prompt}"
+        prompt = f"{team.codex_lead_prompt(resolved, members.agent_command(job_id), cfg.max_attempts)}\n# 사용자 요청\n{prompt}"
         translator = CodexTranslator(hide=members.MARKER)
     else:
         agents_file = job_dir / "agents.json"

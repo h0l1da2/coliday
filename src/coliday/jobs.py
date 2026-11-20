@@ -45,7 +45,7 @@ def launch(
         raise JobError(f"디렉토리가 없습니다: {target}")
     root = gitops.repo_root(target)
     warnings: list[str] = []
-    model = model or lead_model(cfg)
+    model = team.canonical(model or lead_model(cfg))
     check_codex(cfg, model)
     try:
         list_projects(cfg, store)  # 이 작업을 만들기 전에 기존 작업으로 목록을 채워 둔다
@@ -91,9 +91,10 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
     if not job.workdir or not Path(job.workdir).is_dir():
         raise JobError(f"작업 #{job.id} 의 작업 디렉토리가 없습니다 (정리된 작업). 새 작업으로 시작하세요.")
     warnings: list[str] = []
-    model = model or lead_model(cfg)  # 지정이 없으면 이전 실행의 모델을 그대로 쓴다
-    check_codex(cfg, model or job.model)
-    switched = bool(model) and team.is_codex(model) != team.is_codex(job.model)
+    # 고른 값이 Claude 기본 모델(claude)이면 이전 실행이 Claude 였을 때 그 모델을 그대로 쓴다.
+    model = team.canonical(model or lead_model(cfg))
+    switched = team.is_codex(model) != team.is_codex(job.model)
+    check_codex(cfg, model)
     if switched and job.session_id:
         # Claude 세션과 Codex 세션은 서로 이어받을 수 없다. 작업 디렉토리(코드 변경)는 그대로 쓴다.
         warnings.append("팀장이 Claude↔Codex 로 바뀌어 새 세션으로 시작합니다 (이전 대화 내용은 이어지지 않음).")
@@ -104,7 +105,7 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
         store.add_event(job.id, "팀장", RESULT, job.result)
     if not store.requeue_job(job.id, prompt):
         raise JobError(f"작업 #{job.id} 은(는) 이미 다른 곳에서 이어서 실행했습니다.")
-    if model:
+    if model or switched:  # Codex → Claude 기본 모델이면 model 을 비운다
         store.update_job(job.id, model=model)
     if switched:
         store.update_job(job.id, session_id=None)
@@ -112,9 +113,10 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
     return Launched(store.get_job(job.id), warnings)
 
 
-def lead_model(cfg: Config) -> str | None:
+def lead_model(cfg: Config) -> str:
+    """팀장에 적용되는 설정 값 (`claude`, `codex`, `claude:<모델>`, …)."""
     try:
-        return team.load_models(cfg.models_path).lead
+        return team.lead_spec(team.load_models(cfg.models_path))
     except (OSError, ValueError) as exc:
         raise JobError(f"모델 설정을 읽을 수 없습니다: {exc}") from exc
 
@@ -196,7 +198,9 @@ def remove_project(cfg: Config, store: Store, directory: str | Path) -> bool:
 
 def role_prompts(cfg: Config, role: str | None = None) -> list[tuple[str, str]]:
     try:
-        return team.role_prompts(team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), role)
+        return team.role_prompts(
+            team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), role, cfg.max_attempts
+        )
     except (OSError, ValueError) as exc:
         raise JobError(str(exc)) from exc
 

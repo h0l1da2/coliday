@@ -59,7 +59,7 @@ ln -s "$PWD/.venv/bin/coliday" ~/.local/bin/coliday
   목록에 포커스가 있을 때 `ctrl+e` 로 이름을 바꾸고 `ctrl+x` 로 목록에서 뺀다 (디렉토리와 작업은 그대로).
   작업을 시작한 디렉토리는 자동으로 연결된다.
 - 목록에서 ↑/↓ 로 작업을 고르면 타임라인과 diff 가 바뀐다. 1초마다 갱신되고, 실행 중인 작업의 diff 는 2초마다 다시 계산한다.
-- `ctrl+t` 로 팀장·팀원 모델을 바꾼다. 칸을 비우면 기본값으로 돌아간다.
+- `ctrl+t` 로 기본 에이전트와 팀장·팀원의 에이전트·모델을 바꾼다 (아래 "Claude 와 Codex 골라 쓰기").
 - `ctrl+p` 로 팀장·팀원에게 주는 프롬프트를 본다.
 - 이어서 시킨 작업의 타임라인에는 이전 요청·진행 과정·팀장 보고가 모두 남는다. 마우스 휠이나 PgUp/PgDn(또는 alt+↑/↓)로
   올려 본다. 채팅 입력 중에도 PgUp/PgDn 은 타임라인을 넘긴다.
@@ -76,9 +76,9 @@ coliday continue 3 "테스트도 추가해줘" # 끝난 작업 3 에 이어서 �
 coliday project                       # 연결된 프로젝트 디렉토리 목록
 coliday project add ~/work_dir/shop --name 쇼핑몰   # 연결 (디렉토리 생략 시 현재 디렉토리, --name 생략 시 폴더 이름)
 coliday project rm ~/work_dir/shop    # 목록에서 빼기
-coliday model                         # 팀장·팀원 모델 보기
-coliday model lead opus               # 팀장 모델 바꾸기
-coliday model coder sonnet            # 팀원 모델 바꾸기 (--reset 으로 기본값 복원)
+coliday model                         # 기본 에이전트와 팀장·팀원의 에이전트·모델 보기
+coliday model default codex           # 기본 에이전트 바꾸기 (claude / codex)
+coliday model coder claude:sonnet     # 역할 하나만 바꾸기 (--reset 으로 기본을 따르게)
 coliday prompt                        # 팀장·팀원 프롬프트 보기 (coliday prompt coder 로 하나만)
 coliday ls                            # 작업 목록 (텍스트)
 coliday show 3 -f                     # 작업 3 타임라인 따라보기
@@ -103,22 +103,41 @@ coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 
 | `COLIDAY_CLAUDE_BIN` | `claude` | claude 실행 파일 |
 | `COLIDAY_PERMISSION_MODE` | `auto` | `claude --permission-mode` 값. 권한 확인이 필요한 동작은 자동 거부된다 |
 | `COLIDAY_CODEX_BIN` | `codex` | codex 실행 파일 |
+| `COLIDAY_MAX_ATTEMPTS` | `5` | 실패한 작업을 처음 포함해 몇 번까지 시도할지 (1 이상의 정수) |
+
+어떤 작업(빌드, 테스트, 재작업 등)이 실패하면 팀원과 팀장은 같은 작업을 최대 `COLIDAY_MAX_ATTEMPTS` 번까지만 시도한다.
+그래도 안 되면 팀원은 멈추고 시도 내용과 마지막 오류를 팀장에게 넘기고, 팀장은 코드를 동작하는 상태로 정리한 뒤
+최종 보고에 그 작업을 "실패"로 적는다. 이 값은 팀장·팀원에게 주는 지침에 들어가는 것이라 `coliday prompt` 로 확인할 수 있다
+(에이전트가 따르는 규칙이지, 프로그램이 횟수를 세어 강제로 끊는 것은 아니다). 바꾼 값은 다음 실행부터 적용된다.
 
 모델 설정은 `~/.coliday/models.json` 에 저장되고 다음 실행(새 작업·이어서 시키기)부터 적용된다. 실행 중인 작업은 바뀌지 않는다.
-팀장 모델은 `run --model` / `continue --model` 로 작업별로 덮어쓸 수 있고, 설정이 없으면 claude 기본 모델을 쓴다.
-모델 이름은 `opus`, `sonnet`, `haiku` 같은 별칭이나 전체 모델 id 를 쓴다 (이름이 맞는지는 실행할 때 claude 가 확인한다).
+팀장은 `run --model` / `continue --model` 로 작업별로 덮어쓸 수 있고 (예: `--model codex`, `--model claude:opus`),
+따로 고르지 않았으면 기본 에이전트를 따른다.
+모델 이름이 실제로 있는지는 실행할 때 claude / codex 가 확인한다 (틀리면 그 작업이 실패로 표시된다).
 
-### Claude 와 Codex 섞어 쓰기
+### Claude 와 Codex 골라 쓰기
 
-모델 자리에 `codex`(Codex 기본 모델) 또는 `codex:<모델>` 을 쓰면 그 역할은 Codex CLI 로 일한다. 팀장과 팀원 모두 가능하다.
+기본 에이전트(`claude` 또는 `codex`)를 하나 고르고, 필요한 역할만 따로 바꾼다. 팀장과 팀원 모두 가능하다.
+
+| 값 | 뜻 |
+| --- | --- |
+| `claude` / `codex` | 그 에이전트의 기본 모델 |
+| `claude:opus` / `codex:gpt-6.1-sol` | 그 에이전트의 특정 모델 |
+
+모델 이름은 모두 소문자로, 띄어쓰기 없이 하이픈으로 쓴다 (`gpt-6.1-sol` ○, `GPT-6.1 Sol` ✗).
 
 ```bash
-coliday model lead codex              # 팀장을 Codex 로
-coliday model reviewer codex:gpt-5    # 리뷰어만 Codex 의 특정 모델로
-coliday model codex-coder sonnet      # 기본이 Codex 인 팀원을 Claude 로
-coliday model lead --reset            # 되돌리기
+coliday model                             # 현재 설정 보기
+coliday model default codex               # 기본 에이전트를 Codex 로: 따로 고르지 않은 역할이 모두 Codex
+coliday model lead claude:opus            # 팀장만 Claude 의 opus 로
+coliday model reviewer codex:gpt-6.1-sol  # 리뷰어만 Codex 의 특정 모델로
+coliday model reviewer --reset            # 그 역할을 다시 기본 에이전트를 따르게
 ```
 
+TUI 에서는 `ctrl+t` 창 맨 위에서 기본 에이전트를 고르고, 역할마다 에이전트(기본을 따름 / claude / codex)와 모델을 고른다.
+
+- 기본 에이전트가 `claude` 면 팀원 정의에 적힌 Claude 모델(architect·reviewer 는 opus)을 쓰고, `codex-coder` 는 Codex 로 일한다.
+  기본 에이전트가 `codex` 면 따로 고르지 않은 역할은 모두 Codex 기본 모델로 일한다.
 - Claude 팀장 아래의 Codex 팀원은 `codex exec` 를 대신 실행해 주는 작은 Claude(haiku) 에이전트를 거쳐 일한다.
 - Codex 팀장은 샌드박스(workspace-write) 안에서 실행되고, 팀원에게는 셸 명령으로 일을 맡긴다. 팀원은 coliday 가 샌드박스 밖에서 실행한다.
 - Codex 로 실행하는 역할은 수정 도구(Edit/Write)가 없으면 읽기 전용 샌드박스로 돈다 (architect, reviewer).

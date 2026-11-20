@@ -257,29 +257,53 @@ def test_실행중인_작업에는_보낼_수_없고_쓴_내용은_남는다(env
         store.close()
 
 
-def test_m으로_모델을_바꾸고_비우면_기본값으로_되돌린다(env, repo):
+def test_모델_창에서_기본_에이전트와_역할별_에이전트_모델을_고른다(env, repo, monkeypatch):
+    from textual.widgets import Select
     from coliday import team
+    fake_codex = env / "codex"
+    fake_codex.write_text("#!/bin/sh\nexit 0\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("COLIDAY_CODEX_BIN", str(fake_codex))
     cfg = config.load()
     store = Store(cfg.db_path)
-    team.save_models(cfg.models_path, team.Models(lead="opus", agents={"reviewer": "sonnet"}))
+    team.save_models(cfg.models_path, team.Models(lead="opus", agents={"reviewer": "codex:gpt-r"}))
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
+        async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("ctrl+t")
-            assert isinstance(app.screen, ModelScreen)
-            roles = app.screen._roles
-            assert app.screen.query_one("#model-0", Input).value == "opus"
-            app.screen.query_one("#model-0", Input).value = ""
-            app.screen.query_one(f"#model-{roles.index('coder')}", Input).value = "haiku"
-            await pilot.press("enter")
+            screen = app.screen
+            assert isinstance(screen, ModelScreen)
+            roles = screen._roles
+            row = lambda role: roles.index(role)
+            # 저장된 값이 에이전트와 모델로 나뉘어 보인다
+            assert screen.query_one("#default-engine", Select).value == "claude"
+            assert screen.query_one("#engine-0", Select).value == "claude"
+            assert screen.query_one("#model-0", Input).value == "opus"
+            assert screen.query_one(f"#engine-{row('reviewer')}", Select).value == "codex"
+            assert screen.query_one(f"#model-{row('reviewer')}", Input).value == "gpt-r"
+            assert screen.query_one(f"#engine-{row('coder')}", Select).value == "follow"
+
+            screen.query_one("#default-engine", Select).value = "codex"          # 기본 에이전트: codex
+            screen.query_one("#engine-0", Select).value = "follow"               # 팀장: 기본을 따름
+            screen.query_one(f"#engine-{row('coder')}", Select).value = "codex"  # coder: codex 의 특정 모델
+            screen.query_one(f"#model-{row('coder')}", Input).value = "gpt-6.1-sol"
+            screen.query_one(f"#engine-{row('reviewer')}", Select).value = "claude"
+            screen.query_one(f"#model-{row('reviewer')}", Input).value = ""
+            await pilot.pause()
+            await pilot.click("#ok")
             await pilot.pause()
 
             assert team.load_models(cfg.models_path) == team.Models(
-                lead=None, agents={"reviewer": "sonnet", "coder": "haiku"})
+                default="codex", lead=None, agents={"reviewer": "claude", "coder": "codex:gpt-6.1-sol"})
+            rows = dict((r, t) for r, t, _ in jobs.model_rows(cfg))
+            assert (rows["lead"], rows["architect"], rows["reviewer"]) == ("codex", "codex", "claude")
 
             await pilot.press("ctrl+t")
             app.screen.query_one("#model-0", Input).value = "두 단어"
+            app.screen.query_one("#engine-0", Select).value = "claude"
+            await pilot.pause()
+            app.screen.query_one("#model-0", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
             assert any("올바르지 않습니다" in n.message for n in app._notifications)

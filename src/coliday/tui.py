@@ -24,7 +24,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static
 
 from coliday import gitops, jobs, projects, team
 from coliday.config import Config
@@ -126,36 +126,83 @@ class AddProjectScreen(ModalScreen[tuple[str, str] | None]):
         self.dismiss(None)
 
 
+_FOLLOW = "follow"  # 역할 선택 상자의 '기본 에이전트를 따름'
+
+
 class ModelScreen(ModalScreen[dict[str, str] | None]):
-    """역할별 모델 입력. 비워 두면 기본값을 쓴다."""
+    """맨 위에서 기본 에이전트를 고르고, 역할마다 에이전트와 모델을 따로 고를 수 있다.
+
+    결과는 {역할: 값} 이고 값은 `claude`, `codex`, `claude:<모델>`, `codex:<모델>` 또는 ""(기본을 따름)이다.
+    """
 
     BINDINGS = [Binding("escape", "close", "닫기")]
 
     def __init__(self, agents: dict[str, dict], models: team.Models) -> None:
         super().__init__()
         self._roles = [team.LEAD_ROLE, *agents]
+        self._agents = agents
+        self._models = models
         self._current = {team.LEAD_ROLE: models.lead or "", **{n: models.agents.get(n, "") for n in agents}}
-        self._defaults = {role: name for role, name, _ in team.model_rows(agents, team.Models())}
 
     def compose(self) -> ComposeResult:
+        engines = [("claude", team.CLAUDE), ("codex", team.CODEX)]
+        default_engine, default_model = _split_spec(self._models.default)
         with Vertical(id="dialog"):
-            yield Label("모델 설정 (다음 실행부터 적용)", id="dialog-title")
-            yield Label("예: opus, sonnet, haiku 또는 전체 모델 id. 비우면 기본값. Enter 로 저장.", classes="hint")
-            yield Label("codex 또는 codex:<모델> 로 쓰면 그 역할은 Codex CLI 로 일한다 (팀장·팀원 모두 가능).", classes="hint")
+            yield Label("에이전트·모델 설정 (다음 실행부터 적용)", id="dialog-title")
+            with Horizontal(classes="model-row"):
+                yield Label("기본 에이전트", classes="model-role")
+                yield Select(engines, value=default_engine, allow_blank=False, id="default-engine", classes="engine")
+                yield Input(value=default_model, placeholder="모델 (비우면 기본 모델)", id="default-model")
+            yield Label("아래에서 따로 고르지 않은 역할은 기본 에이전트로 일한다. 모델 칸은 비우면 그 에이전트의 기본 모델.",
+                        classes="hint")
             for i, role in enumerate(self._roles):  # 팀원 이름은 위젯 id 로 못 쓰는 문자가 있을 수 있어 순번을 쓴다
+                engine, model = _split_spec(self._current[role]) if self._current[role] else (_FOLLOW, "")
                 with Horizontal(classes="model-row"):
                     yield Label("팀장 (lead)" if role == team.LEAD_ROLE else role, classes="model-role")
-                    yield Input(value=self._current[role], placeholder=f"기본값: {self._defaults[role]}", id=f"model-{i}")
+                    yield Select([("기본을 따름", _FOLLOW), *engines], value=engine, allow_blank=False,
+                                 id=f"engine-{i}", classes="engine")
+                    yield Input(value=model, placeholder=self._placeholder(role), id=f"model-{i}")
+            yield Label("모델 이름은 모두 소문자로, 띄어쓰기 없이 하이픈으로 쓴다. 예: gpt-6.1-sol, opus (GPT-6.1 Sol ✗)",
+                        classes="hint")
+            yield Label("에이전트 codex + 모델 gpt-6.1-sol 은 codex:gpt-6.1-sol 로 저장된다.  모델 칸에서 Enter 또는 저장 버튼.",
+                        classes="hint")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("저장", variant="primary", id="ok")
+                yield Button("닫기", id="close")
+
+    def _placeholder(self, role: str) -> str:
+        rows = {name: text for name, text, _ in team.model_rows(self._agents, team.Models(default=self._models.default))}
+        return f"모델 (지금 기본: {rows[role]})"
 
     def on_mount(self) -> None:
-        self.query_one("#model-0", Input).focus()
+        self.query_one("#default-engine", Select).focus()
 
     @on(Input.Submitted)
+    @on(Button.Pressed, "#ok")
     def _submit(self) -> None:
-        self.dismiss({role: self.query_one(f"#model-{i}", Input).value.strip() for i, role in enumerate(self._roles)})
+        answer = {team.DEFAULT_ROLE: _join_spec(self.query_one("#default-engine", Select).value,
+                                                self.query_one("#default-model", Input).value)}
+        for i, role in enumerate(self._roles):
+            engine = self.query_one(f"#engine-{i}", Select).value
+            model = self.query_one(f"#model-{i}", Input).value
+            answer[role] = "" if engine == _FOLLOW else _join_spec(engine, model)
+        self.dismiss(answer)
 
+    @on(Button.Pressed, "#close")
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+def _split_spec(spec: str) -> tuple[str, str]:
+    """설정 값 → (에이전트, 모델). 에이전트 없이 모델만 쓴 값은 Claude 모델이다."""
+    if team.is_codex(spec):
+        return team.CODEX, team.codex_model(spec) or ""
+    return team.CLAUDE, team.canonical(spec) or ""
+
+
+def _join_spec(engine: object, model: str) -> str:
+    model = model.strip()
+    return f"{engine}:{model}" if model else str(engine)
 
 
 class PromptScreen(ModalScreen[None]):
@@ -228,13 +275,16 @@ class ColidayApp(App[None]):
     NewJobScreen, AddProjectScreen, ModelScreen, PromptScreen, ConfirmScreen { align: center middle; }
     #prompts { width: 90%; height: 90%; padding: 1 2; border: thick $primary; background: $surface; }
     .model-row { height: auto; }
-    .model-role { width: 18; margin-top: 2; }
+    .model-role { width: 16; margin-top: 2; }
+    .model-row .engine { width: 22; margin-top: 1; }
+    .model-row Input { width: 1fr; }
+    ModelScreen #dialog { width: 96; }
     #dialog { width: 80; height: auto; max-height: 100%; overflow-y: auto; padding: 1 2; border: thick $primary; background: $surface; }
     #dialog Input, #dialog Checkbox { margin-top: 1; }
     #dialog-title { text-style: bold; }
     #dialog-buttons { height: auto; margin-top: 1; align-horizontal: right; }
     #dialog-buttons Button { margin-left: 2; }
-    .hint { color: $text-muted; margin-top: 1; }
+    .hint { color: $text-muted; margin-top: 1; width: 100%; }  /* 긴 안내는 잘리지 않고 줄바꿈된다 */
     """
     BINDINGS = [
         # 글자 키는 채팅 입력에 쓰이므로 단축키는 모두 ctrl 조합이다. priority: 채팅 입력 중에도 동작한다.

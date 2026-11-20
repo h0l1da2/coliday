@@ -388,11 +388,11 @@ def test_prompt는_실행에_쓰이는_역할별_프롬프트를_보여준다(en
     assert team.LEAD_PROMPT.strip() in out
     for name, spec in team.DEFAULT_AGENTS.items():
         assert spec["prompt"].strip() in out and spec["description"] in out
-    assert "── coder · 모델: haiku · 도구: Read, Grep, Glob, Edit, Write, Bash ──" in out
+    assert "── coder · 모델: claude:haiku · 도구: Read, Grep, Glob, Edit, Write, Bash ──" in out
 
     assert cli.main(["prompt", "reviewer"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("── reviewer · 모델: opus")
+    assert out.startswith("── reviewer · 모델: claude:opus")
     assert "coliday 팀장 모드" not in out and "시니어 개발자" not in out
 
     assert cli.main(["prompt", "nobody"]) == 2
@@ -406,7 +406,7 @@ def test_prompt는_agents_json으로_바꾼_팀원_정의를_보여준다(env, c
     assert cli.main(["prompt"]) == 0
 
     out = capsys.readouterr().out
-    assert "── qa · 모델: 팀장과 같음 ──" in out and "너는 QA 다." in out
+    assert "── qa · 모델: claude (팀장과 같은 모델) ──" in out and "너는 QA 다." in out
     assert "시니어 개발자" not in out
 
 
@@ -519,6 +519,105 @@ def test_한_번_실행한_작업의_보고는_show에_한_번만_나온다(env,
 
     cli.main(["show", "1"])
     assert capsys.readouterr().out.count("최종 보고: 완료") == 1
+
+
+def test_기본_에이전트를_codex로_바꾸면_따로_고르지_않은_역할이_모두_codex로_일한다(env, repo, capsys):
+    assert cli.main(["model", "default", "codex"]) == 0
+    assert cli.main(["model", "reviewer", "claude:opus"]) == 0   # 이 역할만 Claude 의 특정 모델
+    assert cli.main(["model", "verifier", "codex:gpt-6.1-sol"]) == 0
+    capsys.readouterr()
+
+    cli.main(["model"])
+    lines = {line.split()[0]: line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert "codex" in lines["default"] and "설정함" in lines["default"]
+    assert lines["lead"].split()[1:] == ["codex", "기본값"]
+    assert lines["architect"].split()[1:] == ["codex", "기본값"]      # 정의의 opus 대신 기본 에이전트
+    assert lines["coder"].split()[1:] == ["codex", "기본값"]
+    assert lines["reviewer"].split()[1:] == ["claude:opus", "설정함"]
+    assert lines["verifier"].split()[1:] == ["codex:gpt-6.1-sol", "설정함"]
+
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+    assert not (env / "args.json").exists()  # 팀장이 Codex 로 실행됐다
+    assert _store().get_job(1).model == "codex"
+
+
+def test_기본_에이전트가_claude면_claude_접두사와_모델만_쓴_값이_같은_뜻이다(env, repo, capsys):
+    cli.main(["model", "lead", "claude:sonnet"])
+    cli.main(["model", "coder", "haiku"])          # 에이전트 없이 모델만: Claude 모델
+    cli.main(["model", "codex-coder", "claude"])   # Codex 로 정의된 팀원을 Claude 기본 모델로
+    capsys.readouterr()
+
+    cli.main(["model"])
+    lines = {line.split()[0]: line for line in capsys.readouterr().out.splitlines() if line.strip()}
+    assert lines["default"].split()[1:] == ["claude", "기본값"]
+    assert "claude:sonnet" in lines["lead"] and "claude:haiku" in lines["coder"]
+    assert lines["codex-coder"].split()[1] == "claude" and "claude:opus" in lines["architect"]
+
+    cli.main(["run", "x", "-C", str(repo)])
+    argv, agents = _recorded(env)
+    assert argv[argv.index("--model") + 1] == "sonnet"  # claude 에는 모델 이름만 넘긴다
+    assert agents["coder"]["model"] == "haiku" and agents["architect"]["model"] == "opus"
+    assert "model" not in agents["codex-coder"] and "codex exec" not in agents["codex-coder"]["prompt"]
+
+    assert cli.main(["model", "default", "--reset"]) == 0
+    assert cli.main(["model", "lead", "claude:"]) == 2  # 모델 이름이 빠짐
+
+
+def test_이어서_시킬_때_기본_에이전트를_바꾸면_팀장도_바뀐다(env, repo):
+    cli.main(["run", "x", "-C", str(repo)])          # Claude 팀장
+    cli.main(["model", "default", "codex"])
+
+    assert cli.main(["continue", "1", "더"]) == 0     # Codex 로 넘어간다 (새 세션)
+    assert _codex_calls(env) and "resume" not in _codex_calls(env)[-1]["argv"]
+    assert _store().get_job(1).model == "codex"
+
+    cli.main(["model", "default", "claude"])
+    (env / "args.json").unlink()
+    assert cli.main(["continue", "1", "다시"]) == 0   # 다시 Claude 기본 모델
+    argv, _ = _recorded(env)
+    assert "--model" not in argv and "--resume" not in argv
+
+
+def test_최대_시도_횟수는_기본_5번이고_팀장과_팀원_지침에_들어간다(env, repo):
+    cli.main(["run", "x", "-C", str(repo)])
+
+    argv, agents = _recorded(env)
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert "최대 5번까지만 시도한다" in lead and "## 실패한 작업 정리" in lead
+    assert "5번 시도해도 실패하거나" in lead and "{max_attempts}" not in lead
+    for name in ("architect", "coder", "reviewer", "verifier", "codex-coder"):  # Codex 래퍼도 역할 지침째로 넘긴다
+        assert "최대 5번까지만 시도한다" in agents[name]["prompt"], name
+        assert '"최대 시도 횟수 도달"' in agents[name]["prompt"] and "{max_attempts}" not in agents[name]["prompt"]
+
+
+def test_COLIDAY_MAX_ATTEMPTS로_최대_시도_횟수를_바꾼다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("COLIDAY_MAX_ATTEMPTS", "3")
+    config.load().home.mkdir(parents=True)
+    config.load().agents_override.write_text(json.dumps({"qa": {"description": "검수", "prompt": "너는 QA 다."}}))
+
+    cli.main(["run", "x", "-C", str(repo)])
+    argv, agents = _recorded(env)
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert "최대 3번까지만 시도한다" in lead and "5번" not in lead
+    assert agents["qa"]["prompt"].startswith("너는 QA 다.") and "최대 3번까지만 시도한다" in agents["qa"]["prompt"]
+
+    cli.main(["run", "y", "-C", str(repo), "--model", "codex"])   # Codex 팀장도 같은 값을 쓴다
+    assert "최대 3번까지만 시도한다" in _codex_calls(env)[-1]["stdin"]
+
+    capsys.readouterr()
+    cli.main(["prompt"])
+    out = capsys.readouterr().out
+    assert out.count("최대 3번까지만 시도한다") == 2 and "5번" not in out  # 팀장 + qa
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "많이", "2.5"])
+def test_COLIDAY_MAX_ATTEMPTS가_잘못되면_실행하지_않고_알린다(env, repo, monkeypatch, value):
+    monkeypatch.setenv("COLIDAY_MAX_ATTEMPTS", value)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "x", "-C", str(repo)])
+
+    assert "COLIDAY_MAX_ATTEMPTS" in str(exc.value)
 
 
 def _codex_calls(env):

@@ -13,6 +13,7 @@ class Config:
     claude_bin: str
     permission_mode: str
     codex_bin: str = "codex"
+    max_attempts: int = 5  # 실패한 작업을 처음 포함해 몇 번까지 시도할지 (팀장·팀원 지침에 들어간다)
 
     @property
     def db_path(self) -> Path:
@@ -49,4 +50,18 @@ def load() -> Config:
         claude_bin=os.environ.get("COLIDAY_CLAUDE_BIN", "claude"),
         permission_mode=os.environ.get("COLIDAY_PERMISSION_MODE", "auto"),
         codex_bin=os.environ.get("COLIDAY_CODEX_BIN", "codex"),
+        max_attempts=_max_attempts(os.environ.get("COLIDAY_MAX_ATTEMPTS")),
     )
+
+
+def _max_attempts(raw: str | None) -> int:
+    """COLIDAY_MAX_ATTEMPTS. 비어 있으면 5, 1 이상의 정수가 아니면 오류 (조용히 기본값으로 돌리면 설정이 먹은 줄 안다)."""
+    if raw is None or not raw.strip():
+        return 5
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise SystemExit(f"COLIDAY_MAX_ATTEMPTS 는 1 이상의 정수여야 합니다: {raw!r}")
+    return value
