@@ -12,7 +12,7 @@ from pathlib import Path
 
 from coliday import config, gitops, jobs, members, projects, team, worker
 from coliday.jobs import STATUS_ICON, JobError
-from coliday.store import RESULT, EventRow, Job, Store
+from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--model", help="이 작업만 쓸 팀장 에이전트·모델 (예: codex, claude:opus). 기본: coliday model 설정")
     run.set_defaults(func=_cmd_run)
 
-    cont = sub.add_parser("continue", help="끝난 작업에 이어서 시키기 (같은 세션·같은 작업 디렉토리)")
+    cont = sub.add_parser("continue", help="작업에 이어서 시키기 (같은 세션·같은 작업 디렉토리). 실행 중이면 끝난 뒤 전달")
     cont.add_argument("id", type=int)
     cont.add_argument("prompt", help="이어서 시킬 일")
     cont.add_argument("-d", "--detach", action="store_true", help="시작만 하고 바로 돌아오기")
@@ -146,7 +146,10 @@ def _cmd_continue(cfg: config.Config, store: Store, args: argparse.Namespace) ->
     for w in launched.warnings:
         print(f"주의: {w}", file=sys.stderr)
     job = launched.job
-    print(f"작업 #{job.id} 이어서 시작 — {job.workdir}")
+    if launched.queued:
+        print(f"작업 #{job.id} 이(가) 실행 중이라 요청을 대기시켰습니다. 지금 실행이 끝나면 이어서 전달됩니다.")
+    else:
+        print(f"작업 #{job.id} 이어서 시작 — {job.workdir}")
     if args.detach:
         print(f"진행 상황: coliday show {job.id} -f")
         return 0
@@ -237,10 +240,10 @@ def _cmd_diff(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
 
 
 def _cmd_open(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
-    store.get_job(args.id)  # 없는 작업이면 KeyError → "찾을 수 없습니다"
-    root = jobs.open_artifacts(cfg, args.id)
-    files = jobs.artifacts(cfg, args.id)
-    print(f"결과물 {jobs.artifacts_summary(files)}: {root}")
+    root = jobs.open_artifacts(cfg, store, args.id)
+    files = [p for p in jobs.artifacts(cfg, args.id) if jobs.is_media(p)]
+    print(f"결과물 {jobs.artifacts_summary(jobs.artifacts(cfg, args.id))}: {root}" if files
+          else f"아직 결과물(사진·영상)이 없습니다: {root}")
     for path in files:
         print(f"  {path.relative_to(root)}")
     return 0
@@ -281,7 +284,7 @@ def _follow(store: Store, job_id: int, after_id: int = 0) -> int:
 
 def _print_artifacts(cfg: config.Config, job_id: int) -> None:
     files = jobs.artifacts(cfg, job_id)
-    if files:
+    if any(jobs.is_media(p) for p in files):
         print(f"결과물 {jobs.artifacts_summary(files)}: {cfg.artifacts_dir(job_id)}  (열기: coliday open {job_id})")
 
 
@@ -293,6 +296,9 @@ def _print_header(job: Job) -> None:
 
 def _print_event(ev: EventRow) -> None:
     ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
+    if ev.kind == QUEUED:
+        print(f"{ts}  {_pad(ev.actor, 12)}  (대기: 지금 실행이 끝나면 전달) {ev.message}")
+        return
     if ev.kind == RESULT:
         print(f"\n── 팀장 보고 ({ts}) ──\n{ev.message}\n")
         return

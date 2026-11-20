@@ -13,6 +13,7 @@ from pathlib import Path
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 USER = "사용자"
 FOLLOW_UP = "prompt"  # 끝난 작업에 이어서 시킨 요청 이벤트의 kind
+QUEUED = "queued"  # 실행 중에 보낸 요청. 지금 실행이 끝나면 FOLLOW_UP 으로 바뀌어 이어서 전달된다
 RESULT = "result"  # 실행 한 번의 팀장 보고 전문. 이어서 시켜도 이전 보고가 타임라인에 남게 이벤트로 둔다
 
 _SCHEMA = """
@@ -151,12 +152,62 @@ class Store:
                 (job_id,),
             )
             if cur.rowcount == 1:
-                self.add_event(job_id, USER, FOLLOW_UP, prompt)
+                # worker 가 죽어 전달되지 못한 대기 요청이 남아 있으면 버리지 않고 앞에 붙인다.
+                self.add_event(job_id, USER, FOLLOW_UP, "\n\n".join([*self._take_queued(job_id), prompt]))
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
         return cur.rowcount == 1
+
+    def queue_message(self, job_id: int, prompt: str) -> bool:
+        """실행 중인 작업에 요청을 대기시킨다. 그 사이 작업이 끝났으면 넣지 않고 False (그때는 바로 이어서 시키면 된다)."""
+        cur = self._conn.execute(
+            "INSERT INTO events(job_id, ts, actor, kind, message) SELECT ?, ?, ?, ?, ? "
+            "WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status IN ('queued','running'))",
+            (job_id, time.time(), USER, QUEUED, prompt, job_id),
+        )
+        return cur.rowcount == 1
+
+    def clear_queued(self, job_id: int) -> None:
+        self._conn.execute("DELETE FROM events WHERE job_id = ? AND kind = ?", (job_id, QUEUED))
+
+    def _take_queued(self, job_id: int) -> list[str]:
+        """대기 중인 요청을 꺼낸다 (트랜잭션 안에서 부른다)."""
+        rows = self._conn.execute(
+            "SELECT message FROM events WHERE job_id = ? AND kind = ? ORDER BY id", (job_id, QUEUED)
+        ).fetchall()
+        self._conn.execute("DELETE FROM events WHERE job_id = ? AND kind = ?", (job_id, QUEUED))
+        return [r["message"] for r in rows]
+
+    def finish_or_continue(self, job_id: int, status: str, **fields: object) -> bool:
+        """실행 한 번을 마친다. 대기 중인 요청이 있으면 끝내지 않고 그 요청을 후속 요청으로 바꾼 뒤 False 를 돌려준다.
+
+        '대기 요청 확인'과 '끝내기'를 한 트랜잭션으로 묶는다. 따로 하면 그 사이에 들어온 요청이
+        끝난 작업에 남아 영영 전달되지 않는다. 이미 취소된 작업이면 아무것도 하지 않고 True.
+        """
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(status)
+        extra = {k: v for k, v in fields.items() if k in _UPDATABLE}
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None or row["status"] in TERMINAL_STATUSES:
+                self._conn.execute("COMMIT")
+                return True
+            queued = self._take_queued(job_id)
+            if queued:
+                self.add_event(job_id, USER, FOLLOW_UP, "\n\n".join(queued))
+                extra["phase"] = "대기 중이던 요청 처리 시작"
+            else:
+                extra |= {"status": status, "finished_at": time.time()}
+            assigns = ", ".join(f"{k} = ?" for k in extra)
+            self._conn.execute(f"UPDATE jobs SET {assigns} WHERE id = ?", (*extra.values(), job_id))
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        return not queued
 
     def last_follow_up(self, job_id: int) -> EventRow | None:
         row = self._conn.execute(

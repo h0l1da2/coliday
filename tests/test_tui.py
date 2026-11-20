@@ -214,7 +214,41 @@ def test_채팅_입력으로_끝난_작업에_이어서_시키면_같은_세션�
         store.close()
 
 
-def test_실행중인_작업에는_보낼_수_없고_쓴_내용은_남는다(env, repo, monkeypatch):
+def test_실행중인_작업에_보낸_채팅은_대기했다가_끝나면_전달된다(env, repo, monkeypatch):
+    import json
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "2")
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    launched = jobs.launch(cfg, store, "처음 요청", repo)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            chat = app.query_one("#chat", Input)
+            await _until(pilot, lambda: store.get_job(1).status == "running")
+            await _until(pilot, lambda: app.selected_id == 1)
+            await _until(pilot, lambda: "끝난 뒤 이어서 전달됩니다" in chat.placeholder)
+            chat.focus()
+            chat.value = "버튼 색도 바꿔줘"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert chat.value == ""  # 보내졌다 (대기)
+            assert any("대기시켰습니다" in n.message for n in app._notifications)
+            await _until(pilot, lambda: "⏳ 대기" in _timeline_text(app) and "버튼 색도 바꿔줘" in _timeline_text(app))
+
+            await _until(pilot, lambda: store.get_job(1).is_terminal, timeout=30)
+            await _until(pilot, lambda: _timeline_text(app).count("최종 보고: 완료") == 2)
+            recorded = json.loads((env / "args.json").read_text())
+            assert recorded["stdin"] == "버튼 색도 바꿔줘" and "--resume" in recorded["argv"]
+
+    try:
+        _run(scenario())
+        assert launched.job.id == 1
+    finally:
+        store.close()
+
+
+def test_채팅_입력_중에도_ctrl_단축키가_동작하고_대화_상자는_겹치지_않는다(env, repo, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
     cfg = config.load()
     store = Store(cfg.db_path)
@@ -229,12 +263,6 @@ def test_실행중인_작업에는_보낼_수_없고_쓴_내용은_남는다(env
             await _until(pilot, lambda: "실행 중" in chat.placeholder)
             chat.focus()
             chat.value = "더 해줘"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert any("아직 실행 중" in n.message for n in app._notifications)
-            assert chat.value == "더 해줘" and store.last_follow_up(launched.job.id) is None
-
-            # 채팅 입력 중에도 ctrl 단축키는 동작하고, 대화 상자 안에서는 겹쳐 뜨지 않는다
             await pilot.press("ctrl+n")
             assert isinstance(app.screen, NewJobScreen)
             await pilot.press("ctrl+n", "ctrl+t", "x")
@@ -725,8 +753,9 @@ def test_결과물이_있는_작업은_폴더_경로가_보이고_클릭하거�
             bar = app.query_one("#artifacts", Static)
             await _until(pilot, lambda: all(j.is_terminal for j in store.list_jobs()))
             await _until(pilot, lambda: app.selected_id == shots.id)
-            await _until(pilot, lambda: bar.display)
+            await _until(pilot, lambda: "결과물 2개" in str(bar.content))
             text = str(bar.content)
+            assert bar.display and bar.has_class("-has")
             assert "결과물 2개 (사진 1, 영상 1)" in text and f"jobs/{shots.id}/artifacts" in text
 
             await pilot.click("#artifacts")
@@ -737,15 +766,18 @@ def test_결과물이_있는_작업은_폴더_경로가_보이고_클릭하거�
             await pilot.press("ctrl+f")   # 채팅 입력 중에도 열린다
             await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 2)
 
-            # 결과물이 없는 작업으로 옮기면 줄이 사라지고, 단축키는 없다고 알린다
+            # 결과물이 없는 작업도 줄은 그대로 있고 계속 클릭해서 폴더를 열 수 있다
             app.query_one("#jobs", DataTable).focus()
             await pilot.press("down")
             await _until(pilot, lambda: app.selected_id == plain.id)
-            await _until(pilot, lambda: not bar.display)
-            await pilot.press("ctrl+f")
-            await pilot.pause()
-            assert any("결과물이 없습니다" in n.message for n in app._notifications)
-            assert len((env / "opened.txt").read_text().split()) == 2
+            await _until(pilot, lambda: "결과물 아직 없음" in str(bar.content))
+            assert bar.display and not bar.has_class("-has") and f"jobs/{plain.id}/artifacts" in str(bar.content)
+            await pilot.click("#artifacts")
+            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 3)
+            await pilot.click("#artifacts")   # 여러 번 눌러도 줄은 그대로다
+            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 4)
+            assert bar.display and (env / "opened.txt").read_text().split()[-1] == str(cfg.artifacts_dir(plain.id))
+            assert any("아직 사진·영상이 없습니다" in n.message for n in app._notifications)
 
     try:
         _run(scenario())

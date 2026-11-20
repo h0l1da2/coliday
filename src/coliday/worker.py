@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from coliday import members, team
+from coliday.jobs import organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
 from coliday.store import RESULT, Store
@@ -42,6 +43,15 @@ def build_command(
 def run_job(cfg: Config, store: Store, job_id: int) -> int:
     if not store.start_job(job_id, os.getpid()):
         return 0  # 시작 전에 취소됨
+    while True:
+        # 실행 중에 사용자가 보낸 요청이 대기하고 있으면 끝내지 않고 같은 세션으로 한 번 더 실행한다.
+        code = _run_turn(cfg, store, job_id)
+        if code is not None:
+            return code
+
+
+def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
+    """팀장을 한 번 실행한다. 작업이 끝났으면 종료 코드, 대기 요청이 있어 이어서 실행해야 하면 None."""
     job = store.get_job(job_id)
     job_dir = cfg.job_dir(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -54,8 +64,7 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
         )
     except (OSError, ValueError) as exc:  # 잘못된 사용자 설정
         store.add_event(job_id, LEAD, "error", f"에이전트·모델 설정 오류: {exc}")
-        store.finish_job(job_id, "failed", phase="에이전트·모델 설정 오류")
-        return 1
+        return 1 if store.finish_or_continue(job_id, "failed", phase="에이전트·모델 설정 오류") else None
 
     # 후속 요청이 있으면 이어서 시킨 실행이다: 같은 세션을 resume 하고 로그는 덧붙인다.
     follow_up = store.last_follow_up(job_id)
@@ -101,8 +110,7 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
             returncode = proc.wait()
     except OSError as exc:  # 실행 파일 없음 등
         store.add_event(job_id, LEAD, "error", f"{cmd[0]} 실행 실패: {exc}")
-        store.finish_job(job_id, "failed", phase="팀장 실행 실패")
-        return 1
+        return 1 if store.finish_or_continue(job_id, "failed", phase="팀장 실행 실패") else None
     finally:
         if server:
             server.stop()
@@ -113,10 +121,11 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
         store.add_event(job_id, LEAD, "error", f"종료 코드 {returncode}" + (f": {tail}" if tail else ""))
     if translator.result:  # 상태를 끝으로 바꾸기 전에 남긴다 (끝난 작업을 본 쪽은 보고도 이미 볼 수 있게)
         store.add_event(job_id, LEAD, RESULT, translator.result)
+    jobs_organize(cfg.artifacts_dir(job_id))  # 팀장이 멈춘 지금, 사진·영상을 한 폴더에 늘어놓는다
     cost = translator.cost_usd
     if server and server.cost_usd:  # Codex 팀장은 비용을 알려 주지 않는다. Claude 팀원이 쓴 비용만 더한다
         cost = (cost or 0.0) + server.cost_usd
-    store.finish_job(
+    finished = store.finish_or_continue(
         job_id,
         "succeeded" if ok else "failed",
         phase="완료" if ok else "실패",
@@ -125,7 +134,7 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
         # 이번 실행이 세션을 만들기 전에 실패해도 이전 세션 id 는 지우지 않는다 (다시 이어갈 수 있게).
         session_id=translator.session_id or job.session_id,
     )
-    return 0 if ok else 1
+    return (0 if ok else 1) if finished else None
 
 
 def build_codex_command(cfg: Config, model: str, resume: str | None, rpc: Path, artifacts: str) -> list[str]:

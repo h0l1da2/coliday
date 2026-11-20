@@ -33,6 +33,7 @@ class WorktreeRemoveError(JobError):
 class Launched:
     job: Job
     warnings: list[str] = field(default_factory=list)
+    queued: bool = False  # 작업이 실행 중이라 요청을 대기시켰다 (지금 실행이 끝나면 이어서 전달된다)
 
 
 def launch(
@@ -83,13 +84,18 @@ def launch(
 
 
 def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: str | None = None) -> Launched:
-    """끝난 작업의 세션과 작업 디렉토리를 그대로 이어받아 후속 요청을 실행한다."""
+    """작업의 세션과 작업 디렉토리를 그대로 이어받아 후속 요청을 실행한다.
+
+    작업이 아직 실행 중이면 요청을 대기시킨다: 지금 실행이 끝나는 대로 같은 세션에 이어서 전달된다.
+    """
     prompt = prompt.strip()
     if not prompt:
         raise JobError("요청 내용이 비어 있습니다.")
     job = reconcile(store, store.get_job(job_id))
-    if not job.is_terminal:
-        raise JobError(f"작업 #{job.id} 은(는) 아직 실행 중입니다. 끝난 뒤에 이어서 시킬 수 있습니다.")
+    if not job.is_terminal and store.queue_message(job.id, prompt):
+        notes = ["이 요청에 준 --model 은 무시됩니다 (실행 중인 팀장이 이어서 처리)."] if model else []
+        return Launched(job, notes, queued=True)
+    job = store.get_job(job_id)  # 대기시키려는 사이에 끝났으면 바로 이어서 시킨다
     if not job.workdir or not Path(job.workdir).is_dir():
         raise JobError(f"작업 #{job.id} 의 작업 디렉토리가 없습니다 (정리된 작업). 새 작업으로 시작하세요.")
     warnings: list[str] = []
@@ -200,31 +206,84 @@ def remove_project(cfg: Config, store: Store, directory: str | Path) -> bool:
     return True
 
 
+OTHER_DIR = "_other"  # 사진·영상이 아닌 파일(찍는 데 쓴 HTML·스크립트·로그 등)을 모아 두는 하위 폴더
+
+
 def artifacts(cfg: Config, job_id: int) -> list[Path]:
-    """작업이 남긴 결과물 파일 (스크린샷·영상 등). 숨김 파일은 뺀다."""
+    """작업이 남긴 결과물 파일 (스크린샷·영상 등). 숨김 파일은 뺀다. 파일을 옮기지는 않는다."""
     root = cfg.artifacts_dir(job_id)
     if not root.is_dir():
         return []
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
-    )
+    try:
+        return sorted(
+            p for p in root.rglob("*")
+            if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+        )
+    except OSError:  # 팀원이 정리하는 중에 읽은 경우
+        return []
+
+
+def is_media(path: Path) -> bool:
+    return path.suffix.lower() in _IMAGE_SUFFIXES | _VIDEO_SUFFIXES
+
+
+def organize(root: Path) -> None:
+    """결과물 폴더를 사용자가 열었을 때 한눈에 보이게 정리한다. 실행이 끝난 뒤에만 부른다.
+
+    - 사진·영상은 하위 폴더에 있어도 root 바로 아래로 꺼낸다 (`verify/wide-ok.png` → `verify-wide-ok.png`).
+    - 나머지 파일(찍는 데 쓴 HTML·스크립트·로그)은 지우지 않고 `_other/` 아래로 옮긴다.
+    팀원이 작업 공간으로 쓰는 동안 옮기면 그 작업이 깨지므로 실행 중에는 건드리지 않는다.
+    """
+    try:
+        files = [p for p in root.rglob("*") if p.is_file()]
+    except OSError:
+        return
+    for path in sorted(files):
+        parts = path.relative_to(root).parts
+        if parts[0] == OTHER_DIR or any(part.startswith(".") for part in parts):
+            continue
+        if is_media(path):
+            if len(parts) == 1:
+                continue
+            target = root / "-".join(parts)
+        else:
+            target = root / OTHER_DIR / Path(*parts)
+        stem, suffix, n = target.stem, target.suffix, 2
+        while target.exists():  # 같은 이름이 이미 있으면 번호를 붙인다
+            target = target.with_name(f"{stem}-{n}{suffix}")
+            n += 1
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(target)
+        except OSError:
+            continue
+    for folder in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            folder.rmdir()  # 비어 있을 때만 지워진다
+        except OSError:
+            pass
 
 
 def artifacts_summary(files: list[Path]) -> str:
     """'3개 (사진 2, 영상 1)' 같은 한 줄 요약."""
     images = sum(p.suffix.lower() in _IMAGE_SUFFIXES for p in files)
     videos = sum(p.suffix.lower() in _VIDEO_SUFFIXES for p in files)
-    kinds = [f"{label} {n}" for label, n in (("사진", images), ("영상", videos), ("기타", len(files) - images - videos)) if n]
-    return f"{len(files)}개 ({', '.join(kinds)})"
+    kinds = [f"{label} {n}" for label, n in (("사진", images), ("영상", videos)) if n]
+    other = len(files) - images - videos
+    text = f"{images + videos}개 ({', '.join(kinds)})" if kinds else "사진·영상 없음"
+    return text + (f" + 기타 파일 {other}개" if other else "")
 
 
-def open_artifacts(cfg: Config, job_id: int) -> Path:
-    """결과물 폴더를 파일 탐색기(Finder)로 연다. 결과물이 없으면 JobError."""
-    if not artifacts(cfg, job_id):
-        raise JobError(f"작업 #{job_id} 에는 결과물이 없습니다 (화면 작업이 아니거나 찍지 못한 경우).")
+def open_artifacts(cfg: Config, store: Store, job_id: int) -> Path:
+    """결과물 폴더를 파일 탐색기(Finder)로 연다. 아직 비어 있어도 연다 (나중에 생긴 파일을 그 창에서 볼 수 있다).
+
+    끝난 작업이면 열기 전에 정리한다 (이 기능이 생기기 전에 끝난 작업도 열 때 정리된다).
+    """
     root = cfg.artifacts_dir(job_id)
     try:
+        root.mkdir(parents=True, exist_ok=True)
+        if reconcile(store, store.get_job(job_id)).is_terminal:
+            organize(root)
         subprocess.Popen(
             [cfg.open_bin, str(root)], stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
@@ -263,6 +322,7 @@ def cancel(store: Store, job: Job) -> bool:
     if job.is_terminal:
         return False
     store.finish_job(job.id, "cancelled", phase="사용자가 취소함")
+    store.clear_queued(job.id)  # 취소한 작업에 대기시킨 요청은 전달하지 않는다
     if job.pid and alive(job.pid):
         try:
             os.killpg(job.pid, signal.SIGTERM)  # worker 는 자기 세션의 리더라 pgid == pid

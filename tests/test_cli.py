@@ -258,18 +258,61 @@ def test_처음_실행은_resume_없이_시작한다(env, repo):
     assert "--resume" not in json.loads((env / "args.json").read_text())["argv"]
 
 
-def test_continue는_실행중이거나_worktree가_없거나_삭제된_작업을_거부한다(env, repo, monkeypatch, capsys):
+def test_실행중인_작업에_보낸_요청은_지금_실행이_끝나면_같은_세션으로_이어서_전달된다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "2")
+    cli.main(["run", "처음 요청", "-C", str(repo), "-d"])
+    store = _store()
+    _wait(lambda: store.get_job(1).status == "running")
+    pid = store.get_job(1).pid
+    capsys.readouterr()
+
+    assert cli.main(["continue", "1", "추가 요청 1", "-d"]) == 0
+    assert cli.main(["continue", "1", "추가 요청 2", "-d"]) == 0
+    assert "실행 중이라 요청을 대기시켰습니다" in capsys.readouterr().out
+    assert [e.message for e in store.events(1) if e.kind == "queued"] == ["추가 요청 1", "추가 요청 2"]
+    assert store.get_job(1).status == "running" and store.last_follow_up(1) is None
+
+    _wait(lambda: os.waitpid(pid, os.WNOHANG)[0] == pid, timeout=30)  # 같은 worker 가 두 번째 실행까지 마친다
+    job = store.get_job(1)
+    assert job.status == "succeeded" and job.cost_usd == pytest.approx(0.10)
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["stdin"] == "추가 요청 1\n\n추가 요청 2"  # 대기한 요청을 한 번에 전달
+    assert recorded["argv"][recorded["argv"].index("--resume") + 1] == "s-1"
+    kinds = [e.kind for e in store.events(1) if e.kind in ("queued", "prompt", "result")]
+    assert kinds == ["result", "prompt", "result"]  # 대기 표시는 후속 요청으로 바뀐다
+
+
+def test_취소한_작업에_대기시킨_요청은_전달하지_않는다(env, repo, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
     cli.main(["run", "x", "-C", str(repo), "-d"])
     store = _store()
     _wait(lambda: store.get_job(1).status == "running")
     pid = store.get_job(1).pid
-
-    assert cli.main(["continue", "1", "더 해줘"]) == 2
-    assert "아직 실행 중" in capsys.readouterr().err
+    cli.main(["continue", "1", "나중에", "-d"])
 
     cli.main(["cancel", "1"])
     _wait(lambda: os.waitpid(pid, os.WNOHANG)[0] == pid)
+
+    assert store.get_job(1).status == "cancelled"
+    assert not any(e.kind in ("queued", "prompt") for e in store.events(1))
+
+
+def test_worker가_죽어_남은_대기_요청은_다음에_이어서_시킬_때_함께_전달된다(env, repo):
+    cli.main(["run", "x", "-C", str(repo)])
+    store = _store()
+    store.add_event(1, "사용자", "queued", "전달 못 한 요청")  # 대기시킨 뒤 worker 가 죽은 상황
+
+    assert cli.main(["continue", "1", "새 요청"]) == 0
+
+    assert json.loads((env / "args.json").read_text())["stdin"] == "전달 못 한 요청\n\n새 요청"
+    assert not any(e.kind == "queued" for e in store.events(1))
+
+
+def test_continue는_worktree가_없거나_삭제된_작업을_거부한다(env, repo, capsys):
+    cli.main(["run", "x", "-C", str(repo)])
+    store = _store()
+    cli.main(["cancel", "1"])
+    store._conn.execute("UPDATE jobs SET status = 'cancelled' WHERE id = 1")
     import shutil
     shutil.rmtree(config.load().worktrees_dir / "myrepo-1")  # worktree 만 직접 지운 경우
     assert cli.main(["continue", "1", "더 해줘"]) == 2
@@ -634,6 +677,7 @@ def test_화면_작업의_결과물_폴더가_팀장과_쓰기_가능한_팀원_
     assert argv[argv.index("--add-dir") + 1] == folder and Path(folder).is_dir()
     for name in ("coder", "codex-coder", "verifier"):
         assert f"이 폴더에 저장한다: {folder}" in agents[name]["prompt"], name
+        assert "하위 폴더를 만들지 말고" in agents[name]["prompt"] and "작업 공간으로 쓰지 않는다" in agents[name]["prompt"]
     for name in ("architect", "reviewer"):  # 읽기만 하는 역할
         assert "화면 작업의 결과물" not in agents[name]["prompt"], name
 
@@ -644,16 +688,21 @@ def test_결과물이_있으면_경로를_알려주고_open으로_폴더를_연�
     folder = config.load().artifacts_dir(1)
 
     out = capsys.readouterr().out
-    assert f"결과물 3개 (사진 1, 영상 1, 기타 1): {folder}" in out and "coliday open 1" in out
+    assert f"결과물 2개 (사진 1, 영상 1) + 기타 파일 1개: {folder}" in out and "coliday open 1" in out
 
     assert cli.main(["open", "1"]) == 0
     out = capsys.readouterr().out
-    assert "login-page.png" in out and "flows/order-cancel.webm" in out and ".hidden" not in out
+    assert "login-page.png" in out and ".hidden" not in out and "notes.txt" not in out
+    # 하위 폴더에 저장한 사진·영상은 맨 위로 꺼내 한 폴더에서 다 보이게 하고, 나머지는 _other 로 모은다
+    assert "flows-order-cancel.webm" in out and "flows/" not in out
+    assert sorted(p.name for p in folder.iterdir() if not p.name.startswith(".")) == [
+        "_other", "flows-order-cancel.webm", "login-page.png"]
+    assert (folder / "_other" / "notes.txt").is_file()
     _wait(lambda: (env / "opened.txt").exists())
     assert (env / "opened.txt").read_text().strip() == str(folder)
 
     cli.main(["show", "1"])
-    assert "결과물 3개" in capsys.readouterr().out
+    assert "결과물 2개" in capsys.readouterr().out
 
     monkeypatch.delenv("FAKE_CLAUDE_ARTIFACT")
     cli.main(["continue", "1", "더"])   # 이어서 시켜도 이전 결과물은 남는다
@@ -662,13 +711,59 @@ def test_결과물이_있으면_경로를_알려주고_open으로_폴더를_연�
     assert not folder.exists()
 
 
-def test_결과물이_없으면_open은_폴더를_열지_않고_알린다(env, repo, capsys):
+def test_결과물_정리는_사진_영상만_맨_위에_늘어놓고_나머지는_other로_모은다(tmp_path):
+    root = tmp_path / "artifacts"
+    (root / "verify" / "deep").mkdir(parents=True)
+    (root / "01-ok.png").write_text("top")
+    (root / "verify-01-ok.png").write_text("already")
+    (root / "verify" / "01-ok.png").write_text("nested")          # 이름이 겹친다
+    (root / "verify" / "deep" / "flow.WEBM").write_text("video")
+    (root / "verify" / "check.js").write_text("script")
+    (root / "dom-ok.html").write_text("html")
+    (root / ".tmp").mkdir()
+    (root / ".tmp" / "work.png").write_text("hidden")
+
+    jobs.organize(root)
+    jobs.organize(root)  # 여러 번 불러도 같다
+
+    assert sorted(p.name for p in root.iterdir()) == [
+        ".tmp", "01-ok.png", "_other", "verify-01-ok-2.png", "verify-01-ok.png", "verify-deep-flow.WEBM"]
+    assert (root / "verify-01-ok.png").read_text() == "already" and (root / "verify-01-ok-2.png").read_text() == "nested"
+    assert sorted(str(p.relative_to(root / "_other")) for p in (root / "_other").rglob("*") if p.is_file()) == [
+        "dom-ok.html", "verify/check.js"]
+
+
+def test_실행중에는_결과물_폴더를_정리하지_않는다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    cli.main(["run", "x", "-C", str(repo), "-d"])
+    store = _store()
+    _wait(lambda: store.get_job(1).status == "running")
+    pid = store.get_job(1).pid
+    work = config.load().artifacts_dir(1) / "verify"
+    _wait(lambda: work.parent.is_dir())
+    work.mkdir()
+    (work / "shot.png").write_text("x")      # 팀원이 작업 공간으로 쓰는 중
+    (work / "check.js").write_text("x")
+
+    assert cli.main(["open", "1"]) == 0
+    assert len(jobs.artifacts(config.load(), 1)) == 2
+    assert (work / "shot.png").is_file() and (work / "check.js").is_file()  # 옮기지 않았다
+
+    cli.main(["cancel", "1"])
+    _wait(lambda: os.waitpid(pid, os.WNOHANG)[0] == pid)
+    assert cli.main(["open", "1"]) == 0      # 끝난 뒤에 열면 정리된다
+    root = config.load().artifacts_dir(1)
+    assert (root / "verify-shot.png").is_file() and (root / "_other" / "verify" / "check.js").is_file()
+
+
+def test_결과물이_아직_없어도_open은_폴더를_열고_없다고_알린다(env, repo, capsys):
     cli.main(["run", "x", "-C", str(repo)])
     capsys.readouterr()
 
-    assert cli.main(["open", "1"]) == 2
-    assert "결과물이 없습니다" in capsys.readouterr().err
-    assert not (env / "opened.txt").exists()
+    assert cli.main(["open", "1"]) == 0
+    assert "아직 결과물(사진·영상)이 없습니다" in capsys.readouterr().out
+    _wait(lambda: (env / "opened.txt").exists())
+    assert (env / "opened.txt").read_text().strip() == str(config.load().artifacts_dir(1))
     assert cli.main(["open", "99"]) == 2
     cli.main(["show", "1"])
     assert "coliday open 1" not in capsys.readouterr().out  # 결과물 줄을 찍지 않는다

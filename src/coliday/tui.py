@@ -29,7 +29,7 @@ from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, 
 from coliday import gitops, jobs, projects, team
 from coliday.config import Config
 from coliday.jobs import STATUS_ICON, JobError, WorktreeRemoveError
-from coliday.store import RESULT, EventRow, Job, Store
+from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
@@ -290,8 +290,9 @@ class ColidayApp(App[None]):
     #jobs { height: 2fr; border: round $primary; }
     #timeline { height: 3fr; border: round $secondary; }
     #timeline Markdown { margin: 0; padding: 0; }
-    #artifacts { height: auto; padding: 0 1; background: $boost; color: $success; text-style: underline; display: none; }
-    #artifacts.-has { display: block; }
+    #artifacts { height: auto; padding: 0 1; background: $boost; color: $text-muted; text-style: underline; display: none; }
+    #artifacts.-shown { display: block; }
+    #artifacts.-has { color: $success; }
     #artifacts:hover { background: $primary; color: $text; }
     #diff-pane { width: 2fr; border: round $accent; }
     #projects:focus-within, #jobs:focus-within, #timeline:focus, #diff-pane:focus-within { border: round $warning; }
@@ -627,12 +628,18 @@ class ColidayApp(App[None]):
         bar = self.query_one("#artifacts", ArtifactBar)
         files = jobs.artifacts(self.cfg, self.selected_id) if self.selected_id is not None else []
         text = ""
+        files = [p for p in files if jobs.is_media(p)] and files  # 사진·영상이 하나도 없으면 '아직 없음'으로 본다
         if files:
             folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
             text = f"📁 결과물 {jobs.artifacts_summary(files)}: {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
+        elif self.selected_id is not None:
+            # 파일이 없거나 사라져도 줄은 그대로 두고 계속 클릭할 수 있게 한다 (팀원이 임시 파일을 지우면 줄이 사라지던 문제).
+            folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
+            text = f"📁 결과물 아직 없음 (사진·영상): {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
         if text != self._artifacts_text:
             self._artifacts_text = text
             bar.update(Text(text))
+            bar.set_class(bool(text), "-shown")
             bar.set_class(bool(files), "-has")
 
     def action_open_artifacts(self) -> None:
@@ -640,11 +647,13 @@ class ColidayApp(App[None]):
             self.notify("선택된 작업이 없습니다.", severity="warning")
             return
         try:
-            root = jobs.open_artifacts(self.cfg, self.selected_id)
-        except JobError as exc:
+            root = jobs.open_artifacts(self.cfg, self.store, self.selected_id)
+        except (JobError, KeyError) as exc:
             self.notify(str(exc), severity="warning", timeout=6)
             return
-        self.notify(f"폴더를 열었습니다: {projects.display(str(root))}", timeout=3)
+        has_media = any(jobs.is_media(p) for p in jobs.artifacts(self.cfg, self.selected_id))
+        empty = "" if has_media else " (아직 사진·영상이 없습니다)"
+        self.notify(f"폴더를 열었습니다: {projects.display(str(root))}{empty}", timeout=4)
 
     def action_timeline_scroll(self, direction: int) -> None:
         log = self.query_one("#timeline", VerticalScroll)
@@ -760,9 +769,6 @@ class ColidayApp(App[None]):
         except KeyError:
             self.notify("선택한 작업이 삭제됐습니다.", severity="warning")
             return False
-        if not job.is_terminal:
-            self.notify(f"작업 #{job.id} 이(가) 아직 실행 중입니다. 끝난 뒤에 보낼 수 있습니다.", severity="warning")
-            return False
         try:
             launched = jobs.continue_job(self.cfg, self.store, job.id, prompt)
         except (JobError, gitops.GitError) as exc:
@@ -770,6 +776,8 @@ class ColidayApp(App[None]):
             return False
         for w in launched.warnings:
             self.notify(w, severity="warning", timeout=8)
+        if launched.queued:
+            self.notify(f"작업 #{job.id} 이(가) 실행 중이라 대기시켰습니다. 지금 실행이 끝나면 이어서 전달됩니다.", timeout=6)
         self.refresh_jobs()
         self._poll_selected()
         timeline = self.query_one("#timeline", VerticalScroll)
@@ -786,7 +794,7 @@ class ColidayApp(App[None]):
                 running = not self.store.get_job(self.selected_id).is_terminal
             except KeyError:
                 return
-            hint = (f"작업 #{self.selected_id} 실행 중 — 끝나면 이어서 보낼 수 있습니다" if running
+            hint = (f"작업 #{self.selected_id} 실행 중 — 지금 보내면 이 실행이 끝난 뒤 이어서 전달됩니다 (Enter)" if running
                     else f"작업 #{self.selected_id} 에 이어서 시킬 일 (Enter)   ·   새 작업은 ctrl+n")
         if chat.placeholder != hint:
             chat.placeholder = hint
@@ -905,6 +913,8 @@ def _diff_renderable(text: str) -> Text:
 
 def _event_line(ev: EventRow) -> Text:
     ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
+    if ev.kind == QUEUED:
+        return Text(f"{ts} ⏳ 대기 (지금 실행이 끝나면 전달): {ev.message}", style="italic yellow")
     actor_style = "bold magenta" if ev.actor == "팀장" else _ACTOR_COLORS[sum(map(ord, ev.actor)) % len(_ACTOR_COLORS)]
     line = Text(f"{ts} ", style="dim")
     line.append(f"{ev.actor:<10} ", style=actor_style)
