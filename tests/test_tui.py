@@ -284,12 +284,19 @@ def test_모델_창에서_기본_에이전트와_역할별_에이전트_모델�
             assert screen.query_one(f"#model-{row('reviewer')}", Input).value == "gpt-r"
             assert screen.query_one(f"#engine-{row('coder')}", Select).value == "follow"
 
+            # 에이전트를 바꾸면 그 줄의 모델 칸이 비워진다 (opus 가 남아 codex:opus 가 되지 않게)
+            screen.query_one("#engine-0", Select).value = "codex"
+            await pilot.pause()
+            assert screen.query_one("#model-0", Input).value == ""
+            assert screen.query_one(f"#model-{row('reviewer')}", Input).value == "gpt-r"  # 다른 줄은 그대로
+
             screen.query_one("#default-engine", Select).value = "codex"          # 기본 에이전트: codex
             screen.query_one("#engine-0", Select).value = "follow"               # 팀장: 기본을 따름
             screen.query_one(f"#engine-{row('coder')}", Select).value = "codex"  # coder: codex 의 특정 모델
-            screen.query_one(f"#model-{row('coder')}", Input).value = "gpt-6.1-sol"
             screen.query_one(f"#engine-{row('reviewer')}", Select).value = "claude"
-            screen.query_one(f"#model-{row('reviewer')}", Input).value = ""
+            await pilot.pause()  # 에이전트를 고른 뒤에 모델을 적는다
+            assert screen.query_one(f"#model-{row('reviewer')}", Input).value == ""  # gpt-r 가 남지 않는다
+            screen.query_one(f"#model-{row('coder')}", Input).value = "gpt-6.1-sol"
             await pilot.pause()
             await pilot.click("#ok")
             await pilot.pause()
@@ -300,9 +307,9 @@ def test_모델_창에서_기본_에이전트와_역할별_에이전트_모델�
             assert (rows["lead"], rows["architect"], rows["reviewer"]) == ("codex", "codex", "claude")
 
             await pilot.press("ctrl+t")
-            app.screen.query_one("#model-0", Input).value = "두 단어"
             app.screen.query_one("#engine-0", Select).value = "claude"
             await pilot.pause()
+            app.screen.query_one("#model-0", Input).value = "두 단어"
             app.screen.query_one("#model-0", Input).focus()
             await pilot.press("enter")
             await pilot.pause()

@@ -227,6 +227,8 @@ def with_model(models: Models, agents: dict[str, dict], role: str, model: str | 
     """role 의 모델을 바꾼 새 설정. model 이 None 이면 기본값으로 되돌린다."""
     if model is not None and not _valid_model(model):
         raise ValueError(f"모델 이름이 올바르지 않습니다: {model!r}")
+    if model is not None and (problem := mismatch(model)):
+        raise ValueError(problem)
     if role == DEFAULT_ROLE:
         return Models(lead=models.lead, agents=models.agents, default=model or CLAUDE)
     if role == LEAD_ROLE:
@@ -237,6 +239,29 @@ def with_model(models: Models, agents: dict[str, dict], role: str, model: str | 
     if model is not None:
         changed[role] = model
     return Models(lead=models.lead, agents=changed, default=models.default)
+
+
+_CLAUDE_NAMES = ("opus", "sonnet", "haiku", "fable", "claude")
+_CODEX_NAMES = ("gpt", "codex", "o1", "o3", "o4")
+
+
+def mismatch(spec: str | None) -> str | None:
+    """에이전트와 모델이 서로 안 맞으면(codex:opus, claude:gpt-6.1-sol) 설명을, 아니면 None.
+
+    모델 칸에 다른 에이전트의 모델 이름이 남은 채 에이전트만 바꾸는 실수를 실행 전에 잡는다.
+    이름으로만 판단하므로 모르는 이름은 통과시킨다 (실제로 있는 모델인지는 각 CLI 가 확인한다).
+    """
+    if spec is None:
+        return None
+    if is_codex(spec):
+        model = (codex_model(spec) or "").lower()
+        if model.startswith(_CLAUDE_NAMES):
+            return f"{model} 은(는) Claude 모델이라 Codex 에서 쓸 수 없습니다. codex 만 쓰거나 codex:gpt-… 형태로 쓰세요."
+        return None
+    model = (canonical(spec) or "").lower()
+    if model.startswith(_CODEX_NAMES):
+        return f"{model} 은(는) Codex 모델이라 Claude 에서 쓸 수 없습니다. codex:{model} 로 쓰거나 Claude 모델을 쓰세요."
+    return None
 
 
 def canonical(spec: str | None) -> str | None:

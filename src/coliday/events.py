@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -130,6 +131,7 @@ class CodexTranslator:
     result: str | None = None
     cost_usd: float | None = None  # Codex 는 토큰 수만 알려 준다
     is_error: bool = False
+    _last_error: str | None = None
 
     def feed(self, raw: dict) -> list[Event]:
         kind = raw.get("type")
@@ -140,7 +142,11 @@ class CodexTranslator:
         if kind in ("turn.failed", "error"):
             self.is_error = True
             error = raw.get("error") if isinstance(raw.get("error"), dict) else {}
-            return [Event(self.lead, "error", _clip(str(error.get("message") or raw.get("message") or "Codex 오류")))]
+            message = _error_text(error.get("message") or raw.get("message") or "Codex 오류")
+            if message == self._last_error:  # Codex 는 같은 오류를 error 와 turn.failed 로 두 번 보낸다
+                return []
+            self._last_error = message
+            return [Event(self.lead, "error", _clip(message))]
         if kind == "item.started" and item.get("type") == "command_execution":
             command = _shell_command(str(item.get("command") or ""))
             if self.hide and self.hide in command:
@@ -156,6 +162,19 @@ class CodexTranslator:
                 self.result = text
                 return [Event(self.lead, "text", _clip(text.splitlines()[0]))]
         return []
+
+
+def _error_text(message: object) -> str:
+    """Codex 는 API 오류를 JSON 문자열로 감싸 보낸다. 사람이 읽을 메시지만 꺼낸다."""
+    text = str(message)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text
+    inner = data.get("error") if isinstance(data, dict) else None
+    if isinstance(inner, dict) and inner.get("message"):
+        return str(inner["message"])
+    return str(data.get("message") or text) if isinstance(data, dict) else text
 
 
 def _shell_command(command: str) -> str:

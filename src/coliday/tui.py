@@ -183,6 +183,19 @@ class ModelScreen(ModalScreen[dict[str, str] | None]):
 
     def on_mount(self) -> None:
         self.query_one("#default-engine", Select).focus()
+        self._ready = False  # 처음 값을 채울 때 나오는 Changed 이벤트는 사용자가 바꾼 것이 아니다
+        self.call_after_refresh(lambda: setattr(self, "_ready", True))
+
+    @on(Select.Changed)
+    def _engine_changed(self, event: Select.Changed) -> None:
+        """에이전트를 바꾸면 그 줄의 모델 칸을 비운다. 모델 이름은 에이전트마다 달라 남겨 두면 codex:opus 같은 값이 된다."""
+        if not getattr(self, "_ready", False):
+            return
+        model_id = "default-model" if event.select.id == "default-engine" else (event.select.id or "").replace("engine-", "model-")
+        field = self.query_one(f"#{model_id}", Input)
+        if field.value:
+            field.value = ""
+            self.notify("에이전트를 바꿔서 모델 칸을 비웠습니다 (비우면 그 에이전트의 기본 모델).", timeout=4)
 
     @on(Input.Submitted)
     @on(Button.Pressed, "#ok")

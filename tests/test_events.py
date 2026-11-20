@@ -64,3 +64,18 @@ def test_긴_메시지는_잘라낸다():
 
     assert len(events[0].message) == 160
     assert events[0].message.endswith("…")
+
+
+def test_codex_오류는_감싼_JSON에서_메시지만_꺼내고_한_번만_남긴다():
+    from coliday.events import CodexTranslator
+    inner = json.dumps({"type": "error", "status": 400,
+                        "error": {"type": "invalid_request_error", "message": "The 'fable' model is not supported."}})
+    t = CodexTranslator()
+
+    first = t.feed({"type": "error", "message": inner})
+    second = t.feed({"type": "turn.failed", "error": {"message": inner}})
+    plain = t.feed({"type": "error", "message": "네트워크 오류"})
+
+    assert [(e.kind, e.message) for e in first] == [("error", "The 'fable' model is not supported.")]
+    assert second == [] and t.is_error
+    assert [e.message for e in plain] == ["네트워크 오류"]

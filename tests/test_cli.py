@@ -692,6 +692,26 @@ def test_codex로_도는_역할도_결과물_폴더에_쓸_수_있게_샌드박�
     assert "read-only" in member["argv"] and not any("writable_roots" in a for a in member["argv"])
 
 
+def test_에이전트와_모델이_안_맞으면_설정과_실행_전에_거부한다(env, repo, capsys):
+    assert cli.main(["model", "lead", "codex:fable"]) == 2
+    assert "Claude 모델이라 Codex 에서 쓸 수 없습니다" in capsys.readouterr().err
+    assert cli.main(["model", "coder", "claude:gpt-6.1-sol"]) == 2
+    assert "codex:gpt-6.1-sol 로 쓰거나" in capsys.readouterr().err
+    assert cli.main(["model", "coder", "gpt-6.1-sol"]) == 2      # 에이전트 없이 쓰면 Claude 모델로 본다
+    assert cli.main(["model", "default", "codex:opus"]) == 2
+    assert not config.load().models_path.exists()
+    assert cli.main(["run", "x", "-C", str(repo), "--model", "codex:sonnet"]) == 2
+    assert _store().list_jobs() == []
+
+    # 이미 저장된 잘못된 값도 실행 전에 알린다 (작업을 만들지 않는다)
+    config.load().models_path.write_text(json.dumps({"lead": "codex:fable"}))
+    capsys.readouterr()
+    assert cli.main(["run", "x", "-C", str(repo)]) == 2
+    assert "fable 은(는) Claude 모델" in capsys.readouterr().err and _store().list_jobs() == []
+    assert cli.main(["model", "lead", "codex"]) == 0           # 고칠 수 있다
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+
+
 def _codex_calls(env):
     path = env / "codex.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []

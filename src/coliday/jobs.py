@@ -124,7 +124,9 @@ def lead_model(cfg: Config) -> str:
 
 
 def check_codex(cfg: Config, model: str | None) -> None:
-    """Codex 모델을 고르는데 codex 실행 파일이 없으면 미리 알린다 (실행 중에 팀원이 실패하는 것보다 낫다)."""
+    """에이전트와 모델이 안 맞거나 codex 실행 파일이 없으면 미리 알린다 (실행 중에 실패하는 것보다 낫다)."""
+    if problem := team.mismatch(model):
+        raise JobError(f"{problem} (바꾸기: coliday model)")
     if team.is_codex(model) and shutil.which(cfg.codex_bin) is None:
         raise JobError(f"Codex CLI 를 찾을 수 없습니다: {cfg.codex_bin}. 설치하거나 COLIDAY_CODEX_BIN 으로 경로를 지정하세요.")
 
