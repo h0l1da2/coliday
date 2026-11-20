@@ -44,7 +44,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="coliday",
         description="팀장 에이전트에게 일을 시키고 진행 상황을 본다. 인자 없이 실행하면 TUI 를 연다.",
     )
-    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,prompt,ls,show,diff,cancel,rm}")
+    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,prompt,ls,show,diff,open,cancel,rm}")
 
     sub.add_parser("ui", help="TUI 열기 (인자 없이 실행한 것과 같다)")
 
@@ -92,6 +92,10 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("id", type=int)
     diff.set_defaults(func=_cmd_diff)
 
+    opn = sub.add_parser("open", help="작업이 남긴 결과물(스크린샷·영상) 폴더 열기")
+    opn.add_argument("id", type=int)
+    opn.set_defaults(func=_cmd_open)
+
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
     cancel.add_argument("id", type=int)
     cancel.set_defaults(func=_cmd_cancel)
@@ -131,7 +135,9 @@ def _cmd_run(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     if args.detach:
         print(f"진행 상황: coliday show {job.id} -f")
         return 0
-    return _follow(store, job.id)
+    code = _follow(store, job.id)
+    _print_artifacts(cfg, job.id)
+    return code
 
 
 def _cmd_continue(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
@@ -144,7 +150,9 @@ def _cmd_continue(cfg: config.Config, store: Store, args: argparse.Namespace) ->
     if args.detach:
         print(f"진행 상황: coliday show {job.id} -f")
         return 0
-    return _follow(store, job.id, after_id=last)
+    code = _follow(store, job.id, after_id=last)
+    _print_artifacts(cfg, job.id)
+    return code
 
 
 def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
@@ -210,6 +218,7 @@ def _cmd_show(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
     for ev in store.events(job.id):
         _print_event(ev)
     _print_result(store.get_job(job.id), reported=store.has_result_event(job.id))
+    _print_artifacts(cfg, job.id)
     return 0
 
 
@@ -224,6 +233,16 @@ def _cmd_diff(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
         subprocess.run(pager, shell=True, input=text, text=True, check=False)
     else:
         sys.stdout.write(text)
+    return 0
+
+
+def _cmd_open(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
+    store.get_job(args.id)  # 없는 작업이면 KeyError → "찾을 수 없습니다"
+    root = jobs.open_artifacts(cfg, args.id)
+    files = jobs.artifacts(cfg, args.id)
+    print(f"결과물 {jobs.artifacts_summary(files)}: {root}")
+    for path in files:
+        print(f"  {path.relative_to(root)}")
     return 0
 
 
@@ -258,6 +277,12 @@ def _follow(store: Store, job_id: int, after_id: int = 0) -> int:
     except KeyboardInterrupt:
         print(f"\n따라보기를 멈췄습니다. 작업은 계속됩니다: coliday show {job_id} -f / 취소: coliday cancel {job_id}")
         return 130
+
+
+def _print_artifacts(cfg: config.Config, job_id: int) -> None:
+    files = jobs.artifacts(cfg, job_id)
+    if files:
+        print(f"결과물 {jobs.artifacts_summary(files)}: {cfg.artifacts_dir(job_id)}  (열기: coliday open {job_id})")
 
 
 def _print_header(job: Job) -> None:

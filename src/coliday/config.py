@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ class Config:
     permission_mode: str
     codex_bin: str = "codex"
     max_attempts: int = 5  # 실패한 작업을 처음 포함해 몇 번까지 시도할지 (팀장·팀원 지침에 들어간다)
+    open_bin: str = "open"  # 폴더를 파일 탐색기로 여는 명령
 
     @property
     def db_path(self) -> Path:
@@ -42,6 +44,10 @@ class Config:
     def job_dir(self, job_id: int) -> Path:
         return self.jobs_dir / str(job_id)
 
+    def artifacts_dir(self, job_id: int) -> Path:
+        """작업이 남기는 스크린샷·영상 등 결과물 폴더."""
+        return self.job_dir(job_id) / "artifacts"
+
 
 def load() -> Config:
     home = Path(os.environ.get("COLIDAY_HOME", Path.home() / ".coliday")).expanduser()
@@ -51,6 +57,7 @@ def load() -> Config:
         permission_mode=os.environ.get("COLIDAY_PERMISSION_MODE", "auto"),
         codex_bin=os.environ.get("COLIDAY_CODEX_BIN", "codex"),
         max_attempts=_max_attempts(os.environ.get("COLIDAY_MAX_ATTEMPTS")),
+        open_bin=os.environ.get("COLIDAY_OPEN_BIN") or ("open" if sys.platform == "darwin" else "xdg-open"),
     )
 
 

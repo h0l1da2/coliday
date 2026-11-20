@@ -33,7 +33,7 @@ from coliday.store import RESULT, EventRow, Job, Store
 
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
-    "models", "prompts", "cancel_job", "remove_job", "timeline_scroll",
+    "models", "prompts", "cancel_job", "remove_job", "timeline_scroll", "open_artifacts",
 })
 POLL_SEC = 1.0
 DIFF_EVERY_TICKS = 2
@@ -82,6 +82,13 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool] | None]):
     @on(Button.Pressed, "#close")
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+class ArtifactBar(Static):
+    """선택한 작업의 결과물 폴더 한 줄. 클릭하면 폴더를 연다. 결과물이 없으면 숨긴다."""
+
+    def on_click(self) -> None:
+        self.app.action_open_artifacts()
 
 
 class ProjectTable(DataTable):
@@ -270,6 +277,9 @@ class ColidayApp(App[None]):
     #jobs { height: 2fr; border: round $primary; }
     #timeline { height: 3fr; border: round $secondary; }
     #timeline Markdown { margin: 0; padding: 0; }
+    #artifacts { height: auto; padding: 0 1; background: $boost; color: $success; text-style: underline; display: none; }
+    #artifacts.-has { display: block; }
+    #artifacts:hover { background: $primary; color: $text; }
     #diff-pane { width: 2fr; border: round $accent; }
     #projects:focus-within, #jobs:focus-within, #timeline:focus, #diff-pane:focus-within { border: round $warning; }
     NewJobScreen, AddProjectScreen, ModelScreen, PromptScreen, ConfirmScreen { align: center middle; }
@@ -294,6 +304,7 @@ class ColidayApp(App[None]):
         Binding("ctrl+g", "add_project", "프로젝트 추가", priority=True, key_display="G"),
         Binding("ctrl+t", "models", "모델", priority=True, key_display="T"),
         Binding("ctrl+p", "prompts", "프롬프트", priority=True, key_display="P"),
+        Binding("ctrl+f", "open_artifacts", "결과물 폴더", priority=True, key_display="F"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
         Binding("tab", "focus_next", "패널 이동", show=False),
@@ -322,6 +333,7 @@ class ColidayApp(App[None]):
         self._last_status: str | None = None
         self._diff_text: str | None = None
         self._copied: str | None = None
+        self._artifacts_text = ""
         self._ticks = 0
 
     # ── 화면 구성 ────────────────────────────────────────────
@@ -332,6 +344,7 @@ class ColidayApp(App[None]):
                 yield ProjectTable(id="projects", cursor_type="row", show_header=False)
                 yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
                 yield VerticalScroll(id="timeline")
+                yield ArtifactBar(id="artifacts")
                 # select_on_focus 를 끄지 않으면 포커스를 받을 때 전체 선택돼 다음 글자가 쓴 내용을 지운다.
                 yield Input(id="chat", select_on_focus=False)
             with VerticalScroll(id="diff-pane"):
@@ -372,6 +385,7 @@ class ColidayApp(App[None]):
         self.refresh_jobs()
         self._poll_selected()
         self._update_chat_hint()
+        self._update_artifacts()
 
     def refresh_projects(self, select: str | None = None) -> None:
         """목록 파일이 바뀌었으면(다른 터미널 포함) 다시 그린다. select 가 목록에 있으면 그 줄을 고른다."""
@@ -520,6 +534,7 @@ class ColidayApp(App[None]):
         self.query_one("#diff-pane").border_title = "변경 사항"
         self.query_one("#diff", Static).update("작업을 선택하세요.")
         self._update_chat_hint()
+        self._update_artifacts()
 
     def select_job(self, job_id: int) -> None:
         if job_id == self.selected_id:
@@ -543,6 +558,7 @@ class ColidayApp(App[None]):
         self.query_one("#diff", Static).update("diff 계산 중…")
         self._poll_selected(force_diff=True)
         self._update_chat_hint()
+        self._update_artifacts()
 
     def _poll_selected(self, force_diff: bool = False) -> None:
         if self.selected_id is None:
@@ -593,6 +609,29 @@ class ColidayApp(App[None]):
         log.mount(*(item if isinstance(item, Markdown) else Static(item) for item in items))
         if at_end:
             self.call_after_refresh(log.scroll_end, animate=False)
+
+    def _update_artifacts(self) -> None:
+        bar = self.query_one("#artifacts", ArtifactBar)
+        files = jobs.artifacts(self.cfg, self.selected_id) if self.selected_id is not None else []
+        text = ""
+        if files:
+            folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
+            text = f"📁 결과물 {jobs.artifacts_summary(files)}: {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
+        if text != self._artifacts_text:
+            self._artifacts_text = text
+            bar.update(Text(text))
+            bar.set_class(bool(files), "-has")
+
+    def action_open_artifacts(self) -> None:
+        if self.selected_id is None:
+            self.notify("선택된 작업이 없습니다.", severity="warning")
+            return
+        try:
+            root = jobs.open_artifacts(self.cfg, self.selected_id)
+        except JobError as exc:
+            self.notify(str(exc), severity="warning", timeout=6)
+            return
+        self.notify(f"폴더를 열었습니다: {projects.display(str(root))}", timeout=3)
 
     def action_timeline_scroll(self, direction: int) -> None:
         log = self.query_one("#timeline", VerticalScroll)

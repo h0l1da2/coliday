@@ -699,3 +699,48 @@ def test_ctrl_c로_어디서든_종료하고_실행중인_작업은_계속된다
         while time.time() < end and os.waitpid(pid, os.WNOHANG)[0] != pid:
             time.sleep(0.1)
         store.close()
+
+
+def test_결과물이_있는_작업은_폴더_경로가_보이고_클릭하거나_단축키로_연다(env, repo, monkeypatch):
+    fake_open = env / "open"
+    fake_open.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {env / 'opened.txt'}\n")
+    fake_open.chmod(0o755)
+    monkeypatch.setenv("COLIDAY_OPEN_BIN", str(fake_open))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    plain = jobs.launch(cfg, store, "화면 없는 작업", repo).job
+    monkeypatch.setenv("FAKE_CLAUDE_ARTIFACT", "login-page.png,demo.webm")
+    shots = jobs.launch(cfg, store, "로그인 화면 수정", repo).job
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            bar = app.query_one("#artifacts", Static)
+            await _until(pilot, lambda: all(j.is_terminal for j in store.list_jobs()))
+            await _until(pilot, lambda: app.selected_id == shots.id)
+            await _until(pilot, lambda: bar.display)
+            text = str(bar.content)
+            assert "결과물 2개 (사진 1, 영상 1)" in text and f"jobs/{shots.id}/artifacts" in text
+
+            await pilot.click("#artifacts")
+            await _until(pilot, lambda: (env / "opened.txt").exists())
+            assert (env / "opened.txt").read_text().split() == [str(cfg.artifacts_dir(shots.id))]
+
+            app.query_one("#chat", Input).focus()
+            await pilot.press("ctrl+f")   # 채팅 입력 중에도 열린다
+            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 2)
+
+            # 결과물이 없는 작업으로 옮기면 줄이 사라지고, 단축키는 없다고 알린다
+            app.query_one("#jobs", DataTable).focus()
+            await pilot.press("down")
+            await _until(pilot, lambda: app.selected_id == plain.id)
+            await _until(pilot, lambda: not bar.display)
+            await pilot.press("ctrl+f")
+            await pilot.pause()
+            assert any("결과물이 없습니다" in n.message for n in app._notifications)
+            assert len((env / "opened.txt").read_text().split()) == 2
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()

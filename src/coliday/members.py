@@ -130,6 +130,8 @@ def run_member(
     model = spec.get("model")
     if team.is_codex(model):
         cmd = [cfg.codex_bin, "exec", "--json", "--skip-git-repo-check", "-s", team.codex_sandbox(spec)]
+        if team.codex_sandbox(spec) == "workspace-write":
+            cmd += team.codex_writable_roots(cfg.artifacts_dir(job.id))
         if team.codex_model(model):
             cmd += ["-m", team.codex_model(model)]
         cmd.append("-")
@@ -140,6 +142,7 @@ def run_member(
             cfg.claude_bin, "-p", "--output-format", "stream-json", "--verbose",
             "--permission-mode", cfg.permission_mode, "--permission-prompts", "none",
             "--append-system-prompt", prompt, "-n", f"coliday#{job.id}:{role}",
+            "--add-dir", str(cfg.artifacts_dir(job.id)),
         ]
         if isinstance(model, str) and model:
             cmd += ["--model", model]

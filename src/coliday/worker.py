@@ -28,8 +28,9 @@ def build_command(
         "--permission-mode", cfg.permission_mode,
         "--permission-prompts", "none",
         "--agents", agents_file,
-        "--append-system-prompt", team.lead_prompt(cfg.max_attempts),
+        "--append-system-prompt", team.lead_prompt(cfg.max_attempts, str(cfg.artifacts_dir(job_id))),
         "-n", f"coliday#{job_id}",
+        "--add-dir", str(cfg.artifacts_dir(job_id)),  # 작업 디렉토리 밖이지만 결과물은 쓸 수 있게 한다
     ]
     if model:
         cmd += ["--model", model]
@@ -44,10 +45,12 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
     job = store.get_job(job_id)
     job_dir = cfg.job_dir(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
+    cfg.artifacts_dir(job_id).mkdir(exist_ok=True)  # 스크린샷·영상을 남길 곳. 이어서 시켜도 같은 폴더에 쌓인다
+    artifacts = str(cfg.artifacts_dir(job_id))
 
     try:
         resolved = team.resolve_agents(
-            team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), cfg.max_attempts
+            team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), cfg.max_attempts, artifacts
         )
     except (OSError, ValueError) as exc:  # 잘못된 사용자 설정
         store.add_event(job_id, LEAD, "error", f"에이전트·모델 설정 오류: {exc}")
@@ -64,13 +67,15 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
     if team.is_codex(job.model):
         # Codex 팀장: 지시문을 요청 앞에 붙이고, 팀원 실행 요청은 members.Server 가 받는다.
         server = members.Server(cfg, job, resolved)
-        cmd = build_codex_command(cfg, job.model, resume, server.directory)
-        prompt = f"{team.codex_lead_prompt(resolved, members.agent_command(job_id), cfg.max_attempts)}\n# 사용자 요청\n{prompt}"
+        cmd = build_codex_command(cfg, job.model, resume, server.directory, artifacts)
+        lead = team.codex_lead_prompt(resolved, members.agent_command(job_id), cfg.max_attempts, artifacts)
+        prompt = f"{lead}\n# 사용자 요청\n{prompt}"
         translator = CodexTranslator(hide=members.MARKER)
     else:
         agents_file = job_dir / "agents.json"
         agents_file.write_text(
-            json.dumps(team.claude_agents(resolved, cfg.codex_bin), ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(team.claude_agents(resolved, cfg.codex_bin, artifacts), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         cmd = build_command(cfg, str(agents_file), job.model, job_id, resume)
         translator = Translator()
@@ -123,15 +128,15 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
     return 0 if ok else 1
 
 
-def build_codex_command(cfg: Config, model: str, resume: str | None, rpc: Path) -> list[str]:
-    """Codex 팀장 명령. 샌드박스(workspace-write)는 유지하고 팀원 요청 폴더만 쓸 수 있게 연다."""
+def build_codex_command(cfg: Config, model: str, resume: str | None, rpc: Path, artifacts: str) -> list[str]:
+    """Codex 팀장 명령. 샌드박스(workspace-write)는 유지하고 팀원 요청 폴더와 결과물 폴더만 쓸 수 있게 연다."""
     cmd = [cfg.codex_bin, "exec"]
     if resume:
         cmd += ["resume", resume]
     cmd += [
         "--json", "--skip-git-repo-check",
         "-c", 'sandbox_mode="workspace-write"',  # `exec resume` 에는 -s 옵션이 없어 설정 값으로 준다
-        "-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(str(rpc))}]",
+        *team.codex_writable_roots(rpc, artifacts),
     ]
     if team.codex_model(model):
         cmd += ["-m", team.codex_model(model)]

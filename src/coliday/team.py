@@ -130,8 +130,10 @@ DEFAULT_AGENTS: dict[str, dict] = {
 }
 
 
-def lead_prompt(max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> str:
-    return _LEAD_TEMPLATE.replace(_N, str(max_attempts))
+def lead_prompt(max_attempts: int = DEFAULT_MAX_ATTEMPTS, artifacts: str | None = None) -> str:
+    """팀장 지시문. artifacts 를 주면 화면 작업의 결과물을 그 폴더에 남기라는 절이 붙는다."""
+    text = _LEAD_TEMPLATE.replace(_N, str(max_attempts))
+    return text + _LEAD_ARTIFACTS_RULE.replace("{artifacts}", artifacts) if artifacts else text
 
 
 LEAD_PROMPT = lead_prompt()  # 기본 시도 횟수로 만든 지시문
@@ -142,6 +144,31 @@ _MEMBER_RETRY_RULE = """\
 명령·빌드·테스트 등 맡은 작업이 실패하면 원인을 고쳐 다시 시도하되, 같은 작업은 처음 시도를 포함해 최대 {max_attempts}번까지만 시도한다.
 {max_attempts}번 해도 안 되면 더 시도하지 말고 멈춘 뒤, "최대 시도 횟수 도달"이라고 밝히고 팀장에게 정리해서 보고한다:
 시도한 방법과 횟수, 마지막 오류 메시지, 지금 코드 상태(무엇을 바꿨고 무엇이 깨져 있는지). 성공한 것처럼 쓰지 않는다.
+"""
+
+
+ARTIFACTS_PLACEHOLDER = "<작업별 결과물 폴더>"
+
+_MEMBER_ARTIFACTS_RULE = """\
+
+## 화면 작업의 결과물
+웹 화면·UI 를 만들거나 바꾸는 작업이면 실제로 실행해서 눈으로 확인할 수 있는 결과물을 남긴다. 화면과 무관한 작업이면 이 절은 무시한다.
+- 스크린샷(.png)이나 녹화 영상(.webm, .mp4)을 이 폴더에 저장한다: {artifacts}
+- 프로젝트에 Playwright 같은 브라우저 자동화 도구가 있으면 그것을 쓴다. 없으면 `npx playwright` 처럼 임시로 실행하되
+  프로젝트 의존성(package.json 등)에는 추가하지 않는다.
+- 파일 이름은 무엇을 찍었는지 알 수 있게 짓는다 (예: login-page.png, order-cancel-flow.webm).
+- 개발 서버를 띄웠으면 끝나고 반드시 종료한다. 포트가 사용 중이면 다른 포트를 쓴다 (다른 작업이 동시에 돌고 있을 수 있다).
+- 로그인이나 백엔드가 필요해서 찍지 못했으면 찍은 것처럼 쓰지 말고 "찍지 못함"과 이유를 보고한다.
+- 보고에 저장한 파일 이름과 각 파일이 무엇을 보여 주는지 적는다.
+"""
+
+_LEAD_ARTIFACTS_RULE = """\
+
+## 화면 작업의 결과물
+웹 화면·UI 를 만들거나 바꾸는 작업이면 구현 담당이나 verifier 에게 실제로 실행해 스크린샷이나 녹화 영상을 남기게 한다.
+- 결과물 폴더: {artifacts}
+- 최종 보고에 저장된 파일 이름과 각 파일이 무엇을 보여 주는지 적는다. 찍지 못했으면 이유를 적는다.
+- 화면과 무관한 작업이면 이 절은 무시한다.
 """
 
 
@@ -247,9 +274,11 @@ def is_codex(model: object) -> bool:
 
 
 def resolve_agents(
-    agents: dict[str, dict], models: Models, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    agents: dict[str, dict], models: Models, max_attempts: int = DEFAULT_MAX_ATTEMPTS, artifacts: str | None = None,
 ) -> dict[str, dict]:
     """실행에 쓰는 팀원 정의 사본: 모델 설정을 덮어쓰고 지침에 최대 시도 횟수 규칙을 붙인다.
+
+    artifacts 를 주면 파일을 쓸 수 있는 팀원(구현·검증)에게 화면 작업의 결과물을 그 폴더에 남기라는 절도 붙인다.
 
     정의에 없는 팀원의 설정은 무시한다.
     """
@@ -262,17 +291,27 @@ def resolve_agents(
         else:
             spec.pop("model", None)  # Claude 기본: 팀장 모델을 따른다
         spec["prompt"] = str(spec.get("prompt") or "").rstrip() + "\n" + _MEMBER_RETRY_RULE.replace(_N, str(max_attempts))
+        if artifacts and codex_sandbox(spec) == "workspace-write":  # 설계·리뷰처럼 읽기만 하는 역할은 뺀다
+            spec["prompt"] += _MEMBER_ARTIFACTS_RULE.replace("{artifacts}", artifacts)
         out[name] = spec
     return out
 
 
-def claude_agents(resolved: dict[str, dict], codex_bin: str = CODEX) -> dict[str, dict]:
+def claude_agents(resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None) -> dict[str, dict]:
     """Claude 팀장의 `claude --agents` 에 넘길 정의: Codex 팀원은 래퍼로 바꾼다."""
     out: dict[str, dict] = {}
     for name, spec in resolved.items():
         spec = {k: v for k, v in spec.items() if k != "codex_sandbox"}  # coliday 전용 키
-        out[name] = _codex_wrapper(spec, codex_sandbox(resolved[name]), codex_bin) if is_codex(spec.get("model")) else spec
+        if is_codex(spec.get("model")):
+            spec = _codex_wrapper(spec, codex_sandbox(resolved[name]), codex_bin, artifacts)
+        out[name] = spec
     return out
+
+
+def codex_writable_roots(*paths: str | Path | None) -> list[str]:
+    """Codex 샌드박스(workspace-write)에서 작업 디렉토리 말고도 쓸 수 있게 열 폴더를 주는 옵션."""
+    roots = [str(p) for p in paths if p]
+    return ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"] if roots else []
 
 
 def apply_models(agents: dict[str, dict], models: Models, codex_bin: str = CODEX) -> dict[str, dict]:
@@ -295,9 +334,10 @@ def codex_model(model: str) -> str | None:
 
 def codex_lead_prompt(
     resolved: dict[str, dict], agent_command: str, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    artifacts: str | None = None,
 ) -> str:
     """Codex 팀장 지시문: Claude 용과 같되, 팀원에게 맡기는 방법만 셸 명령으로 바꾼다."""
-    head, _, rest = lead_prompt(max_attempts).partition(_TEAM_HEADING)
+    head, _, rest = lead_prompt(max_attempts, artifacts).partition(_TEAM_HEADING)
     _, _, tail = rest.partition("\n## ")
     roles = "\n".join(f"- {name}: {spec.get('description') or ''}".rstrip() for name, spec in resolved.items())
     how = (
@@ -313,10 +353,12 @@ def codex_lead_prompt(
     return f"{head}{how}\n## {tail}"
 
 
-def _codex_wrapper(spec: dict, sandbox: str, codex_bin: str) -> dict:
+def _codex_wrapper(spec: dict, sandbox: str, codex_bin: str, artifacts: str | None = None) -> dict:
     """팀원의 역할 지침을 그대로 Codex 에 넘기는 Claude 래퍼 정의."""
     model = spec["model"].partition(":")[2]
     command = f'{shlex.quote(codex_bin)} exec -C "$PWD" -s {sandbox} --skip-git-repo-check'
+    if sandbox == "workspace-write":
+        command += "".join(f" {shlex.quote(part)}" for part in codex_writable_roots(artifacts))
     if model:
         command += f" -m {shlex.quote(model)}"
     command += ' -o "$OUT" - < "$PROMPT"'
@@ -362,14 +404,16 @@ def role_prompts(
     if role is not None and role != LEAD_ROLE and role not in agents:
         raise ValueError(f"알 수 없는 역할: {role} (가능: {', '.join([LEAD_ROLE, *agents])})")
     out: list[tuple[str, str]] = []
-    resolved = resolve_agents(agents, models, max_attempts)
+    resolved = resolve_agents(agents, models, max_attempts, ARTIFACTS_PLACEHOLDER)
     for name, model, _ in model_rows(agents, models):
         if role not in (None, name) or name == DEFAULT_ROLE:
             continue
         if name == LEAD_ROLE:
-            prompt = lead_prompt(max_attempts)
+            prompt = lead_prompt(max_attempts, ARTIFACTS_PLACEHOLDER)
             if is_codex(lead_spec(models)):
-                prompt = codex_lead_prompt(resolved, "coliday _agent <작업별 임시 폴더>", max_attempts)
+                prompt = codex_lead_prompt(
+                    resolved, "coliday _agent <작업별 임시 폴더>", max_attempts, ARTIFACTS_PLACEHOLDER
+                )
             out.append((f"lead (팀장) · 모델: {model}", prompt.strip()))
             continue
         spec = resolved[name]

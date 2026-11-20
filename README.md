@@ -52,7 +52,7 @@ ln -s "$PWD/.venv/bin/coliday" ~/.local/bin/coliday
   선택한 작업에 이어서 시킨다 (같은 세션·같은 worktree, 타임라인도 이어진다). 작업이 하나도 없으면 고른 프로젝트에서
   새 작업으로 시작한다. 실행 중인 작업에는 보낼 수 없고, 쓴 내용은 입력창에 남는다. Esc 로 작업 목록으로 돌아간다.
 - 글자 키는 채팅에 쓰이므로 단축키는 모두 ctrl 조합이다: `ctrl+n` 새 작업(새 세션·새 worktree), `ctrl+o` 프로젝트 목록,
-  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 프롬프트, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제, `ctrl+c` 종료.
+  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 프롬프트, `ctrl+f` 결과물 폴더, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제, `ctrl+c` 종료.
 - 처음 열면 프로젝트 목록에서 시작한다. ↑/↓ 로 작업 위치를 고르고 Enter 를 누르면 작업 목록으로 넘어간다.
   작업 목록에서 Enter 를 누르면 채팅 입력으로 간다.
 - 맨 위는 연결된 프로젝트 디렉토리 목록이다. `ctrl+g` 로 디렉토리와 이름(비우면 폴더 이름)을 입력해 추가한다.
@@ -63,6 +63,8 @@ ln -s "$PWD/.venv/bin/coliday" ~/.local/bin/coliday
 - `ctrl+p` 로 팀장·팀원에게 주는 프롬프트를 본다.
 - 이어서 시킨 작업의 타임라인에는 이전 요청·진행 과정·팀장 보고가 모두 남는다. 마우스 휠이나 PgUp/PgDn(또는 alt+↑/↓)로
   올려 본다. 채팅 입력 중에도 PgUp/PgDn 은 타임라인을 넘긴다.
+- 화면(UI) 작업처럼 스크린샷이나 영상을 남긴 작업은 타임라인 아래에 결과물 폴더 경로가 한 줄로 나온다.
+  그 줄을 클릭하거나 `ctrl+f` 를 누르면 폴더가 Finder 로 열려 사진·영상을 바로 볼 수 있다 (터미널 안에 그리지는 않는다).
 - 타임라인과 변경 사항은 마우스로 드래그하면 선택한 부분이 바로 클립보드에 복사된다.
 - `ctrl+c` 로 TUI 를 닫아도 작업은 백그라운드에서 계속된다. 다른 터미널에서 시킨 작업도 같은 목록에 보인다.
 
@@ -83,6 +85,7 @@ coliday prompt                        # 팀장·팀원 프롬프트 보기 (coli
 coliday ls                            # 작업 목록 (텍스트)
 coliday show 3 -f                     # 작업 3 타임라인 따라보기
 coliday diff 3                        # 작업 3 이 만든 코드 변경
+coliday open 3                        # 작업 3 이 남긴 결과물(스크린샷·영상) 폴더 열기
 coliday cancel 3                      # 취소
 coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 worktree·브랜치 (변경이 남아 있으면 --force 필요)
 ```
@@ -103,6 +106,7 @@ coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 
 | `COLIDAY_CLAUDE_BIN` | `claude` | claude 실행 파일 |
 | `COLIDAY_PERMISSION_MODE` | `auto` | `claude --permission-mode` 값. 권한 확인이 필요한 동작은 자동 거부된다 |
 | `COLIDAY_CODEX_BIN` | `codex` | codex 실행 파일 |
+| `COLIDAY_OPEN_BIN` | `open` (macOS) / `xdg-open` | 결과물 폴더를 여는 명령 |
 | `COLIDAY_MAX_ATTEMPTS` | `5` | 실패한 작업을 처음 포함해 몇 번까지 시도할지 (1 이상의 정수) |
 
 어떤 작업(빌드, 테스트, 재작업 등)이 실패하면 팀원과 팀장은 같은 작업을 최대 `COLIDAY_MAX_ATTEMPTS` 번까지만 시도한다.
@@ -148,11 +152,21 @@ TUI 에서는 `ctrl+t` 창 맨 위에서 기본 에이전트를 고르고, 역�
 팀원 정의를 바꾸려면 `~/.coliday/agents.json` 에 `claude --agents` 형식 JSON 을 둔다
 (기본값은 `src/coliday/team.py` 의 `DEFAULT_AGENTS`). 프로젝트별 규칙은 각 레포의 `AGENTS.md` / `CLAUDE.md` 를 따른다.
 
+## 화면 작업의 결과물
+
+웹 화면·UI 를 만들거나 바꾸는 작업이면 팀원(구현·검증 담당)이 실제로 실행해서 스크린샷(.png)이나 녹화 영상(.webm, .mp4)을
+`~/.coliday/jobs/<id>/artifacts/` 에 남기고, 팀장은 최종 보고에 파일 이름과 내용을 적는다.
+
+- 찍는 도구는 프로젝트에 있는 것(Playwright 등)을 쓰고, 없으면 `npx playwright` 처럼 임시로 실행한다 (의존성에 추가하지 않는다).
+- 로그인이나 백엔드가 필요해 찍지 못하면 "찍지 못함"과 이유를 보고한다. 그때는 결과물 줄이 나오지 않는다.
+- 이어서 시키면 같은 폴더에 쌓이고, 작업을 삭제하면 결과물도 함께 지워진다. 남길 파일은 먼저 옮긴다.
+- 실제로 찍을지는 팀장·팀원이 작업 내용을 보고 판단한다 (지침으로 주는 것이라 `coliday prompt` 에서 볼 수 있다).
+
 ## 저장 위치
 
 - `~/.coliday/jobs.db`: 작업·이벤트 (SQLite)
 - `~/.coliday/projects.json`: 연결된 프로젝트 디렉토리, `models.json`: 모델 설정
-- `~/.coliday/jobs/<id>/stream.jsonl`: claude 원본 이벤트, `stderr.log`, `worker.log`
+- `~/.coliday/jobs/<id>/stream.jsonl`: 팀장 원본 이벤트, `stderr.log`, `worker.log`, `artifacts/`(결과물)
 
 ## 개발
 

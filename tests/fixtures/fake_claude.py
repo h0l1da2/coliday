@@ -11,6 +11,11 @@ if record:
     ))
 if os.environ.get("FAKE_CLAUDE_SLEEP"):
     time.sleep(float(os.environ["FAKE_CLAUDE_SLEEP"]))
+if os.environ.get("FAKE_CLAUDE_ARTIFACT"):  # 결과물 폴더(--add-dir 로 받은 곳)에 스크린샷을 남긴 것처럼 한다
+    target = Path(sys.argv[sys.argv.index("--add-dir") + 1])
+    for name in os.environ["FAKE_CLAUDE_ARTIFACT"].split(","):
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
+        (target / name).write_bytes(b"fake")
 if os.environ.get("FAKE_CLAUDE_TOUCH"):
     Path(os.environ["FAKE_CLAUDE_TOUCH"]).write_text("new file\n")
 sys.stdout.write((Path(__file__).parent / "stream.jsonl").read_text())

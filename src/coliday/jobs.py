@@ -17,6 +17,8 @@ from coliday.store import RESULT, Job, Store
 
 STATUS_ICON = {"queued": "…", "running": "●", "succeeded": "✓", "failed": "✗", "cancelled": "■"}
 _QUEUED_TIMEOUT_SEC = 60
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"})
+_VIDEO_SUFFIXES = frozenset({".webm", ".mp4", ".mov", ".mkv", ".avi"})
 
 
 class JobError(Exception):
@@ -194,6 +196,40 @@ def remove_project(cfg: Config, store: Store, directory: str | Path) -> bool:
     except OSError as exc:
         raise JobError(f"프로젝트 목록을 저장할 수 없습니다: {exc}") from exc
     return True
+
+
+def artifacts(cfg: Config, job_id: int) -> list[Path]:
+    """작업이 남긴 결과물 파일 (스크린샷·영상 등). 숨김 파일은 뺀다."""
+    root = cfg.artifacts_dir(job_id)
+    if not root.is_dir():
+        return []
+    return sorted(
+        p for p in root.rglob("*")
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+    )
+
+
+def artifacts_summary(files: list[Path]) -> str:
+    """'3개 (사진 2, 영상 1)' 같은 한 줄 요약."""
+    images = sum(p.suffix.lower() in _IMAGE_SUFFIXES for p in files)
+    videos = sum(p.suffix.lower() in _VIDEO_SUFFIXES for p in files)
+    kinds = [f"{label} {n}" for label, n in (("사진", images), ("영상", videos), ("기타", len(files) - images - videos)) if n]
+    return f"{len(files)}개 ({', '.join(kinds)})"
+
+
+def open_artifacts(cfg: Config, job_id: int) -> Path:
+    """결과물 폴더를 파일 탐색기(Finder)로 연다. 결과물이 없으면 JobError."""
+    if not artifacts(cfg, job_id):
+        raise JobError(f"작업 #{job_id} 에는 결과물이 없습니다 (화면 작업이 아니거나 찍지 못한 경우).")
+    root = cfg.artifacts_dir(job_id)
+    try:
+        subprocess.Popen(
+            [cfg.open_bin, str(root)], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError as exc:
+        raise JobError(f"폴더를 열 수 없습니다 ({cfg.open_bin}): {exc}\n직접 여세요: {root}") from exc
+    return root
 
 
 def role_prompts(cfg: Config, role: str | None = None) -> list[tuple[str, str]]:

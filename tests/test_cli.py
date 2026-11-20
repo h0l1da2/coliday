@@ -30,6 +30,10 @@ def env(tmp_path, monkeypatch):
     fake_codex.chmod(0o755)
     monkeypatch.setenv("COLIDAY_CODEX_BIN", str(fake_codex))
     monkeypatch.setenv("FAKE_CODEX_ARGS", str(tmp_path / "codex.jsonl"))
+    fake_open = tmp_path / "open"
+    fake_open.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {tmp_path / 'opened.txt'}\n")
+    fake_open.chmod(0o755)
+    monkeypatch.setenv("COLIDAY_OPEN_BIN", str(fake_open))
     monkeypatch.setenv("PYTHONPATH", str(SRC) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     return tmp_path
 
@@ -620,6 +624,74 @@ def test_COLIDAY_MAX_ATTEMPTS가_잘못되면_실행하지_않고_알린다(env,
     assert "COLIDAY_MAX_ATTEMPTS" in str(exc.value)
 
 
+def test_화면_작업의_결과물_폴더가_팀장과_쓰기_가능한_팀원_지침에_들어간다(env, repo):
+    cli.main(["run", "x", "-C", str(repo)])
+
+    folder = str(config.load().artifacts_dir(1))
+    argv, agents = _recorded(env)
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert "## 화면 작업의 결과물" in lead and f"- 결과물 폴더: {folder}" in lead
+    assert argv[argv.index("--add-dir") + 1] == folder and Path(folder).is_dir()
+    for name in ("coder", "codex-coder", "verifier"):
+        assert f"이 폴더에 저장한다: {folder}" in agents[name]["prompt"], name
+    for name in ("architect", "reviewer"):  # 읽기만 하는 역할
+        assert "화면 작업의 결과물" not in agents[name]["prompt"], name
+
+
+def test_결과물이_있으면_경로를_알려주고_open으로_폴더를_연다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_ARTIFACT", "login-page.png,flows/order-cancel.webm,notes.txt,.hidden")
+    cli.main(["run", "x", "-C", str(repo)])
+    folder = config.load().artifacts_dir(1)
+
+    out = capsys.readouterr().out
+    assert f"결과물 3개 (사진 1, 영상 1, 기타 1): {folder}" in out and "coliday open 1" in out
+
+    assert cli.main(["open", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "login-page.png" in out and "flows/order-cancel.webm" in out and ".hidden" not in out
+    _wait(lambda: (env / "opened.txt").exists())
+    assert (env / "opened.txt").read_text().strip() == str(folder)
+
+    cli.main(["show", "1"])
+    assert "결과물 3개" in capsys.readouterr().out
+
+    monkeypatch.delenv("FAKE_CLAUDE_ARTIFACT")
+    cli.main(["continue", "1", "더"])   # 이어서 시켜도 이전 결과물은 남는다
+    assert len(jobs.artifacts(config.load(), 1)) == 3
+    cli.main(["rm", "1"])               # 작업을 지우면 결과물도 지워진다
+    assert not folder.exists()
+
+
+def test_결과물이_없으면_open은_폴더를_열지_않고_알린다(env, repo, capsys):
+    cli.main(["run", "x", "-C", str(repo)])
+    capsys.readouterr()
+
+    assert cli.main(["open", "1"]) == 2
+    assert "결과물이 없습니다" in capsys.readouterr().err
+    assert not (env / "opened.txt").exists()
+    assert cli.main(["open", "99"]) == 2
+    cli.main(["show", "1"])
+    assert "coliday open 1" not in capsys.readouterr().out  # 결과물 줄을 찍지 않는다
+
+
+def test_codex로_도는_역할도_결과물_폴더에_쓸_수_있게_샌드박스를_연다(env, repo, monkeypatch):
+    cli.main(["model", "default", "codex"])
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
+    cli.main(["run", "x", "-C", str(repo)])
+
+    folder = str(config.load().artifacts_dir(1))
+    lead, member = sorted(_codex_calls(env), key=lambda c: "# 사용자 요청" not in c["stdin"])
+    lead_roots = next(a for a in lead["argv"] if a.startswith("sandbox_workspace_write.writable_roots="))
+    assert folder in json.loads(lead_roots.split("=", 1)[1]) and f"- 결과물 폴더: {folder}" in lead["stdin"]
+    assert f"sandbox_workspace_write.writable_roots={json.dumps([folder])}" in member["argv"]
+    assert f"이 폴더에 저장한다: {folder}" in member["stdin"]
+
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", "reviewer")   # 읽기 전용 역할은 열지 않는다
+    cli.main(["run", "y", "-C", str(repo)])
+    member = [c for c in _codex_calls(env) if "# 사용자 요청" not in c["stdin"]][-1]
+    assert "read-only" in member["argv"] and not any("writable_roots" in a for a in member["argv"])
+
+
 def _codex_calls(env):
     path = env / "codex.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
@@ -637,7 +709,9 @@ def test_claude_팀장_아래_팀원을_codex로_바꾸면_codex를_돌리는_�
     assert "--agents" in argv and _codex_calls(env) == []  # 팀장은 Claude
     import shlex
     codex = shlex.quote(os.environ["COLIDAY_CODEX_BIN"])  # 경로에 한글·공백이 있어도 명령이 깨지지 않게 인용된다
-    assert f'{codex} exec -C "$PWD" -s workspace-write --skip-git-repo-check -o "$OUT" - < "$PROMPT"' in agents["coder"]["prompt"]
+    roots = shlex.quote(f'sandbox_workspace_write.writable_roots={json.dumps([str(config.load().artifacts_dir(1))])}')
+    assert (f'{codex} exec -C "$PWD" -s workspace-write --skip-git-repo-check -c {roots} -o "$OUT" - < "$PROMPT"'
+            in agents["coder"]["prompt"])
     assert "너는 시니어 개발자다" in agents["coder"]["prompt"]  # 역할 지침은 그대로 Codex 에 전달
     assert (agents["coder"]["model"], agents["coder"]["tools"]) == ("haiku", ["Bash", "Read"])
     assert "-s read-only --skip-git-repo-check -m gpt-x" in agents["reviewer"]["prompt"]  # 수정 도구가 없는 역할
