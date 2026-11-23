@@ -118,8 +118,15 @@ class AddProjectScreen(ModalScreen[tuple[str, str] | None]):
             yield Label(self._title, id="dialog-title")
             yield Input(value=self._directory, placeholder="프로젝트 디렉토리, 또는 SSH 로 접속할 서버의 user@host:/경로", id="dir")
             yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
-            yield Label("서버의 프로젝트는 user@host:/srv/app 처럼 쓴다 (~/.ssh/config 의 별칭:/경로, host:~/app 도 된다). "
-                        "에이전트가 그 서버에서 실행되므로 서버에 git 과 claude 가 설치·로그인돼 있고 키로 접속돼야 한다.",
+            yield Label(Text(  # Text: 예시의 대괄호·@ 가 markup 으로 해석되지 않게 한다
+                "작성 예시\n"
+                "  ~/work_dir/shop-be                 이 컴퓨터의 폴더\n"
+                "  dev@192.168.0.10:/srv/shop         서버의 폴더 (사용자@주소:/절대경로)\n"
+                "  dev@build.example.com:~/shop       ~ 는 서버의 홈 폴더\n"
+                "  myserver:/srv/shop                 ~/.ssh/config 의 별칭 (포트·키 포함)"
+            ), classes="hint", id="project-examples")
+            yield Label("서버의 프로젝트는 에이전트가 그 서버에서 실행된다. 서버에 git 과 claude 가 설치·로그인돼 있어야 하고, "
+                        "터미널에서 ssh dev@192.168.0.10 이 비밀번호를 묻지 않고(키 인증) 접속돼야 한다.",
                         classes="hint")
             yield Label("Enter 로 저장, Tab 으로 칸 이동, Esc 로 닫기", classes="hint")
 
