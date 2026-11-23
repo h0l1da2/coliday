@@ -628,19 +628,18 @@ class ColidayApp(App[None]):
         bar = self.query_one("#artifacts", ArtifactBar)
         files = jobs.artifacts(self.cfg, self.selected_id) if self.selected_id is not None else []
         text = ""
-        files = [p for p in files if jobs.is_media(p)] and files  # 사진·영상이 하나도 없으면 '아직 없음'으로 본다
-        if files:
+        # 지금 보고 있는 작업이 사진·영상을 남겼을 때만 보인다. 화면과 무관한 작업에는 줄도 단축키도 없다.
+        if any(jobs.is_media(p) for p in files):
             folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
             text = f"📁 결과물 {jobs.artifacts_summary(files)}: {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
-        elif self.selected_id is not None:
-            # 파일이 없거나 사라져도 줄은 그대로 두고 계속 클릭할 수 있게 한다 (팀원이 임시 파일을 지우면 줄이 사라지던 문제).
-            folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
-            text = f"📁 결과물 아직 없음 (사진·영상): {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
         if text != self._artifacts_text:
+            was_shown = bool(self._artifacts_text)
             self._artifacts_text = text
             bar.update(Text(text))
             bar.set_class(bool(text), "-shown")
-            bar.set_class(bool(files), "-has")
+            bar.set_class(bool(text), "-has")
+            if was_shown != bool(text):
+                self.refresh_bindings()  # 하단 단축키 안내의 '결과물 폴더'도 함께 켜고 끈다
 
     def action_open_artifacts(self) -> None:
         if self.selected_id is None:
@@ -651,9 +650,7 @@ class ColidayApp(App[None]):
         except (JobError, KeyError) as exc:
             self.notify(str(exc), severity="warning", timeout=6)
             return
-        has_media = any(jobs.is_media(p) for p in jobs.artifacts(self.cfg, self.selected_id))
-        empty = "" if has_media else " (아직 사진·영상이 없습니다)"
-        self.notify(f"폴더를 열었습니다: {projects.display(str(root))}{empty}", timeout=4)
+        self.notify(f"폴더를 열었습니다: {projects.display(str(root))}", timeout=4)
 
     def action_timeline_scroll(self, direction: int) -> None:
         log = self.query_one("#timeline", VerticalScroll)
@@ -803,6 +800,8 @@ class ColidayApp(App[None]):
         # 메인 화면 단축키는 priority 라 대화 상자 안에서도 잡힌다. 대화 상자가 떠 있으면 막는다.
         if action in _MAIN_ACTIONS and len(self.screen_stack) > 1:
             return False
+        if action == "open_artifacts" and not self._artifacts_text:
+            return False  # 이 작업에 결과물이 없으면 단축키도 하단 안내도 없다
         return True
 
     def action_models(self) -> None:

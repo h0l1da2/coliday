@@ -736,7 +736,11 @@ def test_ctrl_c로_어디서든_종료하고_실행중인_작업은_계속된다
         store.close()
 
 
-def test_결과물이_있는_작업은_폴더_경로가_보이고_클릭하거나_단축키로_연다(env, repo, monkeypatch):
+def _footer_has(app, action: str) -> bool:
+    return any(b.action == action and enabled for _, b, enabled, _ in app.screen.active_bindings.values())
+
+
+def test_결과물_폴더는_결과물이_있는_작업에서만_보이고_클릭하거나_단축키로_연다(env, repo, monkeypatch):
     fake_open = env / "open"
     fake_open.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {env / 'opened.txt'}\n")
     fake_open.chmod(0o755)
@@ -766,18 +770,28 @@ def test_결과물이_있는_작업은_폴더_경로가_보이고_클릭하거�
             await pilot.press("ctrl+f")   # 채팅 입력 중에도 열린다
             await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 2)
 
-            # 결과물이 없는 작업도 줄은 그대로 있고 계속 클릭해서 폴더를 열 수 있다
+            assert _footer_has(app, "open_artifacts")
+
+            # 결과물이 없는 작업에서는 줄도 하단 단축키 안내도 없고, 다른 작업의 폴더가 열리지도 않는다
             app.query_one("#jobs", DataTable).focus()
             await pilot.press("down")
             await _until(pilot, lambda: app.selected_id == plain.id)
-            await _until(pilot, lambda: "결과물 아직 없음" in str(bar.content))
-            assert bar.display and not bar.has_class("-has") and f"jobs/{plain.id}/artifacts" in str(bar.content)
-            await pilot.click("#artifacts")
-            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 3)
-            await pilot.click("#artifacts")   # 여러 번 눌러도 줄은 그대로다
-            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 4)
-            assert bar.display and (env / "opened.txt").read_text().split()[-1] == str(cfg.artifacts_dir(plain.id))
-            assert any("아직 사진·영상이 없습니다" in n.message for n in app._notifications)
+            await _until(pilot, lambda: not bar.display)
+            assert str(bar.content) == "" and not _footer_has(app, "open_artifacts")
+            await pilot.press("ctrl+f")
+            await pilot.pause(0.3)
+            assert len((env / "opened.txt").read_text().split()) == 2
+
+            # 사진·영상이 아닌 파일만 있는 작업도 결과물이 없는 것으로 본다
+            (cfg.artifacts_dir(plain.id) / "notes.log").write_text("x")
+            await pilot.pause(1.5)
+            assert not bar.display
+
+            # 결과물이 있는 작업으로 돌아오면 그 작업의 폴더가 다시 보인다
+            await pilot.press("up")
+            await _until(pilot, lambda: app.selected_id == shots.id)
+            await _until(pilot, lambda: bar.display)
+            assert f"jobs/{shots.id}/artifacts" in str(bar.content) and _footer_has(app, "open_artifacts")
 
     try:
         _run(scenario())
