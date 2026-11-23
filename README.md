@@ -34,16 +34,18 @@ mkdir -p ~/.local/bin && ln -s "$PWD/.venv/bin/coliday" ~/.local/bin/coliday   #
 
 ### 업데이트
 
-두 방법 모두 clone 한 폴더의 코드를 그대로 쓴다(editable). 그 폴더에서 받기만 하면 다음 실행부터 새 버전이다:
-
 ```bash
-cd coliday && git pull
+coliday update            # 최신 버전 받기 (받을 것이 있는지만 보려면 --check)
 ```
 
+clone 한 폴더의 코드를 그대로 쓰므로(editable) 그 폴더에서 `git pull` 을 하는 것과 같다. 의존성이 바뀐 업데이트면 설치도 다시 한다.
+
+- 새 버전이 올라오면 알려 준다: TUI 는 열 때 알림과 제목 줄에, 명령은 출력 끝에 한 줄로 나온다. 하루에 한 번 백그라운드로 확인하고
+  (실행을 기다리게 하지 않는다), 받는 것은 `coliday update` 를 실행했을 때만 한다. `COLIDAY_NO_UPDATE_CHECK=1` 로 끈다.
 - 열려 있는 TUI 는 닫았다 다시 연다. 실행 중이던 작업은 이전 코드로 끝까지 돌고, 새로 시작하는 작업부터 적용된다.
 - 설정과 작업 기록(`~/.coliday`)은 그대로 남는다.
-- 받은 뒤 `coliday` 가 모듈을 찾지 못한다는 오류로 열리지 않으면 의존성이 바뀐 것이다. 설치 명령을 한 번 더 실행한다
-  (`uv tool install --editable --force ./coliday` 또는 `.venv/bin/pip install -e .`).
+- clone 한 폴더를 직접 고쳤거나 따로 커밋했으면 덮어쓰지 않고 멈춘다. 정리한 뒤 다시 실행한다.
+- `coliday update` 가 없는 예전 버전은 처음 한 번만 clone 한 폴더에서 `git pull` 을 한다.
 - clone 한 폴더를 옮기거나 지우면 다시 설치한다.
 
 ## TUI
@@ -128,6 +130,7 @@ coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 
 | `COLIDAY_PERMISSION_MODE` | `auto` | `claude --permission-mode` 값. 권한 확인이 필요한 동작은 자동 거부된다 |
 | `COLIDAY_CODEX_BIN` | `codex` | codex 실행 파일 |
 | `COLIDAY_OPEN_BIN` | `open` (macOS) / `xdg-open` | 결과물 폴더를 여는 명령 |
+| `COLIDAY_NO_UPDATE_CHECK` | (없음) | 값을 주면 새 버전 확인과 알림을 끈다 |
 | `COLIDAY_SSH_BIN` | `ssh` | 서버의 프로젝트에 접속하는 명령 |
 | `COLIDAY_REMOTE_CLAUDE_BIN` / `COLIDAY_REMOTE_CODEX_BIN` | `claude` / `codex` | 서버에서 실행할 에이전트 CLI |
 | `COLIDAY_MAX_ATTEMPTS` | `5` | 실패한 작업을 처음 포함해 몇 번까지 시도할지 (1 이상의 정수) |

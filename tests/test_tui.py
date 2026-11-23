@@ -886,3 +886,26 @@ def test_결과물_폴더는_결과물이_있는_작업에서만_보이고_클�
         _run(scenario())
     finally:
         store.close()
+
+
+def test_새_버전이_있으면_화면을_열_때_알린다(env, repo, monkeypatch):
+    from coliday import updater
+
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    monkeypatch.setattr(updater, "notice", lambda stamp: "새 버전이 있습니다 (커밋 3개). 받으려면: coliday update")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await pilot.pause(0.2)
+            assert "새 버전 있음" in app.sub_title
+            assert sum("커밋 3개" in n.message for n in app._notifications) == 1
+            app._check_update()   # 다시 확인해도 같은 알림을 또 띄우지 않는다
+            await pilot.pause(0.1)
+            assert sum("커밋 3개" in n.message for n in app._notifications) == 1
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()

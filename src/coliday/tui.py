@@ -603,6 +603,8 @@ class ColidayApp(App[None]):
         # 작업 위치부터 고르게 한다. 연결된 프로젝트가 없으면 고를 것이 없으니 작업 목록에서 시작한다.
         (ptable if self._projects else table).focus()
         self.set_interval(POLL_SEC, self._tick)
+        self._check_update()
+        self.set_timer(20, self._check_update)  # 방금 시작한 백그라운드 확인이 끝났을 즈음 한 번 더 본다
 
     # ── 주기 갱신 ────────────────────────────────────────────
     def _tick(self) -> None:
@@ -828,6 +830,18 @@ class ColidayApp(App[None]):
         self._last_status = job.status
         if force_diff or just_finished or (not job.is_terminal and self._ticks % DIFF_EVERY_TICKS == 0):
             self._load_diff(job.id, job.workdir, job.base_commit)
+
+    def _check_update(self) -> None:
+        """새 버전이 있으면 한 번 알리고 제목 줄에 남겨 둔다."""
+        from coliday import updater
+
+        try:
+            text = updater.notice(self.cfg.update_stamp)
+        except Exception:  # 알림 때문에 화면이 죽으면 안 된다
+            return
+        if text and not self.sub_title:
+            self.sub_title = "새 버전 있음 · coliday update"
+            self.notify(text, title="업데이트", timeout=10)
 
     def _timeline_write(self, *items: Text | Markdown) -> None:
         log = self.query_one("#timeline", VerticalScroll)

@@ -39,6 +39,11 @@ class Config:
         return self.home / "team.json"
 
     @property
+    def update_stamp(self) -> Path:
+        """새 버전을 마지막으로 확인한 시각 (파일의 수정 시각)."""
+        return self.home / "update-check"
+
+    @property
     def models_path(self) -> Path:
         return self.home / "models.json"
 

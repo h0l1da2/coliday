@@ -24,12 +24,16 @@ def main(argv: list[str] | None = None) -> int:
         args = parser.parse_args(["ui" if sys.stdin.isatty() and sys.stdout.isatty() else "ls"])
     if args.cmd == "ui":
         return _cmd_ui(cfg)
+    if args.cmd == "update":
+        return _cmd_update(args)  # DB 는 쓰지 않는다
     if args.cmd == "_agent":
         # Codex 샌드박스 안에서 실행된다. DB 를 열면(쓰기) 막히므로 Store 를 만들기 전에 처리한다.
         return members.request(Path(args.dir), args.role, sys.stdin.read())
     store = Store(cfg.db_path)
     try:
-        return args.func(cfg, store, args)
+        code = args.func(cfg, store, args)
+        _update_notice(cfg, args)
+        return code
     except KeyError as exc:
         print(f"작업 #{exc.args[0]} 을(를) 찾을 수 없습니다.", file=sys.stderr)
         return 2
@@ -45,7 +49,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="coliday",
         description="팀장 에이전트에게 일을 시키고 진행 상황을 본다. 인자 없이 실행하면 TUI 를 연다.",
     )
-    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,team,prompt,ls,show,diff,open,cancel,rm}")
+    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,team,prompt,ls,show,diff,open,cancel,rm,update}")
 
     sub.add_parser("ui", help="TUI 열기 (인자 없이 실행한 것과 같다)")
 
@@ -123,6 +127,9 @@ def _parser() -> argparse.ArgumentParser:
     rm.add_argument("--force", action="store_true", help="검토하지 않은 변경이 있어도 삭제")
     rm.set_defaults(func=_cmd_rm)
 
+    upd = sub.add_parser("update", help="coliday 를 최신 버전으로 업데이트 (clone 한 폴더에서 git pull, 필요하면 재설치)")
+    upd.add_argument("--check", action="store_true", help="받을 업데이트가 있는지만 확인")
+
     agent = sub.add_parser("_agent")  # 내부용: Codex 팀장이 팀원에게 맡길 때 실행한다
     agent.add_argument("dir")
     agent.add_argument("role")
@@ -174,6 +181,46 @@ def _cmd_continue(cfg: config.Config, store: Store, args: argparse.Namespace) ->
     code = _follow(store, job.id, after_id=last)
     _print_artifacts(cfg, job.id)
     return code
+
+
+def _update_notice(cfg: config.Config, args: argparse.Namespace) -> None:
+    """새 버전이 있으면 명령 출력 끝에 한 줄 알린다. 사람이 터미널에서 직접 실행했을 때만 (스크립트 출력은 건드리지 않는다)."""
+    if args.cmd.startswith("_") or not (sys.stdout.isatty() and sys.stderr.isatty()):
+        return
+    from coliday import updater
+
+    try:
+        text = updater.notice(cfg.update_stamp)
+    except Exception:  # 알림 때문에 명령이 실패하면 안 된다
+        return
+    if text:
+        print(f"\n💡 {text}", file=sys.stderr)
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    from coliday import updater
+
+    try:
+        result = updater.update(updater.source_root(), check=args.check)
+    except updater.UpdateError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not result.commits:
+        print(f"이미 최신입니다 ({result.before[:7]}).")
+        return 0
+    if args.check:
+        print(f"받을 업데이트가 {len(result.commits)}개 있습니다. 받으려면: coliday update")
+    else:
+        print(f"업데이트했습니다: {result.before[:7]} → {result.after[:7]} ({len(result.commits)}개)")
+    for line in result.commits[:20]:
+        print(f"  {line}")
+    if len(result.commits) > 20:
+        print(f"  … 외 {len(result.commits) - 20}개")
+    if result.reinstalled:
+        print("의존성이 바뀌어 다시 설치했습니다.")
+    if result.changed:
+        print("열려 있는 coliday 화면은 닫았다 다시 여세요. 실행 중인 작업은 이전 버전으로 끝까지 돕니다.")
+    return 0
 
 
 def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
