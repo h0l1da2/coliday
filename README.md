@@ -31,7 +31,20 @@ mkdir -p ~/.local/bin && ln -s "$PWD/.venv/bin/coliday" ~/.local/bin/coliday   #
 ```
 
 설치한 뒤 작업할 레포에서 `coliday` 를 실행하면 TUI 가 열린다 (`coliday --help` 로 명령 목록).
-두 방법 모두 clone 한 폴더를 그대로 쓰므로(editable) 업데이트는 그 폴더에서 `git pull` 만 하면 된다. 폴더를 옮기거나 지우면 다시 설치한다.
+
+### 업데이트
+
+두 방법 모두 clone 한 폴더의 코드를 그대로 쓴다(editable). 그 폴더에서 받기만 하면 다음 실행부터 새 버전이다:
+
+```bash
+cd coliday && git pull
+```
+
+- 열려 있는 TUI 는 닫았다 다시 연다. 실행 중이던 작업은 이전 코드로 끝까지 돌고, 새로 시작하는 작업부터 적용된다.
+- 설정과 작업 기록(`~/.coliday`)은 그대로 남는다.
+- 받은 뒤 `coliday` 가 모듈을 찾지 못한다는 오류로 열리지 않으면 의존성이 바뀐 것이다. 설치 명령을 한 번 더 실행한다
+  (`uv tool install --editable --force ./coliday` 또는 `.venv/bin/pip install -e .`).
+- clone 한 폴더를 옮기거나 지우면 다시 설치한다.
 
 ## TUI
 
