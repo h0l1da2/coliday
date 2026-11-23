@@ -24,9 +24,11 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static
+from textual.widgets import (
+    Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static, TextArea,
+)
 
-from coliday import gitops, jobs, projects, team
+from coliday import gitops, jobs, projects, remote, team
 from coliday.config import Config
 from coliday.jobs import STATUS_ICON, JobError, WorktreeRemoveError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
@@ -61,7 +63,7 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool] | None]):
         with Vertical(id="dialog"):
             yield Label("새 작업", id="dialog-title")
             yield Input(placeholder="팀장에게 시킬 일 (Enter 로 시작)", id="prompt")
-            yield Input(value=self._default_dir, placeholder="프로젝트 디렉토리", id="dir")
+            yield Input(value=self._default_dir, placeholder="프로젝트 디렉토리 (서버는 user@host:/경로)", id="dir")
             yield Checkbox("worktree 없이 이 디렉토리에서 직접 작업", id="no-worktree")
             with Horizontal(id="dialog-buttons"):
                 yield Button("시작", variant="primary", id="ok")
@@ -114,8 +116,11 @@ class AddProjectScreen(ModalScreen[tuple[str, str] | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(self._title, id="dialog-title")
-            yield Input(value=self._directory, placeholder="프로젝트 디렉토리", id="dir")
+            yield Input(value=self._directory, placeholder="프로젝트 디렉토리, 또는 SSH 로 접속할 서버의 user@host:/경로", id="dir")
             yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
+            yield Label("서버의 프로젝트는 user@host:/srv/app 처럼 쓴다 (~/.ssh/config 의 별칭:/경로, host:~/app 도 된다). "
+                        "에이전트가 그 서버에서 실행되므로 서버에 git 과 claude 가 설치·로그인돼 있고 키로 접속돼야 한다.",
+                        classes="hint")
             yield Label("Enter 로 저장, Tab 으로 칸 이동, Esc 로 닫기", classes="hint")
 
     def on_mount(self) -> None:
@@ -225,27 +230,229 @@ def _join_spec(engine: object, model: str) -> str:
     return f"{engine}:{model}" if model else str(engine)
 
 
-class PromptScreen(ModalScreen[None]):
-    BINDINGS = [Binding("escape,q,enter", "close", "닫기")]
+class TeamScreen(ModalScreen[None]):
+    """팀 구성: 역할을 고르면 실행에 쓰이는 프롬프트가 아래에 보이고, 고치기·추가·빼기·되돌리기를 한다."""
 
-    def __init__(self, prompts: list[tuple[str, str]]) -> None:
+    # 한글 자모: 한글 입력 상태에서 누른 a/d/r/q.
+    BINDINGS = [
+        Binding("escape,q,ㅂ", "close", "닫기"),
+        Binding("a,ㅁ", "add", "추가"),
+        Binding("d,ㅇ", "remove", "빼기"),
+        Binding("r,ㄱ", "reset", "기본값으로"),
+    ]
+
+    def __init__(self, cfg: Config) -> None:
         super().__init__()
-        self._prompts = prompts
+        self.cfg = cfg
+        self._roles: list[tuple[str, str, str]] = []
 
     def compose(self) -> ComposeResult:
-        text = Text()
-        for title, body in self._prompts:
-            text.append(f"── {title} ──\n", style="bold")
-            text.append(f"{body}\n\n")
-        with VerticalScroll(id="prompts"):
-            yield Static(text)
+        with Vertical(id="team"):
+            yield DataTable(id="team-table", cursor_type="row", zebra_stripes=True)
+            with VerticalScroll(id="prompts"):
+                yield Static(id="team-preview")
+            yield Label("Enter 고치기 · a 새 팀원 · d 팀에서 빼기 · r 기본값으로 되돌리기 · Tab 프롬프트 스크롤 · Esc 닫기"
+                        "   (다음 실행부터 적용)", classes="hint")
 
     def on_mount(self) -> None:
-        pane = self.query_one("#prompts")
-        pane.border_title = "역할별 프롬프트 (↑/↓ 스크롤, Esc 닫기)"
-        pane.focus()
+        self.query_one("#team").border_title = "팀 구성과 역할별 프롬프트"
+        self.query_one("#prompts").border_title = "실행에 쓰이는 프롬프트"
+        table = self.query_one("#team-table", DataTable)
+        table.add_columns("역할", "상태", "설명")
+        self._reload()
+        table.focus()
+
+    def _reload(self, select: str | None = None) -> None:
+        table = self.query_one("#team-table", DataTable)
+        select = select or self._role()
+        try:
+            self._roles = jobs.team_roles(self.cfg)
+        except JobError as exc:
+            self._roles = []
+            self.query_one("#team-preview", Static).update(Text(str(exc), style="bold red"))
+        table.clear()
+        for role, state, description in self._roles:
+            style = {team.STATE_REMOVED: "dim strike", team.STATE_DEFAULT: ""}.get(state, "bold yellow")
+            name = "lead (팀장)" if role == team.LEAD_ROLE else role
+            table.add_row(Text(name, style=style), Text(state, style=style), Text(description, style="dim"), key=role)
+        names = [r for r, _, _ in self._roles]
+        if names:
+            table.move_cursor(row=names.index(select) if select in names else 0)
+            self._preview()
+
+    def _role(self) -> str | None:
+        table = self.query_one("#team-table", DataTable)
+        return self._roles[table.cursor_row][0] if self._roles and 0 <= table.cursor_row < len(self._roles) else None
+
+    def _state(self, role: str) -> str:
+        return next(state for r, state, _ in self._roles if r == role)
+
+    @on(DataTable.RowHighlighted, "#team-table")
+    def _preview(self) -> None:
+        role = self._role()
+        if role is None:
+            return
+        try:
+            if self._state(role) == team.STATE_REMOVED:
+                text = Text("팀에서 뺀 역할입니다. r 을 누르면 되돌립니다.\n\n", style="bold yellow")
+                text.append(jobs.role_definition(self.cfg, role)["prompt"], style="dim")
+            else:
+                text = Text()
+                for title, body in jobs.role_prompts(self.cfg, role):
+                    text.append(f"── {title} ──\n", style="bold")
+                    text.append(f"{body}\n")
+        except JobError as exc:
+            text = Text(str(exc), style="bold red")
+        self.query_one("#team-preview", Static).update(text)
+        self.query_one("#prompts", VerticalScroll).scroll_home(animate=False)
+
+    @on(DataTable.RowSelected, "#team-table")
+    def action_edit(self) -> None:
+        role = self._role()
+        if role is None:
+            return
+        if self._state(role) == team.STATE_REMOVED:
+            self.notify("팀에서 뺀 역할입니다. r 로 되돌린 뒤 고치세요.", severity="warning")
+            return
+        try:
+            definition = jobs.role_definition(self.cfg, role)
+        except JobError as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            return
+        self.app.push_screen(RoleEditScreen(self.cfg, role, definition), self._edited)
+
+    def action_add(self) -> None:
+        self.app.push_screen(RoleEditScreen(self.cfg, None, {"description": "", "prompt": "", "tools": None}), self._edited)
+
+    def _edited(self, role: str | None) -> None:
+        if role:
+            self._reload(role)
+            self.notify(f"{role} 을(를) 저장했습니다. 다음 실행부터 적용됩니다.")
+
+    def action_remove(self) -> None:
+        role = self._role()
+        if role is None or role == team.LEAD_ROLE:
+            self.notify("팀장은 뺄 수 없습니다.", severity="warning")
+            return
+        state = self._state(role)
+        if state == team.STATE_REMOVED:
+            return
+        if state == team.STATE_ADDED:  # 새로 넣은 역할은 빼면 정의가 사라진다
+            self.app.push_screen(
+                ConfirmScreen(f"{role} 을(를) 지울까요? 직접 쓴 프롬프트가 사라집니다."),
+                lambda yes: self._apply(lambda: jobs.remove_role(self.cfg, role), f"{role} 을(를) 지웠습니다.") if yes else None,
+            )
+            return
+        self._apply(lambda: jobs.remove_role(self.cfg, role), f"{role} 을(를) 팀에서 뺐습니다. r 로 되돌릴 수 있습니다.", role)
+
+    def action_reset(self) -> None:
+        role = self._role()
+        if role is None:
+            return
+        state = self._state(role)
+        if state == team.STATE_DEFAULT:
+            self.notify("이미 기본값입니다.")
+        elif state == team.STATE_ADDED:
+            self.notify("새로 넣은 역할은 기본값이 없습니다. 지우려면 d 를 누르세요.", severity="warning")
+        else:
+            self._apply(lambda: jobs.reset_role(self.cfg, role), f"{role} 을(를) 기본값으로 되돌렸습니다.", role)
+
+    def _apply(self, change, message: str, select: str | None = None) -> None:
+        try:
+            change()
+        except JobError as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            return
+        self._reload(select)
+        self.notify(message)
 
     def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class RoleEditScreen(ModalScreen[str | None]):
+    """역할 하나를 고치거나(role) 새 팀원을 만든다(role=None). 저장에 성공하면 역할 이름으로 닫힌다.
+
+    저장이 실패하면 닫지 않는다 (길게 쓴 프롬프트가 사라지지 않게).
+    """
+
+    BINDINGS = [Binding("escape", "close", "닫기"), Binding("ctrl+s", "save", "저장", priority=True)]
+
+    def __init__(self, cfg: Config, role: str | None, definition: dict) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self._role = role
+        self._definition = definition
+        self._warned = False
+
+    @property
+    def _is_lead(self) -> bool:
+        return self._role == team.LEAD_ROLE
+
+    def compose(self) -> ComposeResult:
+        tools = self._definition.get("tools")
+        with Vertical(id="dialog"):
+            title = "새 팀원" if self._role is None else ("팀장 지시문" if self._is_lead else f"{self._role} 고치기")
+            yield Label(f"{title} (다음 실행부터 적용)", id="dialog-title")
+            if self._role is None:
+                yield Input(placeholder="역할 이름 (영문·숫자·-, 예: qa)", id="role-name")
+            if not self._is_lead:
+                yield Input(value=self._definition.get("description") or "", id="role-description",
+                            placeholder="설명: 팀장이 이걸 보고 언제 맡길지 정한다 (예: 구현이 끝난 뒤 사용자 시나리오를 검수한다)")
+                yield Input(value=", ".join(tools) if tools else "", id="role-tools",
+                            placeholder="도구를 쉼표로 (예: Read, Grep, Glob, Bash). 비우면 모든 도구. Edit·Write 가 없으면 코드를 못 고친다")
+            yield TextArea(self._definition.get("prompt") or "", id="role-prompt", soft_wrap=True)
+            if self._is_lead:
+                yield Label("{team} 자리에 팀원 목록(이름과 설명)이, {max_attempts} 자리에 최대 시도 횟수가 들어간다. "
+                            "결과물 폴더 규칙은 자동으로 뒤에 붙는다.", classes="hint")
+            else:
+                yield Label("재시도 규칙과 결과물 폴더 규칙은 자동으로 뒤에 붙는다. 모델은 모델 설정(Ctrl+T)에서 고른다.",
+                            classes="hint")
+            with Horizontal(id="dialog-buttons"):
+                yield Button("저장 (Ctrl+S)", variant="primary", id="ok")
+                yield Button("취소", id="close")
+
+    def on_mount(self) -> None:
+        self.query_one("#role-name" if self._role is None else "#role-prompt").focus()
+
+    def _values(self) -> tuple[str, dict]:
+        name = self._role or self.query_one("#role-name", Input).value.strip()
+        values: dict = {"prompt": self.query_one("#role-prompt", TextArea).text}
+        if not self._is_lead:
+            values["description"] = self.query_one("#role-description", Input).value
+            tools = [t.strip() for t in self.query_one("#role-tools", Input).value.split(",") if t.strip()]
+            values["tools"] = tools or None
+        return name, values
+
+    def _dirty(self) -> bool:
+        name, values = self._values()
+        if self._role is None and name:
+            return True
+        return any(
+            (v.strip() if isinstance(v, str) else v) != (self._definition.get(k) or (None if k == "tools" else ""))
+            for k, v in values.items()
+        )
+
+    @on(Button.Pressed, "#ok")
+    def action_save(self) -> None:
+        name, values = self._values()
+        try:
+            if not name:
+                raise JobError("역할 이름을 주세요.")
+            if self._role is None and any(name == role for role, _, _ in jobs.team_roles(self.cfg)):
+                raise JobError(f"이미 있는 역할입니다: {name}. 목록에서 골라 고치세요.")
+            jobs.set_role(self.cfg, name, **values)
+        except JobError as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            return
+        self.dismiss(name)
+
+    @on(Button.Pressed, "#close")
+    def action_close(self) -> None:
+        if self._dirty() and not self._warned:
+            self._warned = True
+            self.notify("저장하지 않은 변경이 있습니다. 버리려면 한 번 더 누르세요.", severity="warning", timeout=6)
+            return
         self.dismiss(None)
 
 
@@ -296,8 +503,13 @@ class ColidayApp(App[None]):
     #artifacts:hover { background: $primary; color: $text; }
     #diff-pane { width: 2fr; border: round $accent; }
     #projects:focus-within, #jobs:focus-within, #timeline:focus, #diff-pane:focus-within { border: round $warning; }
-    NewJobScreen, AddProjectScreen, ModelScreen, PromptScreen, ConfirmScreen { align: center middle; }
-    #prompts { width: 90%; height: 90%; padding: 1 2; border: thick $primary; background: $surface; }
+    NewJobScreen, AddProjectScreen, ModelScreen, TeamScreen, RoleEditScreen, ConfirmScreen { align: center middle; }
+    #team { width: 92%; height: 92%; padding: 0 1; border: thick $primary; background: $surface; }
+    #team-table { height: auto; max-height: 12; }
+    #prompts { height: 1fr; padding: 0 1; border: round $secondary; }
+    #prompts:focus { border: round $warning; }
+    RoleEditScreen #dialog { width: 110; max-width: 96%; height: 92%; overflow-y: hidden; }
+    #role-prompt { height: 1fr; min-height: 4; margin-top: 1; }  /* 남는 높이를 다 쓴다: 낮은 터미널에서도 버튼이 보인다 */
     .model-row { height: auto; }
     .model-role { width: 16; margin-top: 2; }
     .model-row .engine { width: 22; margin-top: 1; }
@@ -317,7 +529,7 @@ class ColidayApp(App[None]):
         Binding("ctrl+o", "focus_projects", "프로젝트", priority=True, key_display="O"),
         Binding("ctrl+g", "add_project", "프로젝트 추가", priority=True, key_display="G"),
         Binding("ctrl+t", "models", "모델", priority=True, key_display="T"),
-        Binding("ctrl+p", "prompts", "프롬프트", priority=True, key_display="P"),
+        Binding("ctrl+p", "prompts", "팀·프롬프트", priority=True, key_display="P"),
         Binding("ctrl+f", "open_artifacts", "결과물 폴더", priority=True, key_display="F"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
@@ -380,7 +592,7 @@ class ColidayApp(App[None]):
         ptable.add_column("이름", key="name")
         ptable.add_column("경로", key="path")
         opened = projects.normalize(self.default_dir)
-        if gitops.repo_root(Path(opened)) is not None:  # TUI 를 연 레포는 자동으로 연결한다
+        if gitops.repo_root(opened) is not None:  # TUI 를 연 레포는 자동으로 연결한다
             try:
                 jobs.add_project(self.cfg, self.store, opened)
             except JobError:
@@ -417,7 +629,7 @@ class ColidayApp(App[None]):
             self._projects = list(names.items())
             table.clear()
             for path, name in names.items():
-                missing = "" if Path(path).is_dir() else "  (없음)"
+                missing = "" if projects.exists(path) else "  (없음)"
                 table.add_row(name, Text(projects.display(path) + missing, style="dim"), key=path)
             select = select or self.project_dir
         if select is not None:
@@ -527,7 +739,7 @@ class ColidayApp(App[None]):
             Text(STATUS_ICON.get(job.status, "?"), style=style),
             str(job.id),
             jobs.ago(now - job.created_at),
-            Path(job.repo).name,
+            remote.name(job.repo),
             jobs.one_line(job.prompt, 40),
             Text(jobs.one_line(job.phase, 60), style=style),
         )
@@ -682,11 +894,11 @@ class ColidayApp(App[None]):
 
     @work(thread=True, exclusive=True, group="diff")
     def _load_diff(self, job_id: int, workdir: str, base: str | None) -> None:
-        if not workdir or not Path(workdir).is_dir():
+        if not workdir or not (remote.is_remote(workdir) or Path(workdir).is_dir()):
             self.call_from_thread(self._show_diff, job_id, "작업 디렉토리가 없습니다. 정리됐거나 아직 만들어지지 않았습니다.", True)
             return
         try:
-            text = gitops.diff(Path(workdir), base)
+            text = gitops.diff(workdir, base)
         except gitops.GitError as exc:
             self.call_from_thread(self._show_diff, job_id, f"diff 를 계산할 수 없습니다: {exc}", True)
             return
@@ -723,7 +935,7 @@ class ColidayApp(App[None]):
         for w in launched.warnings:
             self.notify(w, severity="warning", timeout=8)
         self.notify(f"작업 #{launched.job.id} 시작")
-        self.refresh_projects(select=projects.normalize(directory))  # 직접 입력한 디렉토리도 연결된다
+        self.refresh_projects(select=launched.project)  # 직접 입력한 디렉토리도 연결된다
         self.refresh_jobs()
         table = self.query_one("#jobs", DataTable)
         table.move_cursor(row=table.get_row_index(str(launched.job.id)))
@@ -806,7 +1018,7 @@ class ColidayApp(App[None]):
 
     def action_models(self) -> None:
         try:
-            agents = team.load_agents(self.cfg.agents_override)
+            agents = team.load_agents(self.cfg.agents_override, team.load_custom(self.cfg.team_path))
             models = team.load_models(self.cfg.models_path)
         except (OSError, ValueError) as exc:
             self.notify(f"모델 설정을 읽을 수 없습니다: {exc}", severity="error", timeout=8)
@@ -829,10 +1041,7 @@ class ColidayApp(App[None]):
         self.push_screen(ModelScreen(agents, models), done)
 
     def action_prompts(self) -> None:
-        try:
-            self.push_screen(PromptScreen(jobs.role_prompts(self.cfg)))
-        except JobError as exc:
-            self.notify(str(exc), severity="error", timeout=8)
+        self.push_screen(TeamScreen(self.cfg))
 
     def _selected_job(self) -> Job | None:
         if self.selected_id is None:

@@ -1,6 +1,8 @@
 """팀장 지시문과 서브에이전트 정의.
 
-`~/.coliday/agents.json` 이 있으면 기본 에이전트 정의 대신 그 파일을 쓴다
+팀원 구성과 프롬프트는 `~/.coliday/team.json` (`coliday team`) 으로 역할별로 바꾼다: 바꾼 역할만 적고
+나머지는 기본값을 따른다. 팀장 지시문도 같은 파일에서 바꾼다 (`Custom`, `merge_agents`, `lead_prompt`).
+`~/.coliday/agents.json` 이 있으면 기본 팀원 정의(`DEFAULT_AGENTS`) 대신 그 파일을 바탕으로 쓴다
 (형식은 `claude --agents` 와 같다). 모델만 바꿀 때는 `~/.coliday/models.json` (`coliday model`) 을 쓴다.
 
 모델이 `codex` 또는 `codex:<모델>` 인 역할은 Codex CLI 로 일한다. 팀장과 팀원 어느 쪽이든 섞어 쓸 수 있다.
@@ -17,7 +19,7 @@ import json
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 LEAD_ROLE = "lead"
@@ -35,6 +37,7 @@ _PROJECT_CONTEXT = """\
 """
 
 _TEAM_HEADING = "## 팀원 (Agent 도구의 subagent_type)"
+TEAM_PLACEHOLDER = "{team}"  # 팀장 지시문에서 팀원 목록(Codex 팀장은 맡기는 방법)이 들어갈 자리
 DEFAULT_MAX_ATTEMPTS = 5
 _N = "{max_attempts}"  # 지시문 안의 최대 시도 횟수 자리 (COLIDAY_MAX_ATTEMPTS)
 
@@ -44,25 +47,23 @@ _LEAD_TEMPLATE = """\
 이 세션은 사용자와 대화할 수 없는 비대화형 실행이므로 질문하지 말고 합리적인 기본값으로 진행한 뒤
 가정한 내용을 최종 보고에 적는다.
 
-""" + _TEAM_HEADING + """
-- architect: 설계. 코드를 수정하지 않는다.
-- coder: Claude 구현 담당.
-- codex-coder: 두 번째 구현 담당 (기본은 Codex CLI). 독립적인 구현 단위를 병렬로 맡기거나 대안 구현이 필요할 때 쓴다.
-- reviewer: diff 리뷰. 수정하지 않는다.
-- verifier: 빌드·테스트·정적 검사 실행.
+{team}
 
 ## 직접 처리하는 일
 질문 답변, 문서·코드 찾기, 조사, 현재 상태 확인처럼 코드를 바꾸지 않는 일은 팀원에게 맡기지 말고
 직접 파일을 읽고 검색해서 바로 답한다. 이때는 아래 절차를 따르지 않는다.
 
 ## 절차 (코드를 바꾸는 일)
-1. 아주 작은 수정이 아니면 architect 에게 먼저 설계를 맡긴다.
-2. 구현을 독립 단위로 나눠 coder / codex-coder 에게 맡긴다. 같은 파일을 두 팀원이 동시에 고치게 하지 않는다.
-3. 구현이 끝나면 reviewer 와 verifier 를 실행한다.
+팀원 목록의 설명을 보고 각 단계에 맞는 팀원을 고른다. 목록에 없는 이름에게는 맡기지 않는다.
+1. 아주 작은 수정이 아니면 설계 담당에게 먼저 설계를 맡긴다.
+2. 구현을 독립 단위로 나눠 구현 담당에게 맡긴다. 구현 담당이 여럿이면 독립 단위를 나눠 병렬로 맡긴다.
+   같은 파일을 두 팀원이 동시에 고치게 하지 않는다.
+3. 구현이 끝나면 리뷰 담당과 검증 담당을 실행한다. 그 밖의 팀원은 각자의 설명에 적힌 때에 쓴다.
 4. [P0]~[P2] 문제나 검사 실패가 있으면 담당 구현자에게 재작업을 맡긴다.
    같은 작업은 처음 시도를 포함해 최대 {max_attempts}번까지만 시도한다 (팀원에게 다시 맡기는 것과 직접 다시 해 보는 것 모두 센다).
    {max_attempts}번 안에 해결되지 않으면 더 시도하지 말고 아래 "실패한 작업 정리"로 넘어간다.
 5. 직접 코드를 수정하지 말고 위임한다. 단, 팀원 결과를 확인하려고 파일을 읽는 것은 괜찮다.
+   어떤 단계를 맡을 팀원이 목록에 없으면 그 단계만 직접 한다.
 6. git commit, push, merge 는 하지 않는다. 변경은 작업 디렉토리에 남겨 사용자가 검토하게 한다.
 7. 모든 서브에이전트가 끝난 뒤 최종 보고한다.
 
@@ -130,13 +131,28 @@ DEFAULT_AGENTS: dict[str, dict] = {
 }
 
 
-def lead_prompt(max_attempts: int = DEFAULT_MAX_ATTEMPTS, artifacts: str | None = None) -> str:
-    """팀장 지시문. artifacts 를 주면 화면 작업의 결과물을 그 폴더에 남기라는 절이 붙는다."""
-    text = _LEAD_TEMPLATE.replace(_N, str(max_attempts))
+def lead_prompt(
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS, artifacts: str | None = None,
+    agents: dict[str, dict] | None = None, template: str | None = None,
+) -> str:
+    """Claude 팀장 지시문. 팀원 목록은 agents 의 이름과 설명으로 만든다 (팀원을 바꾸면 지시문도 따라 바뀐다).
+
+    template 은 사용자가 바꾼 지시문 (없으면 기본). artifacts 를 주면 결과물을 그 폴더에 남기라는 절이 붙는다.
+    """
+    agents = DEFAULT_AGENTS if agents is None else agents
+    return _render_lead(template, f"{_TEAM_HEADING}\n{_roles(agents)}", max_attempts, artifacts)
+
+
+def _roles(agents: dict[str, dict]) -> str:
+    return "\n".join(f"- {name}: {spec.get('description') or ''}".rstrip() for name, spec in agents.items())
+
+
+def _render_lead(template: str | None, section: str, max_attempts: int, artifacts: str | None) -> str:
+    text = (template or _LEAD_TEMPLATE).rstrip() + "\n"
+    if TEAM_PLACEHOLDER not in text:  # 자리를 지운 지시문에도 팀원 목록은 넣는다 (없으면 맡길 방법을 모른다)
+        text += f"\n{TEAM_PLACEHOLDER}\n"
+    text = text.replace(_N, str(max_attempts)).replace(TEAM_PLACEHOLDER, section.strip())
     return text + _LEAD_ARTIFACTS_RULE.replace("{artifacts}", artifacts) if artifacts else text
-
-
-LEAD_PROMPT = lead_prompt()  # 기본 시도 횟수로 만든 지시문
 
 _MEMBER_RETRY_RULE = """\
 
@@ -169,20 +185,226 @@ _MEMBER_ARTIFACTS_RULE = """\
 _LEAD_ARTIFACTS_RULE = """\
 
 ## 화면 작업의 결과물
-웹 화면·UI 를 만들거나 바꾸는 작업이면 구현 담당이나 verifier 에게 실제로 실행해 스크린샷이나 녹화 영상을 남기게 한다.
+웹 화면·UI 를 만들거나 바꾸는 작업이면 구현 담당이나 검증 담당에게 실제로 실행해 스크린샷이나 녹화 영상을 남기게 한다.
 - 결과물 폴더: {artifacts}
 - 최종 보고에 저장된 파일 이름과 각 파일이 무엇을 보여 주는지 적는다. 찍지 못했으면 이유를 적는다.
 - 화면과 무관한 작업이면 이 절은 무시한다.
 """
 
 
-def load_agents(override: Path) -> dict[str, dict]:
+LEAD_PROMPT = lead_prompt()  # 기본 팀원·기본 시도 횟수로 만든 지시문
+
+
+def base_agents(override: Path) -> dict[str, dict]:
+    """사용자가 역할별로 바꾸기 전의 팀원 정의: agents.json 이 있으면 그 파일, 없으면 기본값."""
     if override.is_file():
         data = json.loads(override.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not data:
             raise ValueError(f"{override}: 에이전트 정의는 비어 있지 않은 JSON 객체여야 합니다")
         return data
     return DEFAULT_AGENTS
+
+
+@dataclass(frozen=True)
+class Custom:
+    """사용자가 바꾼 팀 구성 (`team.json`). 바꾼 것만 담는다.
+
+    agents 의 값: 바탕 정의에 있는 역할이면 바꾼 항목만(값이 None 인 항목은 그 항목을 뺀다),
+    새 역할이면 정의 전체, None 이면 그 역할을 팀에서 뺀다.
+    """
+
+    lead_prompt: str | None = None  # 팀장 지시문 ({team}, {max_attempts} 자리를 쓸 수 있다)
+    agents: dict[str, dict | None] = field(default_factory=dict)
+
+
+_ROLE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,39}")  # 셸 명령과 화면에 그대로 쓰인다
+_CUSTOM_FORMAT = (
+    '{"lead": {"prompt": "지시문"}, "agents": {"역할": {"description": "설명", "prompt": "프롬프트", '
+    '"tools": ["Read", "Bash"]}, "뺄 역할": null}} 형식이어야 합니다 (prompt 는 줄 단위 배열도 된다)'
+)
+
+
+def load_custom(path: Path) -> Custom:
+    if not path.is_file():
+        return Custom()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or set(data) - {"lead", "agents"}:
+        raise ValueError(f"{path}: {_CUSTOM_FORMAT}")
+    lead, agents = data.get("lead"), data.get("agents") or {}
+    if not (lead is None or (isinstance(lead, dict) and set(lead) <= {"prompt"})) or not isinstance(agents, dict):
+        raise ValueError(f"{path}: {_CUSTOM_FORMAT}")
+    try:
+        template = _text(lead.get("prompt")) if lead else None
+        if template is not None and not template.strip():
+            raise ValueError("팀장 지시문이 비어 있습니다")
+        out: dict[str, dict | None] = {}
+        for name, spec in agents.items():
+            if spec is not None and not isinstance(spec, dict):
+                raise ValueError(f"{name}: 정의는 객체이거나 null(팀에서 뺌)이어야 합니다")
+            out[name] = None if spec is None else {**spec, **({"prompt": _text(spec["prompt"])} if "prompt" in spec else {})}
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    return Custom(lead_prompt=template, agents=out)
+
+
+def _text(value: object) -> str | None:
+    """프롬프트 값: 문자열 또는 줄 단위 배열 (JSON 에서는 여러 줄 문자열을 쓰기 불편하다)."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(line, str) for line in value):
+        return "\n".join(value)
+    raise ValueError("prompt 는 문자열이나 문자열 배열이어야 합니다")
+
+
+def save_custom(path: Path, custom: Custom) -> None:
+    """바꾼 것이 없으면 파일을 지운다. 프롬프트는 손으로 고치기 쉽게 줄 단위 배열로 쓴다."""
+    if custom == Custom():
+        path.unlink(missing_ok=True)
+        return
+    data: dict = {}
+    if custom.lead_prompt is not None:
+        data["lead"] = {"prompt": custom.lead_prompt.split("\n")}
+    if custom.agents:
+        data["agents"] = {
+            name: spec if spec is None
+            else {k: v.split("\n") if k == "prompt" and isinstance(v, str) else v for k, v in spec.items()}
+            for name, spec in custom.agents.items()
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")  # 실행 중인 worker 가 반쯤 쓴 파일을 읽지 않게 교체한다
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def merge_agents(base: dict[str, dict], custom: Custom) -> dict[str, dict]:
+    """바탕 정의에 사용자가 바꾼 것을 얹은 실제 팀원 정의. 바꾼 역할은 실행 전에 검사한다."""
+    out = {name: dict(spec) if isinstance(spec, dict) else {} for name, spec in base.items()}
+    for name, changed in custom.agents.items():
+        if changed is None:
+            out.pop(name, None)
+            continue
+        if name not in base and (name in (LEAD_ROLE, DEFAULT_ROLE) or not _ROLE_RE.fullmatch(name)):
+            raise ValueError(f"역할 이름이 올바르지 않습니다: {name!r} (영문자로 시작, 영문·숫자·-·_ 40자 이내, lead/default 제외)")
+        spec = {k: v for k, v in {**out.get(name, {}), **changed}.items() if v is not None}
+        _check_spec(name, spec, new=name not in base)
+        out[name] = spec
+    if not out:
+        raise ValueError("팀원이 하나는 있어야 합니다")
+    return out
+
+
+def _check_spec(name: str, spec: dict, *, new: bool) -> None:
+    prompt, description, tools = spec.get("prompt"), spec.get("description"), spec.get("tools")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"{name}: 프롬프트(prompt)가 비어 있습니다")
+    if not isinstance(description, str if new else (str, type(None))) or (new and not description.strip()):
+        raise ValueError(f"{name}: 설명(description)이 비어 있습니다. 팀장은 이 설명을 보고 언제 맡길지 정합니다")
+    if tools is not None and not (
+        isinstance(tools, list) and tools and all(isinstance(t, str) and re.fullmatch(r"[A-Za-z0-9_()*:.-]+", t) for t in tools)
+    ):
+        raise ValueError(f"{name}: 도구(tools)는 이름 목록이어야 합니다 (예: Read, Grep, Bash). 모든 도구를 주려면 비웁니다")
+    model = spec.get("model")
+    if model is not None and (not _valid_model(model) or mismatch(model)):
+        raise ValueError(f"{name}: 모델이 올바르지 않습니다: {model!r}")
+    if spec.get("codex_sandbox") not in (None, "read-only", "workspace-write"):
+        raise ValueError(f"{name}: codex_sandbox 는 read-only 또는 workspace-write 여야 합니다")
+
+
+def load_agents(override: Path, custom: Custom | None = None) -> dict[str, dict]:
+    """실행에 쓰는 팀원 정의. custom 을 주면 역할별로 바꾼 것까지 반영한다."""
+    base = base_agents(override)
+    return merge_agents(base, custom) if custom is not None else base
+
+
+KEEP: object = object()  # with_member 의 tools: 바꾸지 않음 (None 은 '모든 도구')
+
+
+def with_member(
+    custom: Custom, base: dict[str, dict], name: str, *,
+    description: str | None = None, prompt: str | None = None, tools: object = KEEP,
+) -> Custom:
+    """팀원 name 을 고치거나 새로 넣은 설정. 주지 않은 항목은 지금 값을 그대로 둔다."""
+    if name in (LEAD_ROLE, DEFAULT_ROLE):
+        raise ValueError(f"{name} 은(는) 팀원 이름으로 쓸 수 없습니다")
+    current = merge_agents(base, custom)
+    spec = dict(current.get(name) or base.get(name) or {})  # 뺐던 기본 역할을 다시 넣으면 기본 정의에서 시작한다
+    if description is not None:
+        spec["description"] = description.strip()
+    if prompt is not None:
+        spec["prompt"] = prompt.strip()
+    if tools is not KEEP:
+        spec.pop("tools", None)
+        if tools is not None:
+            spec["tools"] = list(tools)  # type: ignore[call-overload]
+    if name in base and isinstance(base[name], dict):
+        original = base[name]
+        changed: dict = {k: v for k, v in spec.items() if _plain(original.get(k)) != _plain(v)}
+        changed.update({k: None for k in original if k not in spec})
+    else:
+        changed = spec
+    agents = {k: v for k, v in custom.agents.items() if k != name}
+    if changed or name not in base:
+        agents[name] = changed
+    updated = replace(custom, agents=agents)
+    merge_agents(base, updated)  # 저장하기 전에 검사한다
+    return updated
+
+
+def _plain(value: object) -> object:
+    return value.strip() if isinstance(value, str) else value
+
+
+def without_member(custom: Custom, base: dict[str, dict], name: str) -> Custom:
+    """팀원 name 을 팀에서 뺀 설정. 마지막 팀원은 뺄 수 없다."""
+    if name not in merge_agents(base, custom):
+        raise ValueError(f"알 수 없는 역할: {name}")
+    agents = {k: v for k, v in custom.agents.items() if k != name}
+    if name in base:
+        agents[name] = None
+    updated = replace(custom, agents=agents)
+    merge_agents(base, updated)
+    return updated
+
+
+def reset_role(custom: Custom, base: dict[str, dict], role: str | None) -> Custom:
+    """role 을 기본값으로 되돌린 설정 (lead 는 팀장 지시문, None 은 전부). 새로 넣은 역할은 없어진다."""
+    if role is None:
+        return Custom()
+    if role == LEAD_ROLE:
+        return replace(custom, lead_prompt=None)
+    if role not in custom.agents:
+        raise ValueError(f"바꾼 적이 없는 역할입니다: {role}")
+    updated = replace(custom, agents={k: v for k, v in custom.agents.items() if k != role})
+    merge_agents(base, updated)
+    return updated
+
+
+def with_lead_prompt(custom: Custom, text: str | None) -> Custom:
+    if text is not None and not text.strip():
+        raise ValueError("팀장 지시문이 비어 있습니다")
+    if text is not None and text.strip() == _LEAD_TEMPLATE.strip():
+        text = None  # 기본과 같으면 저장하지 않는다 (기본 지시문이 나중에 바뀌면 따라간다)
+    return replace(custom, lead_prompt=text.strip() if text is not None else None)
+
+
+def lead_template(custom: Custom) -> str:
+    """고칠 수 있는 팀장 지시문 원문 ({team}, {max_attempts} 자리가 그대로 있다)."""
+    return custom.lead_prompt or _LEAD_TEMPLATE
+
+
+STATE_DEFAULT, STATE_CHANGED, STATE_ADDED, STATE_REMOVED = "기본값", "고침", "추가함", "뺌"
+
+
+def role_states(base: dict[str, dict], custom: Custom) -> list[tuple[str, str]]:
+    """(역할, 상태) 목록. 첫 줄은 팀장이고, 뺀 기본 역할도 되돌릴 수 있게 보여 준다."""
+    rows = [(LEAD_ROLE, STATE_CHANGED if custom.lead_prompt is not None else STATE_DEFAULT)]
+    for name in base:
+        if name not in custom.agents:
+            rows.append((name, STATE_DEFAULT))
+        else:
+            rows.append((name, STATE_REMOVED if custom.agents[name] is None else STATE_CHANGED))
+    rows += [(name, STATE_ADDED) for name, spec in custom.agents.items() if name not in base and spec is not None]
+    return rows
 
 
 @dataclass(frozen=True)
@@ -326,21 +548,36 @@ def resolve_agents(
     return out
 
 
-def claude_agents(resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None) -> dict[str, dict]:
-    """Claude 팀장의 `claude --agents` 에 넘길 정의: Codex 팀원은 래퍼로 바꾼다."""
+def claude_agents(
+    resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None, *, local: bool = True,
+) -> dict[str, dict]:
+    """Claude 팀장의 `claude --agents` 에 넘길 정의: Codex 팀원은 래퍼로 바꾼다.
+
+    local=False 는 서버에서 실행할 때다: artifacts 가 서버의 경로라 이 컴퓨터의 파일 시스템으로 풀지 않는다.
+    """
     out: dict[str, dict] = {}
     for name, spec in resolved.items():
         spec = {k: v for k, v in spec.items() if k != "codex_sandbox"}  # coliday 전용 키
         if is_codex(spec.get("model")):
-            spec = _codex_wrapper(spec, codex_sandbox(resolved[name]), codex_bin, artifacts)
+            spec = _codex_wrapper(spec, codex_sandbox(resolved[name]), codex_bin, artifacts, local)
         out[name] = spec
     return out
 
 
-def codex_writable_roots(*paths: str | Path | None) -> list[str]:
+def without_codex(resolved: dict[str, dict]) -> tuple[dict[str, dict], list[str]]:
+    """Codex 로 일할 팀원을 Claude 로 돌린 정의와 그 팀원 이름들. Codex CLI 가 없는 곳에서 쓴다.
+
+    모델을 빼면 팀장과 같은 Claude 모델로 일한다. 역할 지침과 도구는 그대로다.
+    """
+    names = [name for name, spec in resolved.items() if is_codex(spec.get("model"))]
+    return {n: {k: v for k, v in s.items() if not (n in names and k == "model")} for n, s in resolved.items()}, names
+
+
+def codex_writable_roots(*paths: str | Path | None, local: bool = True) -> list[str]:
     """Codex 샌드박스(workspace-write)에서 작업 디렉토리 말고도 쓸 수 있게 열 폴더를 주는 옵션."""
     # Codex 는 심볼릭 링크가 낀 쓰기 폴더를 거부하고 모든 명령 실행을 막는다 (macOS 의 임시 폴더 /var → /private/var 도 링크다).
-    roots = [str(Path(p).resolve()) for p in paths if p]
+    # 서버의 경로(local=False)는 이 컴퓨터에서 풀면 엉뚱한 경로가 된다 (/var/lib/… → /private/var/lib/…).
+    roots = [str(Path(p).resolve()) if local else str(p) for p in paths if p]
     return ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"] if roots else []
 
 
@@ -364,12 +601,9 @@ def codex_model(model: str) -> str | None:
 
 def codex_lead_prompt(
     resolved: dict[str, dict], agent_command: str, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    artifacts: str | None = None,
+    artifacts: str | None = None, template: str | None = None,
 ) -> str:
     """Codex 팀장 지시문: Claude 용과 같되, 팀원에게 맡기는 방법만 셸 명령으로 바꾼다."""
-    head, _, rest = lead_prompt(max_attempts, artifacts).partition(_TEAM_HEADING)
-    _, _, tail = rest.partition("\n## ")
-    roles = "\n".join(f"- {name}: {spec.get('description') or ''}".rstrip() for name, spec in resolved.items())
     how = (
         "## 팀원에게 맡기는 방법\n"
         "서브에이전트 도구 대신 아래 셸 명령으로 맡긴다. <역할> 자리에 팀원 이름을 쓰고, 작업 명세는 stdin 으로 준다:\n\n"
@@ -378,17 +612,19 @@ def codex_lead_prompt(
         "  명령 실행 시간 제한을 60분(3600000ms)으로 지정하고, 끝나기 전에 다시 실행하지 않는다.\n"
         "- 팀원은 이 대화를 볼 수 없다. 명세에 필요한 맥락(목표, 관련 파일, 제약)을 모두 적는다.\n"
         "- 이 명령 말고 다른 방법으로 팀원을 흉내 내지 않는다.\n\n"
-        f"### 팀원\n{roles}\n"
+        f"### 팀원\n{_roles(resolved)}\n"
     )
-    return f"{head}{how}\n## {tail}"
+    return _render_lead(template, how, max_attempts, artifacts)
 
 
-def _codex_wrapper(spec: dict, sandbox: str, codex_bin: str, artifacts: str | None = None) -> dict:
+def _codex_wrapper(
+    spec: dict, sandbox: str, codex_bin: str, artifacts: str | None = None, local: bool = True,
+) -> dict:
     """팀원의 역할 지침을 그대로 Codex 에 넘기는 Claude 래퍼 정의."""
     model = spec["model"].partition(":")[2]
     command = f'{shlex.quote(codex_bin)} exec -C "$(pwd -P)" -s {sandbox} --skip-git-repo-check'
     if sandbox == "workspace-write":
-        command += "".join(f" {shlex.quote(part)}" for part in codex_writable_roots(artifacts))
+        command += "".join(f" {shlex.quote(part)}" for part in codex_writable_roots(artifacts, local=local))
     if model:
         command += f" -m {shlex.quote(model)}"
     command += ' -o "$OUT" - < "$PROMPT"'
@@ -429,6 +665,7 @@ def display(model: str | None) -> str:
 
 def role_prompts(
     agents: dict[str, dict], models: Models, role: str | None = None, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    template: str | None = None,
 ) -> list[tuple[str, str]]:
     """(제목, 프롬프트) 목록. 실제 실행에 쓰이는 내용 그대로다. role 을 주면 그 역할만."""
     if role is not None and role != LEAD_ROLE and role not in agents:
@@ -439,10 +676,10 @@ def role_prompts(
         if role not in (None, name) or name == DEFAULT_ROLE:
             continue
         if name == LEAD_ROLE:
-            prompt = lead_prompt(max_attempts, ARTIFACTS_PLACEHOLDER)
+            prompt = lead_prompt(max_attempts, ARTIFACTS_PLACEHOLDER, resolved, template)
             if is_codex(lead_spec(models)):
                 prompt = codex_lead_prompt(
-                    resolved, "coliday _agent <작업별 임시 폴더>", max_attempts, ARTIFACTS_PLACEHOLDER
+                    resolved, "coliday _agent <작업별 임시 폴더>", max_attempts, ARTIFACTS_PLACEHOLDER, template
                 )
             out.append((f"lead (팀장) · 모델: {model}", prompt.strip()))
             continue

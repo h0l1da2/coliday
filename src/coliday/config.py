@@ -34,6 +34,11 @@ class Config:
         return self.home / "agents.json"
 
     @property
+    def team_path(self) -> Path:
+        """사용자가 역할별로 바꾼 팀원 구성·프롬프트와 팀장 지시문."""
+        return self.home / "team.json"
+
+    @property
     def models_path(self) -> Path:
         return self.home / "models.json"
 

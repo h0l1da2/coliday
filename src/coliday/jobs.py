@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from coliday import gitops, projects, team
+from coliday import gitops, projects, remote, team
 from coliday.config import Config
 from coliday.store import RESULT, Job, Store
 
@@ -33,6 +33,7 @@ class WorktreeRemoveError(JobError):
 class Launched:
     job: Job
     warnings: list[str] = field(default_factory=list)
+    project: str | None = None  # 새 작업을 시작한 위치 (정규화한 프로젝트 경로)
     queued: bool = False  # 작업이 실행 중이라 요청을 대기시켰다 (지금 실행이 끝나면 이어서 전달된다)
 
 
@@ -43,13 +44,19 @@ def launch(
     prompt = prompt.strip()
     if not prompt:
         raise JobError("요청 내용이 비어 있습니다.")
-    target = Path(directory).expanduser().resolve()
-    if not target.is_dir():
-        raise JobError(f"디렉토리가 없습니다: {target}")
-    root = gitops.repo_root(target)
+    target = _location(directory)
+    host = remote.split(target)[0]
     warnings: list[str] = []
     model = team.canonical(model or lead_model(cfg))
-    check_codex(cfg, model)
+    check_team(cfg)
+    try:
+        if host is not None:
+            check_remote(host, model)
+        else:
+            check_codex(cfg, model)
+        root = gitops.repo_root(target)
+    except remote.RemoteError as exc:
+        raise JobError(str(exc)) from exc
     try:
         list_projects(cfg, store)  # 이 작업을 만들기 전에 기존 작업으로 목록을 채워 둔다
     except JobError:
@@ -58,21 +65,22 @@ def launch(
     if no_worktree or root is None:
         if root is None and not no_worktree:
             raise JobError("git 저장소가 아닙니다. 이 디렉토리에서 직접 작업하려면 worktree 없이 실행하세요 (--no-worktree).")
-        job = store.create_job(prompt=prompt, repo=str(root or target), workdir=str(target), model=model)
+        job = store.create_job(prompt=prompt, repo=root or target, workdir=target, model=model)
     else:
         if gitops.is_dirty(root):
             warnings.append("커밋하지 않은 변경은 worktree 에 포함되지 않습니다 (HEAD 기준으로 작업).")
         base = gitops.head_commit(root)
-        job = store.create_job(prompt=prompt, repo=str(root), workdir="", model=model)
+        job = store.create_job(prompt=prompt, repo=root, workdir="", model=model)
         branch = f"coliday/{job.id}"
-        wt = worktree_path(cfg, job)
         try:
+            wt = worktree_path(cfg, job)
             gitops.add_worktree(root, wt, branch, base)
-        except gitops.GitError as exc:
+        except (gitops.GitError, remote.RemoteError) as exc:
             store.finish_job(job.id, "failed", phase=f"worktree 생성 실패: {exc}")
             raise JobError(f"worktree 생성 실패: {exc}") from exc
         # 하위 디렉토리에서 실행했다면 worktree 안의 같은 위치에서 작업한다.
-        store.update_job(job.id, workdir=str(wt / target.relative_to(root)), branch=branch, base_commit=base)
+        inside = os.path.relpath(remote.split(target)[1], remote.split(root)[1])
+        store.update_job(job.id, workdir=remote.join(wt, inside), branch=branch, base_commit=base)
         job = store.get_job(job.id)
 
     _spawn_worker(cfg, job.id)
@@ -80,7 +88,7 @@ def launch(
         add_project(cfg, store, target)
     except JobError as exc:  # 목록 파일이 깨져도 작업은 이미 시작됐다
         warnings.append(f"프로젝트 목록에 추가하지 못했습니다: {exc}")
-    return Launched(job, warnings)
+    return Launched(job, warnings, project=target)
 
 
 def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: str | None = None) -> Launched:
@@ -96,13 +104,18 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
         notes = ["이 요청에 준 --model 은 무시됩니다 (실행 중인 팀장이 이어서 처리)."] if model else []
         return Launched(job, notes, queued=True)
     job = store.get_job(job_id)  # 대기시키려는 사이에 끝났으면 바로 이어서 시킨다
-    if not job.workdir or not Path(job.workdir).is_dir():
+    if not job.workdir or not _is_dir(job.workdir):
         raise JobError(f"작업 #{job.id} 의 작업 디렉토리가 없습니다 (정리된 작업). 새 작업으로 시작하세요.")
     warnings: list[str] = []
     # 고른 값이 Claude 기본 모델(claude)이면 이전 실행이 Claude 였을 때 그 모델을 그대로 쓴다.
     model = team.canonical(model or lead_model(cfg))
     switched = team.is_codex(model) != team.is_codex(job.model)
-    check_codex(cfg, model)
+    host = remote.split(job.workdir)[0]
+    if host is not None:
+        _remote(check_remote, host, model)
+    else:
+        check_codex(cfg, model)
+    check_team(cfg)
     if switched and job.session_id:
         # Claude 세션과 Codex 세션은 서로 이어받을 수 없다. 작업 디렉토리(코드 변경)는 그대로 쓴다.
         warnings.append("팀장이 Claude↔Codex 로 바뀌어 새 세션으로 시작합니다 (이전 대화 내용은 이어지지 않음).")
@@ -137,10 +150,73 @@ def check_codex(cfg: Config, model: str | None) -> None:
         raise JobError(f"Codex CLI 를 찾을 수 없습니다: {cfg.codex_bin}. 설치하거나 COLIDAY_CODEX_BIN 으로 경로를 지정하세요.")
 
 
+def check_remote(host: str, model: str | None) -> None:
+    """서버에서 실행할 수 있는지 작업을 만들기 전에 확인한다 (접속, git, 에이전트 CLI)."""
+    if problem := team.mismatch(model):
+        raise JobError(f"{problem} (바꾸기: coliday model)")
+    if team.is_codex(model):
+        raise JobError(
+            "SSH 프로젝트에서는 Codex 팀장을 쓸 수 없습니다. 팀장을 Claude 로 두세요 (팀원은 Codex 로 둘 수 있습니다). "
+            "예: coliday model lead claude"
+        )
+    missing = remote.missing_commands(host, "git", remote_claude_bin())
+    if missing:
+        raise JobError(
+            f"{host} 에서 {', '.join(missing)} 을(를) 찾을 수 없습니다. 서버에 설치하고 로그인해 두세요 "
+            "(경로가 PATH 밖이면 COLIDAY_REMOTE_CLAUDE_BIN 으로 지정)."
+        )
+
+
+def remote_claude_bin() -> str:
+    return os.environ.get("COLIDAY_REMOTE_CLAUDE_BIN") or "claude"
+
+
+def remote_codex_bin() -> str:
+    return os.environ.get("COLIDAY_REMOTE_CODEX_BIN") or "codex"
+
+
+def remote_job_dir(host: str, job_id: int) -> str:
+    """서버에 두는 작업별 폴더 (에이전트 정의, 실행 중인 프로세스 번호, 결과물)."""
+    return f"{remote.home(host)}/.coliday/jobs/{job_id}"
+
+
+def _remote(func, *args):
+    """서버 접속 오류를 사용자에게 보여 줄 오류로 바꾼다."""
+    try:
+        return func(*args)
+    except remote.RemoteError as exc:
+        raise JobError(str(exc)) from exc
+
+
+def _location(directory: str | Path) -> str:
+    """사용자가 준 위치를 정규화하고 실제로 있는지 확인한다."""
+    try:
+        target = projects.normalize(directory)
+    except remote.RemoteError as exc:
+        raise JobError(str(exc)) from exc
+    if not _is_dir(target):
+        raise JobError(f"디렉토리가 없습니다: {target}")
+    return target
+
+
+def _is_dir(location: str) -> bool:
+    if remote.is_remote(location):
+        return bool(_remote(remote.is_dir, location))
+    return Path(location).is_dir()
+
+
+def check_team(cfg: Config) -> None:
+    """팀 설정(team.json, agents.json)이 잘못됐으면 작업을 만들기 전에 알린다."""
+    try:
+        team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path))
+    except (OSError, ValueError) as exc:
+        raise JobError(f"팀 설정이 잘못됐습니다: {exc} (바꾸기: coliday team)") from exc
+
+
 def set_model(cfg: Config, role: str, model: str | None) -> None:
     check_codex(cfg, model)
     try:
-        agents = team.load_agents(cfg.agents_override)
+        agents = team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path))
         team.save_models(cfg.models_path, team.with_model(team.load_models(cfg.models_path), agents, role, model))
     except (OSError, ValueError) as exc:
         raise JobError(str(exc)) from exc
@@ -148,7 +224,9 @@ def set_model(cfg: Config, role: str, model: str | None) -> None:
 
 def model_rows(cfg: Config) -> list[tuple[str, str, bool]]:
     try:
-        return team.model_rows(team.load_agents(cfg.agents_override), team.load_models(cfg.models_path))
+        return team.model_rows(
+            team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path)), team.load_models(cfg.models_path)
+        )
     except (OSError, ValueError) as exc:
         raise JobError(f"모델 설정을 읽을 수 없습니다: {exc}") from exc
 
@@ -157,7 +235,7 @@ def _project_entries(cfg: Config, store: Store) -> dict[str, str | None]:
     """경로 → 붙인 이름. 목록 파일이 아직 없으면 기존 작업의 레포로 한 번 채운다."""
     try:
         if not cfg.projects_path.exists():
-            seen = [j.repo for j in reversed(store.list_jobs(200)) if Path(j.repo).is_dir()]
+            seen = [j.repo for j in reversed(store.list_jobs(200)) if projects.exists(j.repo)]
             projects.save(cfg.projects_path, dict.fromkeys(seen))
         return projects.load(cfg.projects_path)
     except (OSError, ValueError) as exc:
@@ -171,7 +249,7 @@ def list_projects(cfg: Config, store: Store) -> list[str]:
 
 def project_names(cfg: Config, store: Store) -> dict[str, str]:
     """경로 → 표시 이름 (붙인 이름이 없으면 폴더 이름)."""
-    return {p: n or Path(p).name for p, n in _project_entries(cfg, store).items()}
+    return {p: n or remote.name(p) for p, n in _project_entries(cfg, store).items()}
 
 
 def add_project(cfg: Config, store: Store, directory: str | Path, name: str | None = None) -> str:
@@ -179,10 +257,9 @@ def add_project(cfg: Config, store: Store, directory: str | Path, name: str | No
 
     name 이 None 이면 이름을 건드리지 않고(이미 있으면 그대로), 빈 문자열이면 폴더 이름으로 되돌린다.
     """
-    path = projects.normalize(directory)
-    if not Path(path).is_dir():
-        raise JobError(f"디렉토리가 없습니다: {path}")
     items = _project_entries(cfg, store)
+    # 이미 연결된 항목은 이름만 바꾸는 것이다: 다시 확인하지 않는다 (서버에 접속하지 못해도 이름은 바꿀 수 있게).
+    path = str(directory) if str(directory) in items else _location(directory)
     updated = dict(items)
     updated[path] = items.get(path) if name is None else (" ".join(name.split()) or None)
     if list(updated.items()) != list(items.items()):
@@ -195,7 +272,10 @@ def add_project(cfg: Config, store: Store, directory: str | Path, name: str | No
 
 def remove_project(cfg: Config, store: Store, directory: str | Path) -> bool:
     """목록에서만 뺀다 (디렉토리와 작업은 건드리지 않는다). 목록에 없었으면 False."""
-    path = projects.normalize(directory)
+    try:
+        path = projects.normalize(directory)
+    except remote.RemoteError:  # 서버에 접속하지 못해도 목록에서는 뺄 수 있어야 한다
+        path = str(directory)
     items = _project_entries(cfg, store)
     if path not in items:
         return False
@@ -295,9 +375,88 @@ def open_artifacts(cfg: Config, store: Store, job_id: int) -> Path:
 
 def role_prompts(cfg: Config, role: str | None = None) -> list[tuple[str, str]]:
     try:
+        custom = team.load_custom(cfg.team_path)
         return team.role_prompts(
-            team.load_agents(cfg.agents_override), team.load_models(cfg.models_path), role, cfg.max_attempts
+            team.load_agents(cfg.agents_override, custom), team.load_models(cfg.models_path), role, cfg.max_attempts,
+            custom.lead_prompt,
         )
+    except (OSError, ValueError) as exc:
+        raise JobError(str(exc)) from exc
+
+
+def _team(cfg: Config) -> tuple[dict[str, dict], team.Custom]:
+    return team.base_agents(cfg.agents_override), team.load_custom(cfg.team_path)
+
+
+def team_roles(cfg: Config) -> list[tuple[str, str, str]]:
+    """(역할, 상태, 설명) 목록. 첫 줄은 팀장. 뺀 기본 역할도 되돌릴 수 있게 나온다."""
+    try:
+        base, custom = _team(cfg)
+        agents = team.merge_agents(base, custom)
+    except (OSError, ValueError) as exc:
+        raise JobError(f"팀 설정을 읽을 수 없습니다: {exc}") from exc
+    return [
+        (role, state, "팀원에게 일을 나눠 맡기고 최종 보고한다." if role == team.LEAD_ROLE
+         else str((agents.get(role) or base.get(role) or {}).get("description") or ""))
+        for role, state in team.role_states(base, custom)
+    ]
+
+
+def role_definition(cfg: Config, role: str) -> dict:
+    """고칠 수 있는 원문: 팀장은 {"prompt"}, 팀원은 {"description", "prompt", "tools"} (tools 가 None 이면 모든 도구).
+
+    실행할 때 자동으로 붙는 규칙(재시도, 결과물)은 들어 있지 않다.
+    """
+    try:
+        base, custom = _team(cfg)
+        if role == team.LEAD_ROLE:
+            return {"prompt": team.lead_template(custom).strip()}
+        agents = team.merge_agents(base, custom)
+    except (OSError, ValueError) as exc:
+        raise JobError(f"팀 설정을 읽을 수 없습니다: {exc}") from exc
+    spec = agents.get(role) or base.get(role)  # 뺀 기본 역할도 원래 정의를 볼 수 있다
+    if not isinstance(spec, dict):
+        raise JobError(f"알 수 없는 역할: {role} (가능: {', '.join([team.LEAD_ROLE, *agents])})")
+    tools = spec.get("tools")
+    return {
+        "description": str(spec.get("description") or ""),
+        "prompt": str(spec.get("prompt") or "").strip(),
+        "tools": list(tools) if isinstance(tools, list) else None,
+    }
+
+
+def set_role(
+    cfg: Config, role: str, *, description: str | None = None, prompt: str | None = None, tools: object = team.KEEP,
+) -> None:
+    """역할을 고치거나 새 팀원을 넣는다 (다음 실행부터 적용). 주지 않은 항목은 그대로 둔다. lead 는 prompt 만 받는다."""
+    try:
+        base, custom = _team(cfg)
+        if role == team.LEAD_ROLE:
+            if description is not None or tools is not team.KEEP:
+                raise ValueError("팀장(lead)은 지시문(prompt)만 바꿀 수 있습니다")
+            if prompt is None:
+                raise ValueError("바꿀 지시문을 주세요")
+            updated = team.with_lead_prompt(custom, prompt)
+        else:
+            updated = team.with_member(custom, base, role, description=description, prompt=prompt, tools=tools)
+        team.save_custom(cfg.team_path, updated)
+    except (OSError, ValueError) as exc:
+        raise JobError(str(exc)) from exc
+
+
+def remove_role(cfg: Config, role: str) -> None:
+    try:
+        base, custom = _team(cfg)
+        team.save_custom(cfg.team_path, team.without_member(custom, base, role))
+    except (OSError, ValueError) as exc:
+        raise JobError(str(exc)) from exc
+
+
+def reset_role(cfg: Config, role: str | None) -> None:
+    """역할 하나(또는 None 이면 전부)를 기본값으로 되돌린다."""
+    try:
+        base, custom = _team(cfg)
+        team.save_custom(cfg.team_path, team.reset_role(custom, base, role))
     except (OSError, ValueError) as exc:
         raise JobError(str(exc)) from exc
 
@@ -312,8 +471,13 @@ def _spawn_worker(cfg: Config, job_id: int) -> None:
         )
 
 
-def worktree_path(cfg: Config, job: Job) -> Path:
-    return cfg.worktrees_dir / f"{Path(job.repo).name}-{job.id}"
+def worktree_path(cfg: Config, job: Job) -> str:
+    """작업의 worktree 위치. 서버의 레포면 그 서버의 `~/.coliday/worktrees` 아래다."""
+    folder = f"{remote.name(job.repo)}-{job.id}"
+    host = remote.split(job.repo)[0]
+    if host is not None:
+        return f"{host}:{remote.home(host)}/.coliday/worktrees/{folder}"
+    return str(cfg.worktrees_dir / folder)
 
 
 def cancel(store: Store, job: Job) -> bool:
@@ -328,7 +492,24 @@ def cancel(store: Store, job: Job) -> bool:
             os.killpg(job.pid, signal.SIGTERM)  # worker 는 자기 세션의 리더라 pgid == pid
         except ProcessLookupError:
             pass
+    host = remote.split(job.workdir)[0]
+    if host is not None:
+        # ssh 연결을 끊는 것만으로는 서버의 에이전트가 멈추지 않을 수 있다. 기록해 둔 프로세스를 직접 끝낸다.
+        remote.spawn(host, stop_script(job.id))
     return True
+
+
+REMOTE_JOBS = '"$HOME"/.coliday/jobs'  # 서버 셸에서 풀리는 경로 (접속하지 않고도 명령을 만들 수 있게)
+
+
+def stop_script(job_id: int) -> str:
+    """서버에서 이 작업의 에이전트(와 그 자식)를 끝내는 셸 스크립트."""
+    pid_file = f"{REMOTE_JOBS}/{job_id}/pid"
+    return (
+        f'p=$(cat {pid_file} 2>/dev/null) && [ -n "$p" ] && '
+        '{ pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; }; '
+        f"rm -f {pid_file}"
+    )
 
 
 def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
@@ -337,18 +518,25 @@ def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
     if not job.is_terminal:
         raise JobError("실행 중인 작업입니다. 먼저 취소하세요.")
     removed_worktree = False
+    note = ""
+    host = remote.split(job.workdir or job.repo)[0]
     if job.branch:  # worktree 없이 실행한 작업은 기록만 지운다 (프로젝트 디렉토리는 건드리지 않는다)
-        wt = worktree_path(cfg, job)
-        if wt.exists():
-            try:
-                gitops.remove_worktree(Path(job.repo), wt, job.branch, force)
-            except gitops.GitError as exc:
+        try:
+            wt = worktree_path(cfg, job)
+            if _is_dir(wt):
+                gitops.remove_worktree(job.repo, wt, job.branch, force)
+                removed_worktree = True
+        except (gitops.GitError, JobError, remote.RemoteError) as exc:
+            if host is None or not force:
                 raise WorktreeRemoveError(f"삭제 실패 (검토하지 않은 변경이 있으면 --force 필요): {exc}") from exc
-            removed_worktree = True
+            # 없어진 서버의 작업도 목록에서는 지울 수 있어야 한다. 강제 삭제면 기록만 지운다.
+            note = f" 서버의 worktree 와 브랜치는 지우지 못했습니다: {exc}"
     if not store.delete_job(job.id):
         raise JobError(f"작업 #{job.id} 은(는) 다시 실행 중이라 삭제하지 않았습니다.")
     shutil.rmtree(cfg.job_dir(job.id), ignore_errors=True)
-    return f"작업 #{job.id} 을(를) 삭제했습니다" + (f" (worktree 와 브랜치 {job.branch} 포함)." if removed_worktree else ".")
+    if host is not None:
+        remote.spawn(host, f"rm -rf {REMOTE_JOBS}/{job.id}")  # 서버에 둔 에이전트 정의·결과물 원본
+    return f"작업 #{job.id} 을(를) 삭제했습니다" + (f" (worktree 와 브랜치 {job.branch} 포함)." if removed_worktree else ".") + note
 
 
 def reconcile(store: Store, job: Job) -> Job:

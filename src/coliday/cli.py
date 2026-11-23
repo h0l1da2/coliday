@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import config, gitops, jobs, members, projects, team, worker
+from coliday import config, gitops, jobs, members, projects, remote, team, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
@@ -44,13 +45,14 @@ def _parser() -> argparse.ArgumentParser:
         prog="coliday",
         description="팀장 에이전트에게 일을 시키고 진행 상황을 본다. 인자 없이 실행하면 TUI 를 연다.",
     )
-    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,prompt,ls,show,diff,open,cancel,rm}")
+    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,team,prompt,ls,show,diff,open,cancel,rm}")
 
     sub.add_parser("ui", help="TUI 열기 (인자 없이 실행한 것과 같다)")
 
     run = sub.add_parser("run", help="새 작업 실행")
     run.add_argument("prompt", help="팀장에게 시킬 일")
-    run.add_argument("-C", "--dir", default=".", help="프로젝트 디렉토리 (기본: 현재 디렉토리)")
+    run.add_argument("-C", "--dir", default=".",
+                     help="프로젝트 디렉토리 (기본: 현재 디렉토리). 서버의 디렉토리는 user@host:/경로 (SSH)")
     run.add_argument("--no-worktree", action="store_true", help="worktree 없이 프로젝트 디렉토리에서 직접 작업")
     run.add_argument("-d", "--detach", action="store_true", help="시작만 하고 바로 돌아오기")
     run.add_argument("--model", help="이 작업만 쓸 팀장 에이전트·모델 (예: codex, claude:opus). 기본: coliday model 설정")
@@ -63,9 +65,10 @@ def _parser() -> argparse.ArgumentParser:
     cont.add_argument("--model", help="이번 실행부터 쓸 팀장 모델 (기본: coliday model 설정, 없으면 이전과 같음)")
     cont.set_defaults(func=_cmd_continue)
 
-    proj = sub.add_parser("project", help="연결된 프로젝트 디렉토리 보기/추가/빼기")
+    proj = sub.add_parser("project", help="연결된 프로젝트 디렉토리 보기/추가/빼기 (서버는 user@host:/경로 로 SSH 접속)")
     proj.add_argument("action", nargs="?", choices=["add", "rm"], help="생략하면 목록 보기")
-    proj.add_argument("dir", nargs="?", help="디렉토리 (add 는 기본: 현재 디렉토리)")
+    proj.add_argument("dir", nargs="?",
+                      help="디렉토리 (add 는 기본: 현재 디렉토리). 서버는 user@host:/경로 또는 ~/.ssh/config 별칭:/경로")
     proj.add_argument("--name", help="add: 목록에 보일 이름 (기본: 폴더 이름). 이미 연결된 디렉토리면 이름만 바꾼다")
     proj.set_defaults(func=_cmd_project)
 
@@ -75,7 +78,22 @@ def _parser() -> argparse.ArgumentParser:
     model.add_argument("--reset", action="store_true", help="해당 역할을 기본값으로 되돌리기")
     model.set_defaults(func=_cmd_model)
 
-    prompt = sub.add_parser("prompt", help="팀장·팀원에게 주는 프롬프트 보기")
+    tm = sub.add_parser(
+        "team", help="팀원 구성과 역할별 프롬프트 보기/바꾸기 (다음 실행부터 적용)",
+        description="팀원을 고치거나 넣고 뺀다. 바꾼 것만 ~/.coliday/team.json 에 저장되고 나머지는 기본값을 따른다. "
+                    "lead 는 팀장 지시문이다 ({team} 자리에 팀원 목록, {max_attempts} 자리에 최대 시도 횟수가 들어간다).",
+    )
+    tm.add_argument("action", nargs="?", choices=["show", "set", "rm", "reset"],
+                    help="show: 고칠 수 있는 원문(JSON) / set: 고치거나 새로 넣기 / rm: 팀에서 빼기 / reset: 기본값으로. 생략하면 목록")
+    tm.add_argument("role", nargs="?", help="lead(팀장 지시문) 또는 팀원 이름. 없는 이름으로 set 하면 새 팀원이 된다")
+    tm.add_argument("--description", help="set: 팀장이 보고 언제 맡길지 정하는 한 줄 설명")
+    tm.add_argument("--prompt", help="set: 프롬프트 (팀장은 지시문)")
+    tm.add_argument("--prompt-file", help="set: 프롬프트를 읽을 파일 ('-' 는 stdin)")
+    tm.add_argument("--tools", help="set: 쓸 도구를 쉼표로 (예: Read,Grep,Bash). all 은 모든 도구")
+    tm.add_argument("--all", action="store_true", help="reset: 팀 전체를 기본값으로")
+    tm.set_defaults(func=_cmd_team)
+
+    prompt = sub.add_parser("prompt", help="팀장·팀원에게 주는 프롬프트 보기 (실행에 쓰이는 내용 그대로)")
     prompt.add_argument("role", nargs="?", help="lead(팀장) 또는 팀원 이름. 생략하면 전부")
     prompt.set_defaults(func=_cmd_prompt)
 
@@ -167,14 +185,14 @@ def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> 
         if not args.dir:
             raise JobError("목록에서 뺄 디렉토리를 주세요. 예: coliday project rm ~/work_dir/some-project")
         if not jobs.remove_project(cfg, store, args.dir):
-            raise JobError(f"목록에 없는 디렉토리입니다: {projects.normalize(args.dir)}")
-        print(f"목록에서 뺐습니다: {projects.normalize(args.dir)}")
+            raise JobError(f"목록에 없는 디렉토리입니다: {args.dir}")
+        print(f"목록에서 뺐습니다: {args.dir}")
         return 0
     items = jobs.project_names(cfg, store)
     if not items:
         print("연결된 프로젝트가 없습니다. 예: coliday project add ~/work_dir/some-project --name 쇼핑몰")
     for path, name in items.items():
-        print(f"{_pad(name, 28)}  {path}" + ("" if Path(path).is_dir() else "  (없음)"))
+        print(f"{_pad(name, 28)}  {path}" + ("" if projects.exists(path) else "  (없음)"))
     return 0
 
 
@@ -192,6 +210,52 @@ def _cmd_model(cfg: config.Config, store: Store, args: argparse.Namespace) -> in
     return 0
 
 
+def _cmd_team(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
+    setting = args.description is not None or args.prompt is not None or args.prompt_file or args.tools is not None
+    if setting and args.action != "set":
+        raise JobError("--description, --prompt, --prompt-file, --tools 는 set 에만 씁니다. 예: coliday team set qa --prompt-file qa.md")
+    if args.all and (args.action != "reset" or args.role):
+        raise JobError("--all 은 역할 없이 reset 에만 씁니다. 예: coliday team reset --all")
+    if args.action in ("show", "set", "rm") and not args.role:
+        raise JobError(f"역할을 주세요. 예: coliday team {args.action} reviewer")
+    if args.action == "show":
+        print(json.dumps(_as_lines(jobs.role_definition(cfg, args.role)), ensure_ascii=False, indent=2))
+        return 0
+    if args.action == "set":
+        if not setting:
+            raise JobError('바꿀 내용을 주세요. 예: coliday team set qa --description "검수 담당" --prompt-file qa.md --tools Read,Bash')
+        if args.prompt is not None and args.prompt_file:
+            raise JobError("--prompt 와 --prompt-file 중 하나만 주세요.")
+        prompt = args.prompt
+        if args.prompt_file:
+            try:
+                prompt = sys.stdin.read() if args.prompt_file == "-" else Path(args.prompt_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise JobError(f"프롬프트 파일을 읽을 수 없습니다: {exc}") from exc
+        tools: object = team.KEEP
+        if args.tools is not None:
+            tools = None if args.tools.strip().lower() == "all" else [t.strip() for t in args.tools.split(",") if t.strip()]
+        jobs.set_role(cfg, args.role, description=args.description, prompt=prompt, tools=tools)
+    elif args.action == "rm":
+        jobs.remove_role(cfg, args.role)
+    elif args.action == "reset":
+        if not args.role and not args.all:
+            raise JobError("되돌릴 역할을 주세요. 전부 되돌리려면: coliday team reset --all")
+        jobs.reset_role(cfg, args.role)
+    elif args.role:
+        raise JobError(f"무엇을 할지 주세요. 예: coliday team show {args.role} / coliday team set {args.role} --prompt-file p.md")
+    for role, state, description in jobs.team_roles(cfg):
+        print(f"{_pad(role, 14)}  {_pad(state, 8)}  {description}")
+    if args.action:
+        print("다음 실행부터 적용됩니다.")
+    return 0
+
+
+def _as_lines(definition: dict) -> dict:
+    """team.json 에 그대로 붙여 넣을 수 있는 모양: 프롬프트는 줄 단위 배열."""
+    return {k: v.split("\n") if k == "prompt" else v for k, v in definition.items() if v is not None}
+
+
 def _cmd_prompt(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     print("\n\n".join(f"── {title} ──\n{body}" for title, body in jobs.role_prompts(cfg, args.role)))
     return 0
@@ -205,7 +269,7 @@ def _cmd_ls(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     now = time.time()
     for j in rows:
         icon = STATUS_ICON.get(j.status, "?")
-        repo = Path(j.repo).name
+        repo = remote.name(j.repo)
         print(
             f"{icon} #{j.id:<4} {jobs.ago(now - j.created_at):>6}  {repo:<20.20}  "
             f"{_pad(jobs.one_line(j.prompt, 40), 40)}  {jobs.one_line(j.phase, 50)}"
@@ -227,7 +291,7 @@ def _cmd_show(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
 
 def _cmd_diff(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     job = store.get_job(args.id)
-    text = gitops.diff(Path(job.workdir), job.base_commit)
+    text = gitops.diff(job.workdir, job.base_commit)
     if not text.strip():
         print("변경 사항이 없습니다.")
         return 0

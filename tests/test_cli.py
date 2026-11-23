@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from coliday import cli, config, jobs
+from coliday import cli, config, jobs, team, worker
 from coliday.store import Store
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_claude.py"
@@ -998,3 +998,144 @@ def _wait(cond, timeout=10.0):
             return
         time.sleep(0.1)
     raise AssertionError("시간 초과")
+
+
+def _team_file():
+    return json.loads(config.load().team_path.read_text())
+
+
+def test_team으로_바꾼_역할만_저장되고_다음_실행에_적용된다(env, repo, capsys):
+    assert cli.main(["team", "set", "reviewer", "--prompt", "너는 보안 리뷰어다."]) == 0
+    assert cli.main(["team", "set", "qa", "--description", "구현 뒤 사용자 시나리오 검수",
+                     "--prompt", "너는 QA 다.\n둘째 줄", "--tools", "Read, Bash"]) == 0
+    assert cli.main(["team", "rm", "codex-coder"]) == 0
+    assert _team_file() == {"agents": {   # 바꾼 것만 적힌다. 프롬프트는 줄 단위 배열
+        "reviewer": {"prompt": ["너는 보안 리뷰어다."]},
+        "qa": {"description": "구현 뒤 사용자 시나리오 검수", "prompt": ["너는 QA 다.", "둘째 줄"], "tools": ["Read", "Bash"]},
+        "codex-coder": None,
+    }}
+    capsys.readouterr()
+    assert cli.main(["team"]) == 0
+    rows = {line.split()[0]: line.split()[1] for line in capsys.readouterr().out.splitlines()}
+    assert rows == {"lead": "기본값", "architect": "기본값", "coder": "기본값", "codex-coder": "뺌",
+                    "reviewer": "고침", "verifier": "기본값", "qa": "추가함"}
+
+    cli.main(["run", "x", "-C", str(repo)])
+    argv, agents = _recorded(env)
+    assert list(agents) == ["architect", "coder", "reviewer", "verifier", "qa"]
+    assert agents["reviewer"]["prompt"].startswith("너는 보안 리뷰어다.") and "실패했을 때" in agents["reviewer"]["prompt"]
+    assert agents["reviewer"]["tools"] == ["Read", "Grep", "Glob", "Bash"]   # 안 바꾼 항목은 기본값
+    assert agents["qa"]["tools"] == ["Read", "Bash"] and agents["qa"]["prompt"].startswith("너는 QA 다.\n둘째 줄")
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert "- qa: 구현 뒤 사용자 시나리오 검수" in lead and "codex-coder" not in lead   # 팀장도 바뀐 팀을 안다
+
+    cli.main(["run", "y", "-C", str(repo), "--model", "codex"])   # Codex 팀장도 같은 팀을 본다
+    stdin = _codex_calls(env)[-1]["stdin"]
+    assert "- qa: 구현 뒤 사용자 시나리오 검수" in stdin and "codex-coder" not in stdin
+
+    assert cli.main(["team", "reset", "reviewer"]) == 0 and cli.main(["team", "reset", "codex-coder"]) == 0
+    assert list(_team_file()["agents"]) == ["qa"]
+    assert cli.main(["team", "reset", "--all"]) == 0
+    assert not config.load().team_path.exists()   # 바꾼 것이 없으면 파일도 없다
+
+
+def test_team_set_lead로_팀장_지시문을_바꾼다(env, repo, tmp_path, capsys, monkeypatch):
+    capsys.readouterr()
+    assert cli.main(["team", "show", "lead"]) == 0
+    template = "\n".join(json.loads(capsys.readouterr().out)["prompt"])
+    assert "{team}" in template and "{max_attempts}" in template and "## 팀원 (Agent" not in template
+
+    f = tmp_path / "lead.md"
+    f.write_text("너는 꼼꼼한 팀장이다.\n{team}\n같은 일은 {max_attempts}번까지만.\n")
+    assert cli.main(["team", "set", "lead", "--prompt-file", str(f)]) == 0
+    cli.main(["run", "x", "-C", str(repo)])
+    argv, _ = _recorded(env)
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert lead.startswith("너는 꼼꼼한 팀장이다.\n## 팀원 (Agent 도구의 subagent_type)\n- architect:")
+    assert "같은 일은 5번까지만." in lead and "coliday 팀장 모드" not in lead
+    assert "## 화면 작업의 결과물" in lead   # 결과물 규칙은 그대로 붙는다
+
+    # {team} 자리를 지워도 팀원 목록은 들어간다. Codex 팀장은 그 자리에 맡기는 방법이 들어가 위임이 된다
+    assert cli.main(["team", "set", "lead", "--prompt", "자리 없는 지시문"]) == 0
+    assert _team_file() == {"lead": {"prompt": ["자리 없는 지시문"]}}
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
+    cli.main(["run", "y", "-C", str(repo), "--model", "codex"])
+    lead_call = next(c for c in _codex_calls(env) if "# 사용자 요청" in c["stdin"])
+    assert lead_call["stdin"].startswith("자리 없는 지시문\n\n## 팀원에게 맡기는 방법")
+    assert len(_codex_calls(env)) == 1 and _store().get_job(2).status == "succeeded"   # coder 는 Claude 로 돌았다
+
+    assert cli.main(["team", "set", "lead", "--prompt", template]) == 0   # 기본과 같으면 저장하지 않는다
+    assert not config.load().team_path.exists()
+    assert cli.main(["team", "set", "lead", "--description", "x"]) == 2
+    assert cli.main(["team", "set", "lead", "--prompt", "  "]) == 2
+
+
+def test_team은_잘못된_입력을_저장하지_않는다(env, capsys):
+    assert cli.main(["team", "set", "qa", "--prompt", "설명이 없다"]) == 2
+    assert "설명(description)" in capsys.readouterr().err
+    assert cli.main(["team", "set", "bad name", "--description", "d", "--prompt", "p"]) == 2
+    assert cli.main(["team", "set", "lead2;rm", "--description", "d", "--prompt", "p"]) == 2
+    assert cli.main(["team", "set", "default", "--description", "d", "--prompt", "p"]) == 2
+    assert cli.main(["team", "set", "coder", "--tools", "Read; rm -rf"]) == 2
+    assert cli.main(["team", "set", "coder", "--prompt", ""]) == 2
+    assert cli.main(["team", "set", "coder"]) == 2
+    assert cli.main(["team", "rm", "nobody"]) == 2 and cli.main(["team", "rm", "lead"]) == 2
+    assert cli.main(["team", "reset", "coder"]) == 2      # 바꾼 적 없는 역할
+    assert cli.main(["team", "reset"]) == 2 and cli.main(["team", "rm", "coder", "--prompt", "x"]) == 2
+    assert not config.load().team_path.exists()
+
+    for name in ("architect", "coder", "codex-coder", "reviewer"):
+        assert cli.main(["team", "rm", name]) == 0
+    capsys.readouterr()
+    assert cli.main(["team", "rm", "verifier"]) == 2     # 마지막 팀원은 뺄 수 없다
+    assert "팀원이 하나는 있어야 합니다" in capsys.readouterr().err
+    assert cli.main(["team", "set", "coder", "--tools", "all"]) == 0   # 뺀 기본 역할을 다시 넣으면 기본 정의에서 시작한다
+    assert _team_file()["agents"]["coder"] == {"tools": None}
+    agents = team.load_agents(config.load().agents_override, team.load_custom(config.load().team_path))
+    assert "tools" not in agents["coder"] and agents["coder"]["prompt"].startswith("너는 시니어 개발자다")
+
+
+def test_손으로_쓴_team_json이_잘못되면_실행_전에_알린다(env, repo, capsys):
+    cfg = config.load()
+    cfg.home.mkdir(parents=True)
+    cfg.team_path.write_text(json.dumps({"agents": {"qa": {"prompt": ["줄1", "줄2"]}}}))   # 설명이 없다
+    assert cli.main(["team"]) == 2 and "설명(description)" in capsys.readouterr().err
+    assert cli.main(["prompt"]) == 2
+
+    assert cli.main(["run", "x", "-C", str(repo)]) == 2 and _store().list_jobs() == []   # 작업을 만들지 않는다
+    assert "팀 설정이 잘못됐습니다" in capsys.readouterr().err
+
+    # 작업을 만든 뒤에 파일이 깨졌으면 그 작업이 실패하고 이유가 타임라인에 남는다
+    store = _store()
+    job = store.create_job(prompt="p", repo=str(repo), workdir=str(repo), model=None)
+    assert worker.run_job(cfg, store, job.id) == 1
+    assert store.get_job(job.id).status == "failed"
+    assert any("설명(description)" in e.message for e in store.events(job.id))
+
+    cfg.team_path.write_text(json.dumps({"agent": {}}))   # 오타 난 키
+    assert cli.main(["team"]) == 2 and "형식이어야 합니다" in capsys.readouterr().err
+    cfg.team_path.write_text("{")
+    assert cli.main(["team"]) == 2
+
+    cfg.team_path.write_text(json.dumps({"agents": {"qa": {"description": "검수", "prompt": ["줄1", "줄2"]}}}))
+    assert jobs.role_definition(cfg, "qa") == {"description": "검수", "prompt": "줄1\n줄2", "tools": None}
+    assert cli.main(["model", "qa", "codex"]) == 0   # 새 역할도 모델을 고를 수 있다
+
+
+def test_agents_json_위에_역할별_변경을_얹는다(env, capsys):
+    cfg = config.load()
+    cfg.home.mkdir(parents=True)
+    cfg.agents_override.write_text(json.dumps({"qa": {"prompt": "너는 QA 다."}, "dev": {"description": "구현", "prompt": "구현한다."}}))
+    assert cli.main(["team", "set", "qa", "--prompt", "너는 깐깐한 QA 다."]) == 0   # 바탕에 설명이 없어도 고칠 수 있다
+    assert cli.main(["team", "rm", "dev"]) == 0
+    agents = team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path))
+    assert agents == {"qa": {"prompt": "너는 깐깐한 QA 다."}}
+
+
+def test_이_컴퓨터에_codex가_없으면_codex_팀원을_claude로_돌린다(env, repo, monkeypatch):
+    monkeypatch.setenv("COLIDAY_CODEX_BIN", "no-such-codex")
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+    _, agents = _recorded(env)
+    assert "model" not in agents["codex-coder"] and "exec -C" not in agents["codex-coder"]["prompt"]
+    assert any("이 컴퓨터에 codex 가 없어 codex-coder 은(는) Claude 로 실행합니다" == e.message for e in _store().events(1))
+    assert cli.main(["run", "y", "-C", str(repo), "--model", "codex"]) == 2   # Codex 팀장은 대신할 수 없다: 종전대로 알린다

@@ -11,11 +11,13 @@ import pytest
 
 pytest.importorskip("textual")
 
-from textual.widgets import DataTable, Input, Markdown, Static  # noqa: E402
+from textual.widgets import DataTable, Input, Markdown, Static, TextArea  # noqa: E402
 
-from coliday import config, jobs  # noqa: E402
+from coliday import config, jobs, team  # noqa: E402
 from coliday.store import Store  # noqa: E402
-from coliday.tui import AddProjectScreen, ConfirmScreen, ColidayApp, ModelScreen, NewJobScreen, PromptScreen  # noqa: E402
+from coliday.tui import (  # noqa: E402
+    AddProjectScreen, ConfirmScreen, ColidayApp, ModelScreen, NewJobScreen, RoleEditScreen, TeamScreen,
+)
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_claude.py"
 SRC = Path(__file__).parents[1] / "src"
@@ -358,17 +360,104 @@ def test_p로_역할별_프롬프트를_보고_닫는다(env, repo):
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await pilot.press("ctrl+p")
-            assert isinstance(app.screen, PromptScreen)
-            shown = str(app.screen.query_one("#prompts Static", Static).content)
-            assert "coliday 팀장 모드" in shown and "너는 코드 리뷰어다" in shown
+            assert isinstance(app.screen, TeamScreen)
+            preview = app.screen.query_one("#team-preview", Static)
+            assert "coliday 팀장 모드" in str(preview.content)   # 첫 줄은 팀장
+            for _ in range(4):
+                await pilot.press("down")
+            await _until(pilot, lambda: "너는 코드 리뷰어다" in str(preview.content))
             await pilot.press("escape")
-            assert not isinstance(app.screen, PromptScreen)
+            assert not isinstance(app.screen, TeamScreen)
 
     try:
         _run(scenario())
     finally:
         store.close()
 
+
+def test_팀_화면에서_역할을_고치고_넣고_빼고_되돌린다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+
+    def state(role):
+        return {r: s for r, s, _ in jobs.team_roles(cfg)}.get(role)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("ctrl+p")
+            preview = app.screen.query_one("#team-preview", Static)
+
+            # 고치기: reviewer 의 프롬프트만 바꾼다. 채팅 입력의 단축키(Ctrl+S = 작업 취소)가 아니라 저장이 된다
+            for _ in range(4):
+                await pilot.press("down")
+            await pilot.press("enter")
+            assert isinstance(app.screen, RoleEditScreen)
+            area = app.screen.query_one("#role-prompt", TextArea)
+            assert area.text.startswith("너는 코드 리뷰어다") and "실패했을 때" not in area.text  # 자동 규칙은 원문에 없다
+            area.text = "너는 보안 리뷰어다."
+            await pilot.press("ctrl+s")
+            await _until(pilot, lambda: isinstance(app.screen, TeamScreen))
+            assert state("reviewer") == team.STATE_CHANGED and "너는 보안 리뷰어다." in str(preview.content)
+            assert team.load_custom(cfg.team_path).agents == {"reviewer": {"prompt": "너는 보안 리뷰어다."}}
+
+            # 추가: 빈 값으로는 저장되지 않고 화면도 닫히지 않는다 (쓴 내용이 남는다)
+            await pilot.press("a")
+            assert isinstance(app.screen, RoleEditScreen)
+            app.screen.query_one("#role-name", Input).value = "qa"
+            app.screen.query_one("#role-prompt", TextArea).text = "너는 QA 다."
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, RoleEditScreen) and state("qa") is None   # 설명이 없다
+            app.screen.query_one("#role-description", Input).value = "구현 뒤 검수"
+            app.screen.query_one("#role-tools", Input).value = "Read, Bash"
+            await pilot.press("ctrl+s")
+            await _until(pilot, lambda: isinstance(app.screen, TeamScreen))
+            assert state("qa") == team.STATE_ADDED
+            assert team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path))["qa"]["tools"] == ["Read", "Bash"]
+            assert "- qa: 구현 뒤 검수" in jobs.role_prompts(cfg, "lead")[0][1]   # 팀장 지시문에도 들어간다
+
+            # 저장하지 않은 변경은 Esc 한 번으로 버려지지 않는다
+            await pilot.press("enter")   # 커서는 방금 넣은 qa
+            app.screen.query_one("#role-prompt", TextArea).text = "버릴 내용"
+            await pilot.press("escape")
+            assert isinstance(app.screen, RoleEditScreen)
+            await pilot.press("escape")
+            await _until(pilot, lambda: isinstance(app.screen, TeamScreen))
+            assert jobs.role_definition(cfg, "qa")["prompt"] == "너는 QA 다."
+
+            # 빼기와 되돌리기
+            for _ in range(8):
+                await pilot.press("up")
+            for _ in range(3):
+                await pilot.press("down")   # codex-coder
+            await pilot.press("d")
+            await _until(pilot, lambda: state("codex-coder") == team.STATE_REMOVED)
+            assert "codex-coder" not in team.load_agents(cfg.agents_override, team.load_custom(cfg.team_path))
+            await pilot.press("r")
+            await _until(pilot, lambda: state("codex-coder") == team.STATE_DEFAULT)
+            await pilot.press("down")       # reviewer
+            await pilot.press("r")
+            await _until(pilot, lambda: state("reviewer") == team.STATE_DEFAULT)
+
+            # 팀장 지시문
+            for _ in range(8):
+                await pilot.press("up")
+            await pilot.press("enter")
+            area = app.screen.query_one("#role-prompt", TextArea)
+            assert "{team}" in area.text and "{max_attempts}" in area.text
+            assert not app.screen.query("#role-description")
+            area.text = "너는 팀장이다.\n{team}\n최대 {max_attempts}번."
+            await pilot.press("ctrl+s")
+            await _until(pilot, lambda: isinstance(app.screen, TeamScreen))
+            assert state("lead") == team.STATE_CHANGED
+            shown = str(preview.content)
+            assert "너는 팀장이다." in shown and "- qa: 구현 뒤 검수" in shown and "최대 5번." in shown
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
 
 def _second_repo(tmp_path):
     r = tmp_path / "other"
