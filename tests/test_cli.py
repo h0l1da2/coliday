@@ -787,6 +787,29 @@ def test_codex로_도는_역할도_결과물_폴더에_쓸_수_있게_샌드박�
     assert "read-only" in member["argv"] and not any("writable_roots" in a for a in member["argv"])
 
 
+def test_홈이_심볼릭_링크여도_codex에는_링크를_푼_경로만_넘긴다(env, repo, monkeypatch):
+    # Codex 는 쓰기 폴더 경로에 심볼릭 링크가 끼면 모든 명령 실행을 거부한다 (~/.coliday → 다른 폴더).
+    real = env / "real-home"
+    real.mkdir()
+    link = env / "link-home"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("COLIDAY_HOME", str(link))
+    cli.main(["model", "default", "codex"])
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
+    cli.main(["run", "x", "-C", str(repo)])
+
+    calls = _codex_calls(env)
+    assert len(calls) == 2  # 팀장, 팀원
+    for call in calls:
+        roots = json.loads(next(
+            a for a in call["argv"] if a.startswith("sandbox_workspace_write.writable_roots=")
+        ).split("=", 1)[1])
+        assert roots and all(os.path.realpath(r) == r for r in roots)
+        assert str(link) not in call["stdin"]  # 지침에 적는 결과물 폴더도 같은 경로여야 한다
+    assert str(real.resolve() / "jobs" / "1" / "artifacts") in calls[0]["stdin"]
+    assert Path(_store().get_job(1).workdir).is_relative_to(real.resolve())
+
+
 def test_에이전트와_모델이_안_맞으면_설정과_실행_전에_거부한다(env, repo, capsys):
     assert cli.main(["model", "lead", "codex:fable"]) == 2
     assert "Claude 모델이라 Codex 에서 쓸 수 없습니다" in capsys.readouterr().err
@@ -825,7 +848,7 @@ def test_claude_팀장_아래_팀원을_codex로_바꾸면_codex를_돌리는_�
     import shlex
     codex = shlex.quote(os.environ["COLIDAY_CODEX_BIN"])  # 경로에 한글·공백이 있어도 명령이 깨지지 않게 인용된다
     roots = shlex.quote(f'sandbox_workspace_write.writable_roots={json.dumps([str(config.load().artifacts_dir(1))])}')
-    assert (f'{codex} exec -C "$PWD" -s workspace-write --skip-git-repo-check -c {roots} -o "$OUT" - < "$PROMPT"'
+    assert (f'{codex} exec -C "$(pwd -P)" -s workspace-write --skip-git-repo-check -c {roots} -o "$OUT" - < "$PROMPT"'
             in agents["coder"]["prompt"])
     assert "너는 시니어 개발자다" in agents["coder"]["prompt"]  # 역할 지침은 그대로 Codex 에 전달
     assert (agents["coder"]["model"], agents["coder"]["tools"]) == ("haiku", ["Bash", "Read"])

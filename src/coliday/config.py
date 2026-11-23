@@ -50,7 +50,8 @@ class Config:
 
 
 def load() -> Config:
-    home = Path(os.environ.get("COLIDAY_HOME", Path.home() / ".coliday")).expanduser()
+    # 심볼릭 링크를 풀어 둔다: Codex 샌드박스는 링크가 낀 경로를 쓰기 폴더로 받지 않는다 (~/.coliday 가 링크일 수 있다).
+    home = Path(os.environ.get("COLIDAY_HOME", Path.home() / ".coliday")).expanduser().resolve()
     return Config(
         home=home,
         claude_bin=os.environ.get("COLIDAY_CLAUDE_BIN", "claude"),

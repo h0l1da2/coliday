@@ -339,7 +339,8 @@ def claude_agents(resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: 
 
 def codex_writable_roots(*paths: str | Path | None) -> list[str]:
     """Codex 샌드박스(workspace-write)에서 작업 디렉토리 말고도 쓸 수 있게 열 폴더를 주는 옵션."""
-    roots = [str(p) for p in paths if p]
+    # Codex 는 심볼릭 링크가 낀 쓰기 폴더를 거부하고 모든 명령 실행을 막는다 (macOS 의 임시 폴더 /var → /private/var 도 링크다).
+    roots = [str(Path(p).resolve()) for p in paths if p]
     return ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"] if roots else []
 
 
@@ -385,7 +386,7 @@ def codex_lead_prompt(
 def _codex_wrapper(spec: dict, sandbox: str, codex_bin: str, artifacts: str | None = None) -> dict:
     """팀원의 역할 지침을 그대로 Codex 에 넘기는 Claude 래퍼 정의."""
     model = spec["model"].partition(":")[2]
-    command = f'{shlex.quote(codex_bin)} exec -C "$PWD" -s {sandbox} --skip-git-repo-check'
+    command = f'{shlex.quote(codex_bin)} exec -C "$(pwd -P)" -s {sandbox} --skip-git-repo-check'
     if sandbox == "workspace-write":
         command += "".join(f" {shlex.quote(part)}" for part in codex_writable_roots(artifacts))
     if model:
