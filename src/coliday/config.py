@@ -39,9 +39,14 @@ class Config:
         return self.home / "team.json"
 
     @property
+    def auth_path(self) -> Path:
+        """서버의 claude 에 넘겨 줄 인증 (`auth.py`). 이름이 .env 로 시작해 .env 읽기 차단이 에이전트에게서 가린다."""
+        return self.home / ".env.auth"
+
+    @property
     def protected_paths(self) -> list[str]:
-        """에이전트가 쓰면 안 되는 파일: 작업 기록 DB (작업별 허용 여부가 들어 있다)."""
-        return [f"{self.db_path}{suffix}" for suffix in ("", "-wal", "-shm")]
+        """에이전트가 쓰면 안 되는 파일: 작업 기록 DB (작업별 허용 여부가 들어 있다)와 등록한 인증."""
+        return [*(f"{self.db_path}{suffix}" for suffix in ("", "-wal", "-shm")), str(self.auth_path)]
 
     @property
     def update_stamp(self) -> Path:

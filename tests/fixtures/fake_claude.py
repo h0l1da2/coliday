@@ -10,7 +10,9 @@ stdin_prompt = sys.stdin.read()
 record = os.environ.get("FAKE_CLAUDE_ARGS")
 if record:
     Path(record).write_text(json.dumps(
-        {"argv": sys.argv[1:], "stdin": stdin_prompt, "cwd": os.getcwd(), "pid": os.getpid()},
+        {"argv": sys.argv[1:], "stdin": stdin_prompt, "cwd": os.getcwd(), "pid": os.getpid(),
+         "env": {k: os.environ.get(k) for k in os.environ.get("FAKE_CLAUDE_ENV", "").split(",") if k},
+         "auth": {k: os.environ[k] for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") if k in os.environ}},
         ensure_ascii=False,
     ))
 if os.environ.get("FAKE_CLAUDE_SLEEP"):

@@ -13,7 +13,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import DataTable, Input, Label, Markdown, Static, TextArea  # noqa: E402
 
-from coliday import config, jobs, team  # noqa: E402
+from coliday import auth, config, jobs, team  # noqa: E402
 from coliday.store import Store  # noqa: E402
 from coliday.tui import (  # noqa: E402
     AddProjectScreen, ConfirmScreen, ColidayApp, ModelScreen, NewJobScreen, RoleEditScreen, TeamScreen,
@@ -113,6 +113,9 @@ def test_git_저장소가_아닌_디렉토리로_시작하면_직접_작업할�
             assert isinstance(app.screen, ConfirmScreen) and store.list_jobs() == []   # 묻기 전에는 만들지 않는다
             question = str(app.screen.query_one(Label).render())
             assert "git 저장소가 아닙니다" in question and "되돌릴 수도 없습니다" in question
+            label, dialog = app.screen.query_one(Label), app.screen.query_one("#dialog")
+            assert label.region.right <= dialog.content_region.right    # 긴 줄이 창 밖으로 잘리지 않고
+            assert label.region.height > question.count("\n") + 1       # 줄바꿈된다
             await pilot.press("n")
             await pilot.pause()
             assert store.list_jobs() == [] and len(app.screen_stack) == 1
@@ -692,6 +695,28 @@ def test_r로_지운_작업은_목록에서_바로_사라지고_남은_작업을
             await _until(pilot, lambda: all(j.is_terminal for j in store.list_jobs()))
             await _until(pilot, lambda: app.selected_id == 2)  # 최신 작업이 맨 위
 
+            # 작업 목록에서 고른 채로 Delete(맥의 delete 는 backspace): 바로 지우지 않고 물어본다
+            for key in ("delete", "backspace"):
+                table.focus()
+                await pilot.press(key)
+                await pilot.pause()
+                assert isinstance(app.screen, ConfirmScreen) and "삭제할까요" in app.screen._question
+                await pilot.press("n")
+                await pilot.pause()
+                assert table.row_count == 2 and len(app.screen_stack) == 1
+            chat = app.query_one("#chat", Input)           # 입력 칸에서는 글자를 지우는 키다
+            chat.focus()
+            chat.value = "ab"
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert chat.value == "a" and len(app.screen_stack) == 1
+            chat.value = ""
+            app.query_one("#projects").focus()             # 프로젝트 목록에서는 아무 일도 없다
+            await pilot.press("delete")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and table.row_count == 2
+            table.focus()
+
             # 변경이 남은 worktree: 한 번 더 확인하고, 아니오면 그대로 둔다
             await pilot.press("ctrl+r")
             await pilot.press("y")
@@ -934,8 +959,10 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
     calls = []
     real = jobs.add_project
 
-    def add_project(cfg, store, directory, name=None, password=None):
-        calls.append((str(directory), name, password))
+    def add_project(cfg, store, directory, name=None, password=None, tokens=None):
+        calls.append((str(directory), name, password, tokens))
+        for kind, secret in (tokens or {}).items():
+            auth.save(cfg, kind, secret)
         return str(directory) if "@" in str(directory) else real(cfg, store, directory, name, password)
 
     monkeypatch.setattr(jobs, "add_project", add_project)
@@ -951,9 +978,14 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
 
             screen.query_one("#kind", Select).value = "ssh"
             await pilot.pause()
-            assert shown() == {"host", "port", "remote-dir", "password", "name"} and screen.query_one("#ssh-hint").display
-            assert screen.query_one("#password", Input).password
-            assert "저장하지 않는다" in str(screen.query_one("#ssh-hint").render())
+            assert shown() == {"host", "port", "remote-dir", "password", "claude-token", "codex-key", "name"}
+            assert screen.query_one("#ssh-hint").display
+            assert all(screen.query_one(i, Input).password for i in ("#password", "#claude-token", "#codex-key"))
+            hint = str(screen.query_one("#ssh-hint").render())
+            assert "저장하지 않는다" in hint and "claude setup-token" in hint   # 토큰을 어디서 받는지 알려 준다
+            assert "claude setup-token" in screen.query_one("#claude-token", Input).placeholder
+            dialog = screen.query_one("#dialog")
+            assert dialog.region.bottom <= 40 and dialog.max_scroll_y == 0   # 칸이 늘어도 창이 화면에 다 들어온다
 
             screen.query_one("#remote-dir", Input).value = "/srv/app"
             await pilot.press("enter")                        # 서버 주소가 비었다
@@ -968,25 +1000,34 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
 
             screen.query_one("#port", Input).value = "2222"
             screen.query_one("#password", Input).value = " s3cret "   # 비밀번호는 앞뒤 공백도 그대로
+            await pilot.press("enter")                        # Claude 토큰이 없으면 서버 프로젝트를 추가하지 않는다
+            await pilot.pause()
+            assert app.screen is screen and calls == []
+            assert any("Claude 토큰을 넣으세요" in n.message for n in app._notifications)
+            assert app.focused is screen.query_one("#claude-token", Input)
+            screen.query_one("#claude-token", Input).value = " sk-ant-oat01-fromdialog "
             await pilot.press("enter")
             await pilot.pause()
-            assert calls == [("dev@server:2222:/srv/app", None, " s3cret ")]
+            assert calls == [("dev@server:2222:/srv/app", None, " s3cret ", {"claude": "sk-ant-oat01-fromdialog"})]
+            assert auth.get(cfg, auth.CLAUDE) == "sk-ant-oat01-fromdialog"
 
             await pilot.press("ctrl+g")                       # 포트와 비밀번호를 비우면 붙이지 않는다
             app.screen.query_one("#kind", Select).value = "ssh"
             await pilot.pause()
+            assert "등록됨" in app.screen.query_one("#claude-token", Input).placeholder   # 이미 등록했으면 비워도 된다
             app.screen.query_one("#host", Input).value = "dev@server"
             app.screen.query_one("#remote-dir", Input).value = "~/app"
+            app.screen.query_one("#codex-key", Input).value = "sk-proj-codex"
             app.screen.query_one("#host", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
-            assert calls[-1] == ("dev@server:~/app", None, None)
+            assert calls[-1] == ("dev@server:~/app", None, None, {"codex": "sk-proj-codex"})
 
             await pilot.press("ctrl+g")                       # 이 컴퓨터의 폴더
             app.screen.query_one("#dir", Input).value = str(repo)
             await pilot.press("enter")
             await pilot.pause()
-            assert calls[-1] == (str(repo), None, None)
+            assert calls[-1] == (str(repo), None, None, {})
 
             await pilot.press("ctrl+o")
             await pilot.press("ctrl+e")                       # 이름 바꾸기에는 위치 선택도 서버 칸도 없다

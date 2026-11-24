@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from coliday import gitops, guard, projects, remote, team
+from coliday import auth, gitops, guard, projects, remote, team
 from coliday.config import Config
 from coliday.store import RESULT, USER, Job, Store
 
@@ -57,7 +57,7 @@ def launch(
     check_team(cfg)
     try:
         if host is not None:
-            check_remote(host, model)
+            check_remote(cfg, host, model)
         else:
             check_codex(cfg, model)
         check_env_guard(cfg, host, model, allow_env)
@@ -130,7 +130,7 @@ def continue_job(
     switched = team.is_codex(model) != team.is_codex(job.model)
     host = remote.split(job.workdir)[0]
     if host is not None:
-        _remote(check_remote, host, model)
+        _remote(check_remote, cfg, host, model)
     else:
         check_codex(cfg, model)
     _remote(check_env_guard, cfg, host, model, store.allow_env(job.id) if allow_env is None else allow_env)
@@ -171,8 +171,10 @@ def check_codex(cfg: Config, model: str | None) -> None:
         raise JobError(f"Codex CLI 를 찾을 수 없습니다: {cfg.codex_bin}. 설치하거나 COLIDAY_CODEX_BIN 으로 경로를 지정하세요.")
 
 
-def check_remote(host: str, model: str | None) -> None:
-    """서버에서 실행할 수 있는지 작업을 만들기 전에 확인한다 (접속, git, 에이전트 CLI)."""
+def check_remote(cfg: Config, host: str, model: str | None) -> None:
+    """서버에서 실행할 수 있는지 작업을 만들기 전에 확인한다 (넘겨 줄 인증, 접속, git, 에이전트 CLI)."""
+    if not auth.get(cfg, auth.CLAUDE):
+        raise JobError(f"서버에서 쓸 Claude 토큰이 등록돼 있지 않습니다 (서버에서는 로그인하지 않습니다). {auth.HOW_TO}.")
     if problem := team.mismatch(model):
         raise JobError(f"{problem} (바꾸기: coliday model)")
     if team.is_codex(model):
@@ -183,7 +185,7 @@ def check_remote(host: str, model: str | None) -> None:
     missing = remote.missing_commands(host, "git", remote_claude_bin())
     if missing:
         raise JobError(
-            f"{host} 에서 {', '.join(missing)} 을(를) 찾을 수 없습니다. 서버에 설치하고 로그인해 두세요 "
+            f"{host} 에서 {', '.join(missing)} 을(를) 찾을 수 없습니다. 서버에 설치해 두세요 "
             "(경로가 PATH 밖이면 COLIDAY_REMOTE_CLAUDE_BIN 으로 지정)."
         )
 
@@ -344,13 +346,24 @@ def project_names(cfg: Config, store: Store) -> dict[str, str]:
 
 def add_project(
     cfg: Config, store: Store, directory: str | Path, name: str | None = None, password: str | None = None,
+    tokens: dict[str, str] | None = None,
 ) -> str:
     """목록에 추가하고 정규화한 경로를 돌려준다.
 
     name 이 None 이면 이름을 건드리지 않고(이미 있으면 그대로), 빈 문자열이면 폴더 이름으로 되돌린다.
     password 는 서버의 프로젝트에만 쓴다: 키로 접속되지 않으면 이 비밀번호로 한 번 접속해 SSH 키를 등록한다 (저장하지 않는다).
+    tokens 도 서버의 프로젝트에만 쓴다: {"claude"|"codex": 값} 을 이 컴퓨터에 등록해 둔다 (`auth.py`. 빈 값은 그대로 둔다).
     """
     host = remote.split(str(directory).strip())[0]
+    if host is not None:
+        try:
+            for kind, secret in (tokens or {}).items():
+                if secret and secret.strip():
+                    auth.save(cfg, kind, secret)
+        except auth.AuthError as exc:
+            raise JobError(str(exc)) from exc
+        except OSError as exc:
+            raise JobError(f"인증을 저장하지 못했습니다: {exc}") from exc
     if password and host is not None:
         try:
             if not remote.key_works(host):  # 이미 키로 접속되면 서버를 건드리지 않는다

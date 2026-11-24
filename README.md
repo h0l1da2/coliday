@@ -73,7 +73,7 @@ clone 한 폴더의 코드를 그대로 쓰므로(editable) 그 폴더에서 `gi
 - 작업이 실행 중일 때 보낸 채팅은 대기했다가(타임라인에 ⏳ 로 표시) 지금 실행이 끝나는 대로 같은 세션에 이어서 전달된다.
   여러 개를 보내면 한 번에 묶어서 전달한다. 실행 도중에 끼어드는 것은 아니다. 작업을 취소하면 대기한 요청은 버려진다.
 - 글자 키는 채팅에 쓰이므로 단축키는 모두 ctrl 조합이다: `ctrl+n` 새 작업(새 세션·새 worktree), `ctrl+o` 프로젝트 목록,
-  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 팀·프롬프트, `ctrl+f` 결과물 폴더, `ctrl+l` .env 읽기 허용, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제, `ctrl+c` 종료.
+  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 팀·프롬프트, `ctrl+f` 결과물 폴더, `ctrl+l` .env 읽기 허용, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제 (작업 목록에서는 `delete` 키도 된다. 지우기 전에 확인한다), `ctrl+c` 종료.
 - 처음 열면 프로젝트 목록에서 시작한다. ↑/↓ 로 작업 위치를 고르고 Enter 를 누르면 작업 목록으로 넘어간다.
   작업 목록에서 Enter 를 누르면 채팅 입력으로 간다.
 - 맨 위는 연결된 프로젝트 디렉토리 목록이다. `ctrl+g` 로 디렉토리와 이름(비우면 폴더 이름)을 입력해 추가한다.
@@ -110,6 +110,7 @@ coliday ls                            # 작업 목록 (텍스트)
 coliday show 3 -f                     # 작업 3 타임라인 따라보기
 coliday diff 3                        # 작업 3 이 만든 코드 변경
 coliday open 3                        # 작업 3 이 남긴 결과물(스크린샷·영상) 폴더 열기
+coliday auth set                      # 서버의 claude 에 넘겨 줄 인증 등록 (아래 "서버의 프로젝트")
 coliday cancel 3                      # 취소
 coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 worktree·브랜치 (변경이 남아 있으면 --force 필요)
 ```
@@ -211,7 +212,7 @@ coliday env 12 allow      # 이 작업(세션)에만 허용. deny 로 다시 막
 - Claude 는 읽기 금지 규칙과 Bash 샌드박스를 함께 쓴다. 규칙만으로는 `grep -r` 이나 `python -c "open('.env')"` 로 내용이 나오기 때문이다.
   샌드박스 안에서도 네트워크와 홈·임시 폴더 쓰기는 열어 둔다 (빌드가 돌 수 있게).
 - Codex 는 권한 프로필에서 `.env*` 를 읽지 못하게 둔다.
-- 막을 수 없는 환경이면 막지 않은 채 돌리지 않고 시작 전에 알린다: `claude` 2.1.331 미만, `codex` 0.171.0 미만(팀장일 때),
+- 막을 수 없는 환경이면 막지 않은 채 돌리지 않고 시작 전에 알린다: `claude` 2.1.325 미만, `codex` 0.171.0 미만(팀장일 때),
   리눅스에 `bubblewrap`·`socat` 이 없을 때. (Codex 팀원은 버전이 낮으면 Claude 로 돌린다.)
 - 이 컴퓨터(macOS)에서는 디스크 어디에 있든 막고, 서버에서는 작업 디렉토리와 원래 레포 아래만 막는다.
 - 막는 것은 이름이 `.env` 로 시작하는 파일뿐이다. `application-prod.yml` 같은 다른 비밀 파일은 막지 않는다. `.env.example` 도 함께 막힌다.
@@ -229,14 +230,25 @@ coliday run "주문 취소 API 추가" -C dev@build-server:/srv/shop
 ```
 
 TUI 에서는 `ctrl+g` 창 맨 위에서 "이 컴퓨터의 폴더" 대신 "SSH 로 접속하는 서버의 폴더"를 고른다. 그러면 서버(`dev@build-server`),
-포트(비우면 22), 서버의 폴더, 비밀번호 칸이 나온다.
+포트(비우면 22), 서버의 폴더, 비밀번호, Claude 토큰, Codex API 키 칸이 나온다.
 
 에이전트가 **서버에서** 실행된다: 코드 수정·빌드·테스트가 모두 서버에서 돌고, 이 컴퓨터의 coliday 는 ssh 로 명령을 보내고
 진행 상황을 받아 온다. 작업 목록·타임라인·diff·이어서 시키기·취소·삭제는 로컬 프로젝트와 같다.
 
-- 서버에는 coliday 를 설치하지 않는다. `git` 과 `claude` 만 설치돼 있고 `claude` 에 로그인돼 있으면 된다.
+- 서버에는 coliday 를 설치하지 않는다. `git` 과 `claude` 만 설치돼 있으면 된다 (로그인은 필요 없다: 아래처럼 이 컴퓨터에서 받은 토큰을 넘긴다).
   `codex` 는 없어도 된다: 없으면 Codex 로 두었던 팀원(기본 팀의 codex-coder 포함)을 Claude 로 실행하고 타임라인에 알린다.
   PATH 밖에 있으면 `COLIDAY_REMOTE_CLAUDE_BIN` / `COLIDAY_REMOTE_CODEX_BIN` 으로 경로를 준다.
+- 서버의 `claude` 에는 로그인하지 않는다. 이 컴퓨터에서 받은 토큰을 등록해 두면 서버의 작업을 시작할 때마다 그 서버의 `claude` 에 넘긴다.
+  토큰이 없으면 서버의 작업은 시작되지 않는다.
+  1. 이 컴퓨터의 터미널에서 `claude setup-token` 을 실행해 토큰을 받는다.
+  2. TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 **Claude 토큰** 칸에 넣는다. CLI 는 `coliday auth set` (값을 물어본다. 입력은 보이지 않는다),
+     또는 `coliday project add dev@build-server:/srv/shop --token`.
+  - 한 번 등록하면 모든 서버 프로젝트에 쓴다 (다음부터 토큰 칸은 비워 둬도 된다). `coliday auth` 로 상태를 보고 `coliday auth rm` 으로 지운다.
+  - Codex 팀원을 서버에서 쓰려면 **Codex API 키** 칸(또는 `coliday auth set codex`)에 OpenAI API 키를 넣는다. `CODEX_API_KEY` 로 넘긴다.
+    넣지 않으면 서버의 `codex` 는 그 서버의 로그인을 쓴다 (서버에 `codex` 가 없으면 Claude 로 대신 실행).
+  - 값은 이 컴퓨터의 `~/.coliday/.env.auth` 에만 저장한다 (본인만 읽는 파일). 서버에는 ssh 의 표준 입력으로 보내 `claude` 프로세스의
+    환경변수(`CLAUDE_CODE_OAUTH_TOKEN`, Anthropic API 키면 `ANTHROPIC_API_KEY`)로만 두고, 명령 인자나 서버의 디스크에는 남기지 않는다.
+  - 실행 중에는 서버의 그 프로세스 환경에 있으므로, 서버의 root 나 같은 계정을 쓰는 사람은 볼 수 있다. 믿는 서버에서만 쓴다.
 - 키 인증으로 접속돼야 한다. 백그라운드에서 실행하므로 비밀번호나 호스트 키 확인을 물을 수 없다.
   먼저 터미널에서 `ssh dev@build-server` 가 아무것도 묻지 않고 되는지 확인한다. 포트·키·점프 호스트는 `~/.ssh/config` 를 따른다.
 - 키 인증이 안 돼 있으면 프로젝트를 추가할 때 서버 비밀번호를 준다: TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 비밀번호 칸, CLI 는
@@ -313,6 +325,7 @@ TUI 에서는 `ctrl+p` 창에서 같은 일을 한다.
 
 - `~/.coliday/jobs.db`: 작업·이벤트 (SQLite)
 - `~/.coliday/projects.json`: 연결된 프로젝트 디렉토리, `models.json`: 모델 설정, `team.json`: 바꾼 팀원 구성·프롬프트
+- `~/.coliday/.env.auth`: 서버의 `claude`·`codex` 에 넘겨 줄 인증 (등록했을 때만)
 - `~/.coliday/jobs/<id>/stream.jsonl`: 팀장 원본 이벤트, `stderr.log`, `worker.log`, `artifacts/`(결과물)
 
 ## 개발

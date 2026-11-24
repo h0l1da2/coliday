@@ -1252,7 +1252,7 @@ def test_env를_막지_못하는_버전이면_막지_않은_채_돌리지_않고
     monkeypatch.setenv("FAKE_CLAUDE_VERSION", "1.0.58 (Claude Code)")
     assert cli.main(["run", "x", "-C", str(repo)]) == 2
     err = capsys.readouterr().err
-    assert "claude(1.0.58)는 .env 읽기를 막지 못합니다" in err and "2.1.331 이상" in err and "--allow-env" in err
+    assert "claude(1.0.58)는 .env 읽기를 막지 못합니다" in err and "2.1.325 이상" in err and "--allow-env" in err
     assert _store().list_jobs() == []
     assert cli.main(["run", "x", "-C", str(repo), "--allow-env"]) == 0     # 사람이 허용하면 시작한다
     assert cli.main(["continue", "1", "y", "--deny-env"]) == 2             # 다시 막으려 해도 막을 수 없으면 거부한다

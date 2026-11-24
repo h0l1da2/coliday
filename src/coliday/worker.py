@@ -13,7 +13,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from coliday import guard, jobs, members, remote, team
+from coliday import auth, guard, jobs, members, remote, team
 from coliday.jobs import organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
@@ -189,10 +189,19 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
                 artifacts=artifacts, claude_bin=jobs.remote_claude_bin(), allow=allow, add_dirs=add_dirs,
                 settings=settings,
             )
+            # 서버에서는 로그인하지 않는다: 이 컴퓨터에 등록한 인증을 서버의 claude 에 넘긴다 (codex 팀원도 물려받는다).
+            # 표준 입력의 첫 줄들로 보낸다: 명령 인자에 넣으면 `ps` 에 보이고, 서버의 디스크에는 쓰지 않는다.
+            secrets = auth.load(cfg)
+            if not auth.get(cfg, auth.CLAUDE):
+                store.add_event(job_id, LEAD, "error", f"서버에서 쓸 Claude 토큰이 등록돼 있지 않습니다. {auth.HOW_TO}.")
+                return 1 if store.finish_or_continue(job_id, "failed", phase="인증 없음") else None
+            receive = "".join(f"IFS= read -r {name} && export {name} && " for name in secrets)
+            prompt = "".join(f"{value}\n" for value in secrets.values()) + prompt
             # 프로세스 번호를 남겨 두고(취소할 때 쓴다) 그 프로세스가 그대로 에이전트가 된다.
             cmd = remote.command(
                 host,
-                f"cd {shlex.quote(remote_workdir)} && echo $$ > {shlex.quote(remote_dir + '/pid')} && exec {shlex.join(inner)}",
+                f"{receive}cd {shlex.quote(remote_workdir)} && echo $$ > {shlex.quote(remote_dir + '/pid')}"
+                f" && exec {shlex.join(inner)}",
             )
         else:
             for path, script in scripts.items():
@@ -248,6 +257,8 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     if translator.result:  # 상태를 끝으로 바꾸기 전에 남긴다 (끝난 작업을 본 쪽은 보고도 이미 볼 수 있게)
         store.add_event(job_id, LEAD, RESULT, translator.result)
     if host is not None:
+        if not ok and auth.is_failure(translator.result):
+            store.add_event(job_id, LEAD, "error", _auth_hint(host))
         if returncode == 255 and not translator.result:  # ssh 가 끊겼다: 서버의 에이전트가 남아 돌지 않게 한다
             store.add_event(job_id, LEAD, "error", f"{host} 와의 SSH 연결이 끊겼습니다. 서버의 에이전트를 멈춥니다.")
             remote.spawn(host, jobs.stop_script(job_id))
@@ -266,6 +277,14 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         session_id=translator.session_id or job.session_id,
     )
     return (0 if ok else 1) if finished else None
+
+
+def _auth_hint(host: str) -> str:
+    """서버의 claude 가 넘겨받은 인증을 거부했을 때 무엇을 하면 되는지."""
+    return (
+        f"{host} 의 claude 가 이 컴퓨터에 등록한 인증을 받아들이지 않았습니다 (만료됐거나 잘못된 값). "
+        "`claude setup-token` 으로 새로 받아 다시 등록하세요 (프로젝트 추가 창의 토큰 칸, 또는 `coliday auth set`)."
+    )
 
 
 def _fetch_artifacts(store: Store, job_id: int, host: str, source: str, target: Path) -> None:

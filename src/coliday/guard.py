@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-MIN_CLAUDE = (2, 1, 331)
+MIN_CLAUDE = (2, 1, 325)
 MIN_CODEX = (0, 171, 0)
 PATTERN = ".env*"  # .env, .env.local, .env.261116 …
 _PROFILE = "coliday"

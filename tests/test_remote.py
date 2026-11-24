@@ -13,12 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from coliday import cli, config, gitops, jobs, remote
+from coliday import auth, cli, config, gitops, jobs, remote
 from coliday.store import Store
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SRC = Path(__file__).parents[1] / "src"
 HOST = "dev@server"
+TOKEN = "sk-ant-oat01-" + "t0ken" * 8
 
 
 @pytest.fixture
@@ -39,6 +40,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.setenv("PYTHONPATH", str(SRC) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     remote.home.cache_clear()
+    auth.save(config.load(), auth.CLAUDE, TOKEN)  # 서버 작업에는 넘겨 줄 토큰이 있어야 한다
     return tmp_path
 
 
@@ -383,3 +385,81 @@ def test_서버에서도_기본으로_env_읽기를_막고_막을_수_없으면_
     monkeypatch.setattr(remote, "missing_commands", lambda host, *names: [n for n in names if n == "bwrap"])
     assert cli.main(["run", "z", "-C", app]) == 2
     assert "bwrap 이(가) 없어 .env 읽기를 막을 수 없습니다" in capsys.readouterr().err
+
+
+def test_등록한_인증을_서버의_claude에_넘기되_명령에는_드러내지_않는다(env, app, monkeypatch, capsys):
+    saved = config.load().auth_path
+    assert cli.main(["auth", "rm"]) == 0 and not saved.exists()
+    assert cli.main(["run", "로그인 고쳐줘", "-C", app]) == 2                  # 토큰이 없으면 서버 작업을 만들지 않는다
+    err = capsys.readouterr().err
+    assert "Claude 토큰이 등록돼 있지 않습니다" in err and "claude setup-token" in err and _store().list_jobs() == []
+
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(TOKEN + "\n"))
+    assert cli.main(["auth", "set"]) == 0
+    out = capsys.readouterr().out
+    assert TOKEN not in out and "Claude 토큰" in out                       # 값은 화면에 다시 보여 주지 않는다
+    assert saved.read_text() == f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\n" and saved.stat().st_mode & 0o777 == 0o600
+
+    assert cli.main(["run", "로그인 고쳐줘", "-C", app]) == 0
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["auth"] == {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}           # 서버의 claude 가 환경변수로 받는다
+    assert recorded["stdin"] == "로그인 고쳐줘"                              # 요청에는 섞이지 않는다
+    assert TOKEN not in (env / "ssh.jsonl").read_text()                     # ssh 명령 인자에는 없다 (ps 에 보인다)
+    home = env / "server-home"
+    leaked = [p for p in home.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
+    assert leaked == []                                                     # 서버의 디스크에도 쓰지 않는다
+    job_dir = config.load().job_dir(1)
+    assert all(TOKEN not in f.read_text(errors="replace") for f in job_dir.rglob("*") if f.is_file())
+
+    assert cli.main(["continue", "1", "테스트도 돌려줘"]) == 0                # 이어서 시킬 때도 넘긴다
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["auth"] == {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN} and recorded["stdin"] == "테스트도 돌려줘"
+
+    assert cli.main(["auth", "rm", "claude"]) == 0
+    assert cli.main(["continue", "1", "한 번 더"]) == 2                       # 지운 뒤에는 이어서 시키지도 못한다
+    assert "Claude 토큰이 등록돼 있지 않습니다" in capsys.readouterr().err
+
+
+def test_codex_키와_API_키도_넘기고_이상한_값은_등록하지_않는다(env, app, monkeypatch, capsys):
+    cfg = config.load()
+    auth.save(cfg, auth.CLAUDE, "  sk-ant-api03-abcdefghijklmnop  ")       # API 키는 다른 환경변수로 넘긴다
+    auth.save(cfg, auth.CODEX, "sk-proj-codexkey1234567890")
+    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_API_KEY")
+    assert cli.main(["run", "x", "-C", app]) == 0
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["auth"] == {"ANTHROPIC_API_KEY": "sk-ant-api03-abcdefghijklmnop"} and recorded["stdin"] == "x"
+    assert recorded["env"] == {"CODEX_API_KEY": "sk-proj-codexkey1234567890"}   # codex 팀원은 claude 의 환경을 물려받는다
+    assert "codexkey" not in (env / "ssh.jsonl").read_text()
+    assert cli.main(["auth"]) == 0
+    out = capsys.readouterr().out
+    assert "Anthropic API 키" in out and "abcdefghijkl" not in out and "ANTHROPIC_API_KEY" in out
+    assert "codex: 등록됨" in out and "codexkey" not in out
+
+    for bad in ("", "two words", "line1\nline2"):                          # 줄이 나뉘면 뒤쪽이 요청으로 흘러 들어간다
+        with pytest.raises(auth.AuthError):
+            auth.save(cfg, auth.CLAUDE, bad)
+    assert auth.get(cfg, auth.CLAUDE) == "sk-ant-api03-abcdefghijklmnop"    # 실패한 등록은 기존 값을 건드리지 않는다
+    assert auth.clear(cfg, auth.CODEX) and auth.get(cfg, auth.CODEX) is None and auth.get(cfg, auth.CLAUDE)
+    cfg.auth_path.write_text("CLAUDE_CODE_OAUTH_TOKEN=broken value\nEVIL=1\n")
+    assert auth.load(cfg) == {}                                             # 손으로 망가뜨린 줄·모르는 이름은 쓰지 않는다
+
+
+def test_서버의_claude가_인증을_거부하면_어떻게_할지_알린다(env, app, monkeypatch, capsys):
+    script = env / "claude"
+    script.write_text(
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.331 (Claude Code)'; exit 0; }\ncat > /dev/null\n"
+        "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,"
+        "\"result\":\"Failed to authenticate. API Error: 401 OAuth access token is invalid.\"}'\nexit 1\n"
+    )
+    assert cli.main(["run", "x", "-C", app]) == 1
+    messages = [e.message for e in _store().events(1)]
+    assert any("받아들이지 않았습니다" in m and "claude setup-token" in m for m in messages)
+    assert all("sk-ant-oat01" not in m for m in messages)
+
+
+def test_project_add_token은_토큰을_물어_등록한다(env, app, monkeypatch, capsys):
+    auth.clear(config.load())
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO("sk-ant-oat01-from-project-add\n"))
+    assert cli.main(["project", "add", app, "--token"]) == 0
+    assert auth.get(config.load(), auth.CLAUDE) == "sk-ant-oat01-from-project-add"
+    assert "sk-ant-oat01" not in capsys.readouterr().out

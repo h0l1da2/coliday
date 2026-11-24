@@ -28,14 +28,14 @@ from textual.widgets import (
     Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static, TextArea,
 )
 
-from coliday import gitops, guard, jobs, projects, remote, team
+from coliday import auth, gitops, guard, jobs, projects, remote, team
 from coliday.config import Config
 from coliday.jobs import STATUS_ICON, JobError, NotARepoError, WorktreeRemoveError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
-    "models", "prompts", "cancel_job", "remove_job", "timeline_scroll", "open_artifacts", "env_access",
+    "models", "prompts", "cancel_job", "remove_job", "remove_listed_job", "timeline_scroll", "open_artifacts", "env_access",
 })
 POLL_SEC = 1.0
 DIFF_EVERY_TICKS = 2
@@ -119,8 +119,8 @@ class ProjectTable(DataTable):
 _LOCAL, _SSH = "local", "ssh"
 
 
-class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
-    """프로젝트 위치와 이름 입력. 결과는 (위치, 이름, 서버 비밀번호)다.
+class AddProjectScreen(ModalScreen[tuple[str, str, str, dict[str, str]] | None]):
+    """프로젝트 위치와 이름 입력. 결과는 (위치, 이름, 서버 비밀번호, 등록할 인증 {"claude"|"codex": 값})다.
 
     추가할 때는 먼저 이 컴퓨터의 폴더인지 SSH 서버인지 고르고, SSH 일 때만 주소·포트·비밀번호 칸이 나온다.
     이름만 바꿀 때(adding=False)는 위치를 그대로 보여 주고 이름만 받는다.
@@ -128,12 +128,16 @@ class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
 
     BINDINGS = [Binding("escape", "close", "닫기")]
 
-    def __init__(self, directory: str, name: str = "", title: str = "프로젝트 추가", adding: bool = True) -> None:
+    def __init__(
+        self, directory: str, name: str = "", title: str = "프로젝트 추가", adding: bool = True,
+        registered: frozenset[str] = frozenset(),
+    ) -> None:
         super().__init__()
         self._directory = directory
         self._name = name
         self._title = title
         self._adding = adding
+        self._registered = registered  # 이미 등록한 인증의 종류 (auth.CLAUDE, auth.CODEX): 그 칸은 비워 둬도 된다
 
     def compose(self) -> ComposeResult:
         host, path = remote.split(self._directory)
@@ -157,9 +161,21 @@ class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
                     yield Input(value=port, placeholder="포트 (22)", id="port", max_length=5)
                 yield Input(value=path if host is not None else "", placeholder="서버의 폴더 (예: /srv/shop, ~/shop)", id="remote-dir")
                 yield Input(password=True, placeholder="비밀번호 (키로 접속되면 비운다)", id="password")
+                kept = "등록됨: 비우면 그대로"
+                with Horizontal(id="ssh-tokens"):
+                    yield Input(
+                        password=True, id="claude-token",
+                        placeholder=f"Claude 토큰 ({kept if auth.CLAUDE in self._registered else 'claude setup-token 이 준 값'})",
+                    )
+                    yield Input(
+                        password=True, id="codex-key",
+                        placeholder=f"Codex API 키 ({kept if auth.CODEX in self._registered else '선택'})",
+                    )
             yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
-            yield Label("에이전트가 그 서버에서 실행된다: 서버에 git 과 claude 가 설치·로그인돼 있어야 한다. "
-                        "비밀번호는 한 번만 써서 이 컴퓨터의 SSH 키를 서버에 등록하고 저장하지 않는다 (그 뒤로는 키로 접속).",
+            yield Label("에이전트가 그 서버에서 실행된다 (서버에 git 과 claude 설치 필요). 서버에서는 로그인하지 않는다: "
+                        "이 컴퓨터의 터미널에서 `claude setup-token` 을 실행해 받은 토큰을 Claude 토큰 칸에 넣는다. "
+                        "Codex API 키는 서버에서 Codex 팀원을 쓸 때만 넣는다 (OpenAI API 키). "
+                        "비밀번호는 한 번만 써서 SSH 키를 서버에 등록하고 저장하지 않는다.",
                         classes="hint", id="ssh-hint")
             yield Label("Enter 로 저장, Tab 으로 칸 이동, Esc 로 닫기", classes="hint")
 
@@ -190,13 +206,13 @@ class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
     @on(Input.Submitted)
     def _submit(self) -> None:
         if not self._adding:
-            self.dismiss((self._directory, self._text("#name"), ""))
+            self.dismiss((self._directory, self._text("#name"), "", {}))
             return
         if self._kind == _LOCAL:
             if not self._text("#dir"):
                 self.notify("디렉토리를 입력하세요.", severity="warning")
                 return
-            self.dismiss((self._text("#dir"), self._text("#name"), ""))
+            self.dismiss((self._text("#dir"), self._text("#name"), "", {}))
             return
         host, path = self._text("#host"), self._text("#remote-dir")
         if not host or not path:
@@ -208,7 +224,16 @@ class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
         except remote.RemoteError as exc:
             self.notify(str(exc), severity="warning")
             return
-        self.dismiss((location, self._text("#name"), self.query_one("#password", Input).value))
+        tokens = {auth.CLAUDE: self._text("#claude-token"), auth.CODEX: self._text("#codex-key")}
+        tokens = {kind: value for kind, value in tokens.items() if value}
+        if auth.CLAUDE not in tokens and auth.CLAUDE not in self._registered:
+            self.notify(
+                "Claude 토큰을 넣으세요. 이 컴퓨터의 터미널에서 `claude setup-token` 을 실행하면 받을 수 있습니다.",
+                severity="warning", timeout=8,
+            )
+            self.query_one("#claude-token", Input).focus()
+            return
+        self.dismiss((location, self._text("#name"), self.query_one("#password", Input).value, tokens))
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -599,11 +624,15 @@ class ColidayApp(App[None]):
     .model-row Input { width: 1fr; }
     ModelScreen #dialog { width: 96; }
     #dialog { width: 80; height: auto; max-height: 100%; overflow-y: auto; padding: 1 2; border: thick $primary; background: $surface; }
+    ConfirmScreen #dialog Label { width: 100%; }  /* 긴 질문이 잘리지 않고 줄바꿈되게 */
     #dialog Input, #dialog Checkbox, #dialog Select { margin-top: 1; }
     #local-fields, #ssh-fields, #ssh-address { height: auto; }
     #ssh-fields Input { margin-top: 0; }  /* 칸이 많다: 테두리만으로 구분해 낮은 터미널에서도 한 화면에 들어오게 */
     #ssh-fields { margin-top: 1; }
     #host { width: 1fr; }
+    #ssh-tokens { height: auto; }
+    #claude-token { width: 3fr; }
+    #codex-key { width: 2fr; }
     #port { width: 16; }
     #dialog-title { text-style: bold; }
     #dialog-buttons { height: auto; margin-top: 1; align-horizontal: right; }
@@ -622,6 +651,8 @@ class ColidayApp(App[None]):
         Binding("ctrl+l", "env_access", ".env 허용", priority=True, key_display="L"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
+        # 작업 목록에서 고른 채로 누르는 Delete (맥의 delete 는 backspace 로 들어온다). 입력 칸에서는 글자를 지우는 키라 priority 가 아니다.
+        Binding("delete,backspace", "remove_listed_job", "작업 삭제", show=False),
         Binding("tab", "focus_next", "패널 이동", show=False),
         # priority 가 아니다: 목록·diff 에 포커스가 있으면 그 패널이 스스로 넘기고, 채팅 입력 중에는 타임라인을 넘긴다.
         Binding("pageup,alt+up", "timeline_scroll(-1)", "타임라인 위로", show=False),
@@ -763,7 +794,11 @@ class ColidayApp(App[None]):
 
     def action_add_project(self) -> None:
         # 추가 창에서 이름을 비우면 (이미 연결된 디렉토리의) 기존 이름을 지우지 않는다.
-        self.push_screen(AddProjectScreen(self.default_dir), lambda a: self._save_project(a and (a[0], a[1] or None, a[2])))
+        registered = frozenset(kind for kind in auth.KINDS if auth.get(self.cfg, kind))
+        self.push_screen(
+            AddProjectScreen(self.default_dir, registered=registered),
+            lambda a: self._save_project(a and (a[0], a[1] or None, a[2], a[3])),
+        )
 
     def action_rename_project(self) -> None:
         if self.project_dir is None:
@@ -772,12 +807,12 @@ class ColidayApp(App[None]):
         current = dict(self._projects or []).get(self.project_dir, "")
         self.push_screen(AddProjectScreen(self.project_dir, current, "프로젝트 이름 바꾸기", adding=False), self._save_project)
 
-    def _save_project(self, answer: tuple[str, str | None, str] | None) -> None:
+    def _save_project(self, answer: tuple[str, str | None, str, dict[str, str]] | None) -> None:
         if not answer:
             return
-        directory, name, password = answer
+        directory, name, password, tokens = answer
         try:
-            added = jobs.add_project(self.cfg, self.store, directory, name, password or None)
+            added = jobs.add_project(self.cfg, self.store, directory, name, password or None, tokens)
         except JobError as exc:
             self.notify(str(exc), severity="error", timeout=8)
             return
@@ -1251,6 +1286,10 @@ class ColidayApp(App[None]):
                 self.refresh_jobs()
 
         self.push_screen(ConfirmScreen(f"작업 #{job.id} 을(를) 취소할까요?"), done)
+
+    def action_remove_listed_job(self) -> None:
+        if self.focused is self.query_one("#jobs"):  # 프로젝트 목록 등 다른 곳에서 누른 것은 무시한다
+            self.action_remove_job()
 
     def action_remove_job(self) -> None:
         job = self._selected_job()
