@@ -22,6 +22,8 @@ import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from coliday.guard import EnvGuard
+
 LEAD_ROLE = "lead"
 DEFAULT_ROLE = "default"  # 기본 에이전트 설정을 가리키는 이름 (팀원 이름이 아니다)
 CLAUDE = "claude"
@@ -549,19 +551,96 @@ def resolve_agents(
 
 
 def claude_agents(
-    resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None, *, local: bool = True,
+    resolved: dict[str, dict], runners: dict[str, str] | None = None, tasks_dir: str = "",
 ) -> dict[str, dict]:
     """Claude 팀장의 `claude --agents` 에 넘길 정의: Codex 팀원은 래퍼로 바꾼다.
 
-    local=False 는 서버에서 실행할 때다: artifacts 가 서버의 경로라 이 컴퓨터의 파일 시스템으로 풀지 않는다.
+    runners 는 {역할: 그 역할을 Codex 로 돌리는 실행 파일 경로} 다 (`codex_runners` 로 만든 파일을 둔 곳).
+    tasks_dir 은 래퍼가 작업 명세를 파일로 써 둘 폴더다 (`claude --add-dir` 로 열어 둔다).
     """
     out: dict[str, dict] = {}
     for name, spec in resolved.items():
         spec = {k: v for k, v in spec.items() if k != "codex_sandbox"}  # coliday 전용 키
         if is_codex(spec.get("model")):
-            spec = _codex_wrapper(spec, codex_sandbox(resolved[name]), codex_bin, artifacts, local)
+            spec = _codex_wrapper(spec, (runners or {})[name], f"{tasks_dir}/{Path((runners or {})[name]).name}")
         out[name] = spec
     return out
+
+
+def codex_runners(
+    resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None, *, local: bool = True,
+    guard: EnvGuard | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Codex 로 일할 팀원마다 {역할: (파일 이름, sh 스크립트)}. 스크립트는 작업 명세 파일을 받아 Codex 의 답을 출력한다.
+
+    Claude 래퍼가 `codex exec` 를 직접 부르면 auto 권한 모드의 분류기가 "허가받지 않은 외부 전송"으로 보고 막는다.
+    그래서 실행 파일 하나로 묶어 두고 그 파일만 허용 규칙(`runner_rule`)으로 연다.
+    명세를 heredoc 으로 넘기면 본문의 글자([P0]~[P3] 같은 대괄호)에 따라 규칙이 맞지 않아, 파일 경로만 인자로 받는다.
+    local=False 는 서버에서 실행할 때다: artifacts 가 서버의 경로라 이 컴퓨터의 파일 시스템으로 풀지 않는다.
+    guard 를 주면 Codex 가 .env 파일을 읽지 못하게 막는다 (`guard.py`).
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for name, spec in resolved.items():
+        if is_codex(spec.get("model")):
+            file_name = f"{len(out) + 1}-{re.sub(r'[^A-Za-z0-9_-]', '_', name)}"  # 규칙·명령에 그대로 쓸 수 있는 이름
+            out[name] = (file_name, _codex_runner(spec, codex_sandbox(spec), codex_bin, artifacts, local, guard))
+    return out
+
+
+def runner_command(path: str) -> str:
+    """래퍼가 실행할 명령의 앞부분. 허용 규칙과 글자 그대로 맞아야 한다."""
+    return shlex.quote(path)
+
+
+def runner_rule(path: str) -> str:
+    """`claude --allowedTools` 에 넘길 규칙: 이 실행 파일만 분류기를 거치지 않고 실행된다."""
+    return f"Bash({runner_command(path)}:*)"
+
+
+def codex_access(
+    sandbox: str, *writable: str | Path | None, local: bool = True, guard: EnvGuard | None = None,
+) -> list[str]:
+    """Codex 의 접근 범위 옵션: 샌드박스와, 작업 디렉토리 말고도 쓸 수 있는 폴더. guard 가 있으면 .env 읽기도 막는다."""
+    if guard is not None:
+        # 권한 프로필은 -s 와 함께 쓸 수 없다: 샌드박스와 쓰기 폴더를 프로필 하나로 준다.
+        roots = [str(Path(p).resolve()) if local else str(p) for p in writable if p]
+        return guard.codex_args(sandbox, roots)
+    roots = codex_writable_roots(*writable, local=local) if sandbox == "workspace-write" else []
+    return ["-c", f'sandbox_mode="{sandbox}"', *roots]
+
+
+def _codex_runner(
+    spec: dict, sandbox: str, codex_bin: str, artifacts: str | None, local: bool, guard: EnvGuard | None = None,
+) -> str:
+    model = codex_model(spec["model"])
+    command = f'{shlex.quote(codex_bin)} exec -C "$(pwd -P)" --skip-git-repo-check'
+    command += "".join(f" {shlex.quote(part)}" for part in codex_access(sandbox, artifacts, local=local, guard=guard))
+    if model:
+        command += f" -m {shlex.quote(model)}"
+    command += ' -o "$OUT" -'
+    prompt = str(spec.get("prompt") or "").strip()
+    mark = "COLIDAY_ROLE_PROMPT"
+    while mark in prompt:  # 역할 지침에 같은 줄이 있어도 heredoc 이 중간에 끊기지 않게
+        mark += "_"
+    return (
+        "#!/bin/sh\n"
+        "# coliday 가 만든 파일. 이 역할을 Codex CLI 로 실행한다: 작업 명세 파일(없으면 stdin)을 받아 Codex 의 답을 출력한다.\n"
+        'if [ "$#" -gt 0 ] && [ ! -s "$1" ]; then echo "작업 명세 파일이 없거나 비어 있습니다: $1" >&2; exit 2; fi\n'
+        'OUT=$(mktemp) && LOG=$(mktemp) || exit 1\n'
+        "trap 'rm -f \"$OUT\" \"$LOG\"' EXIT\n"
+        "{\n"
+        f"cat <<'{mark}'\n{prompt}\n{mark}\n"
+        "printf '\\n# 작업 명세\\n'\n"
+        'if [ "$#" -gt 0 ]; then cat "$1"; else cat; fi\n'
+        f'}} | {command} > "$LOG" 2>&1\n'
+        "code=$?\n"
+        'if [ "$code" -ne 0 ]; then\n'
+        '  echo "codex 실행 실패 (종료 코드 $code)" >&2\n'
+        '  tail -n 40 "$LOG" >&2\n'
+        '  exit "$code"\n'
+        "fi\n"
+        'cat "$OUT"\n'
+    )
 
 
 def without_codex(resolved: dict[str, dict]) -> tuple[dict[str, dict], list[str]]:
@@ -579,10 +658,6 @@ def codex_writable_roots(*paths: str | Path | None, local: bool = True) -> list[
     # 서버의 경로(local=False)는 이 컴퓨터에서 풀면 엉뚱한 경로가 된다 (/var/lib/… → /private/var/lib/…).
     roots = [str(Path(p).resolve()) if local else str(p) for p in paths if p]
     return ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"] if roots else []
-
-
-def apply_models(agents: dict[str, dict], models: Models, codex_bin: str = CODEX) -> dict[str, dict]:
-    return claude_agents(resolve_agents(agents, models), codex_bin)
 
 
 def codex_sandbox(spec: dict) -> str:
@@ -617,29 +692,20 @@ def codex_lead_prompt(
     return _render_lead(template, how, max_attempts, artifacts)
 
 
-def _codex_wrapper(
-    spec: dict, sandbox: str, codex_bin: str, artifacts: str | None = None, local: bool = True,
-) -> dict:
-    """팀원의 역할 지침을 그대로 Codex 에 넘기는 Claude 래퍼 정의."""
-    model = spec["model"].partition(":")[2]
-    command = f'{shlex.quote(codex_bin)} exec -C "$(pwd -P)" -s {sandbox} --skip-git-repo-check'
-    if sandbox == "workspace-write":
-        command += "".join(f" {shlex.quote(part)}" for part in codex_writable_roots(artifacts, local=local))
-    if model:
-        command += f" -m {shlex.quote(model)}"
-    command += ' -o "$OUT" - < "$PROMPT"'
+def _codex_wrapper(spec: dict, runner: str, task_prefix: str) -> dict:
+    """팀원에게 온 작업 명세를 그대로 Codex 실행 파일(`codex_runners`)에 넘기는 Claude 래퍼 정의."""
     prompt = (
         "너는 Codex CLI 를 실행해 주는 얇은 래퍼다. 맡은 일을 직접 하지 않는다 (파일을 고치거나 직접 조사해 답하지 않는다).\n"
-        "1. `OUT=$(mktemp); PROMPT=$(mktemp)` 로 임시 파일을 만들고, $PROMPT 에 아래 [역할 지침] 전문과 "
-        "받은 작업 명세 전문을 고치지 말고 차례로 쓴다 (따옴표가 깨지지 않게 heredoc 을 쓴다).\n"
-        f"2. 다음 명령을 그대로 실행한다. 오래 걸릴 수 있으니 끝날 때까지 기다린다:\n   {command}\n"
-        "3. 끝나면 $OUT 내용과 `git status --short`, `git diff --stat` 을 읽는다.\n"
-        "4. 보고: Codex 의 답을 빠짐없이 전하고, 변경 파일 목록과 Codex 가 보고한 검사 결과를 적는다 "
-        "(직접 확인하지 않은 것은 그렇게 표시). 명령이 실패했으면 오류 메시지를 그대로 보고하고 대신 일하지 않는다.\n\n"
-        "[역할 지침]\n" + str(spec.get("prompt") or "").strip()
+        f"1. Write 도구로 받은 작업 명세 전문을 고치지 말고 새 파일에 쓴다. 경로는 {task_prefix}-<임의의 숫자 6자리>.md 로 한다 "
+        "(같은 역할이 동시에 불려도 겹치지 않게). Write 는 이 파일을 쓰는 데만 쓴다.\n"
+        "2. 다음 명령을 실행한다. 다른 명령과 묶지 않고(&&, ;, |, 리다이렉션 금지) 이 명령 하나만 그대로 실행한다. "
+        "오래 걸릴 수 있으니 실행 시간 제한을 최대로 지정하고 끝날 때까지 기다린다:\n"
+        f"{runner_command(runner)} <1에서 쓴 파일의 경로>\n"
+        "3. 끝나면 `git status --short`, `git diff --stat` 을 읽는다.\n"
+        "4. 보고: 명령이 출력한 Codex 의 답을 빠짐없이 전하고, 변경 파일 목록과 Codex 가 보고한 검사 결과를 적는다 "
+        "(직접 확인하지 않은 것은 그렇게 표시). 명령이 실패했거나 실행이 거부됐으면 오류 메시지를 그대로 보고하고 대신 일하지 않는다."
     )
-    wrapper = {"description": spec.get("description", ""), "prompt": prompt, "tools": ["Bash", "Read"], "model": "haiku"}
-    return wrapper
+    return {"description": spec.get("description", ""), "prompt": prompt, "tools": ["Bash", "Read", "Write"], "model": "haiku"}
 
 
 def model_rows(agents: dict[str, dict], models: Models) -> list[tuple[str, str, bool]]:

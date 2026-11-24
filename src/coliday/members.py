@@ -23,6 +23,7 @@ import uuid
 from pathlib import Path
 
 from coliday import team
+from coliday.guard import EnvGuard
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
 from coliday.store import Job, Store
@@ -63,10 +64,11 @@ def request(directory: Path, role: str, task: str) -> int:
 class Server:
     """요청 폴더를 지켜보다가 요청마다 스레드를 띄워 팀원을 실행한다."""
 
-    def __init__(self, cfg: Config, job: Job, resolved: dict[str, dict]) -> None:
+    def __init__(self, cfg: Config, job: Job, resolved: dict[str, dict], guard: EnvGuard | None = None) -> None:
         self.cfg = cfg
         self.job = job
         self.resolved = resolved
+        self.guard = guard  # 있으면 팀원도 .env 를 읽지 못한다
         self.directory = rpc_dir(job.id)
         self.cost_usd = 0.0
         self._lock = threading.Lock()
@@ -113,7 +115,7 @@ class Server:
         first_line = " ".join(task.strip().splitlines()[0].split())[:120]
         store.add_event(job_id, LEAD, "dispatch", f"{role}에게 분배: {first_line}")
         store.update_job(job_id, phase=f"{LEAD}: {role}에게 분배")
-        ok, text, cost = run_member(self.cfg, store, self.job, role, self.resolved[role], task)
+        ok, text, cost = run_member(self.cfg, store, self.job, role, self.resolved[role], task, self.guard)
         with self._lock:
             self.cost_usd += cost or 0.0
         store.add_event(job_id, role, "done", "종료 (completed)" if ok else "종료 (failed)")
@@ -123,15 +125,16 @@ class Server:
 
 
 def run_member(
-    cfg: Config, store: Store, job: Job, role: str, spec: dict, task: str,
+    cfg: Config, store: Store, job: Job, role: str, spec: dict, task: str, guard: EnvGuard | None = None,
 ) -> tuple[bool, str, float | None]:
     """팀원 하나를 실행하고 (성공 여부, 보고, 비용)을 돌려준다. 진행 과정은 타임라인에 남긴다."""
     prompt = str(spec.get("prompt") or "")
     model = spec.get("model")
     if team.is_codex(model):
-        cmd = [cfg.codex_bin, "exec", "--json", "--skip-git-repo-check", "-s", team.codex_sandbox(spec)]
-        if team.codex_sandbox(spec) == "workspace-write":
-            cmd += team.codex_writable_roots(cfg.artifacts_dir(job.id))
+        cmd = [
+            cfg.codex_bin, "exec", "--json", "--skip-git-repo-check",
+            *team.codex_access(team.codex_sandbox(spec), cfg.artifacts_dir(job.id), guard=guard),
+        ]
         if team.codex_model(model):
             cmd += ["-m", team.codex_model(model)]
         cmd.append("-")
@@ -148,12 +151,16 @@ def run_member(
             cmd += ["--model", model]
         if isinstance(spec.get("tools"), list):
             cmd += ["--tools", ",".join(map(str, spec["tools"]))]
+        if guard is not None:
+            cmd += ["--settings", guard.claude_settings(
+                writable=[str(cfg.artifacts_dir(job.id))], protected=cfg.protected_paths,
+            )]
         stdin = task
         translator = Translator(lead=role)
     try:
         proc = subprocess.Popen(
             cmd, cwd=job.workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1,
+            stderr=subprocess.PIPE, text=True, bufsize=1, env=agent_env(guard),
         )
     except OSError as exc:
         store.add_event(job.id, role, "error", f"실행 실패: {exc}")
@@ -184,6 +191,18 @@ def run_member(
         store.add_event(job.id, role, "error", f"종료 코드 {returncode}" + (f": {tail}" if tail else ""))
         text = text or f"{role} 이(가) 실패했습니다 (종료 코드 {returncode}). {tail}".strip()
     return ok, text, translator.cost_usd
+
+
+def agent_env(guard: EnvGuard | None) -> dict[str, str] | None:
+    """에이전트 프로세스의 환경. 샌드박스 안에서는 macOS 의 /usr/bin/java 가 JDK 를 찾지 못해, 미리 찾아 JAVA_HOME 으로 준다."""
+    if guard is None or sys.platform != "darwin" or os.environ.get("JAVA_HOME"):
+        return None
+    try:
+        found = subprocess.run(["/usr/libexec/java_home"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    home = found.stdout.strip()
+    return {**os.environ, "JAVA_HOME": home} if found.returncode == 0 and home.startswith("/") else None
 
 
 def _write_json(path: Path, data: dict) -> None:

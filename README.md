@@ -73,7 +73,7 @@ clone 한 폴더의 코드를 그대로 쓰므로(editable) 그 폴더에서 `gi
 - 작업이 실행 중일 때 보낸 채팅은 대기했다가(타임라인에 ⏳ 로 표시) 지금 실행이 끝나는 대로 같은 세션에 이어서 전달된다.
   여러 개를 보내면 한 번에 묶어서 전달한다. 실행 도중에 끼어드는 것은 아니다. 작업을 취소하면 대기한 요청은 버려진다.
 - 글자 키는 채팅에 쓰이므로 단축키는 모두 ctrl 조합이다: `ctrl+n` 새 작업(새 세션·새 worktree), `ctrl+o` 프로젝트 목록,
-  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 팀·프롬프트, `ctrl+f` 결과물 폴더, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제, `ctrl+c` 종료.
+  `ctrl+g` 프로젝트 추가, `ctrl+t` 모델, `ctrl+p` 팀·프롬프트, `ctrl+f` 결과물 폴더, `ctrl+l` .env 읽기 허용, `ctrl+s` 작업 취소, `ctrl+r` 작업 삭제, `ctrl+c` 종료.
 - 처음 열면 프로젝트 목록에서 시작한다. ↑/↓ 로 작업 위치를 고르고 Enter 를 누르면 작업 목록으로 넘어간다.
   작업 목록에서 Enter 를 누르면 채팅 입력으로 간다.
 - 맨 위는 연결된 프로젝트 디렉토리 목록이다. `ctrl+g` 로 디렉토리와 이름(비우면 폴더 이름)을 입력해 추가한다.
@@ -169,6 +169,9 @@ TUI 에서는 `ctrl+t` 창 맨 위에서 기본 에이전트를 고르고, 역�
 - 기본 에이전트가 `claude` 면 팀원 정의에 적힌 Claude 모델(architect·reviewer 는 opus)을 쓰고, `codex-coder` 는 Codex 로 일한다.
   기본 에이전트가 `codex` 면 따로 고르지 않은 역할은 모두 Codex 기본 모델로 일한다.
 - Claude 팀장 아래의 Codex 팀원은 `codex exec` 를 대신 실행해 주는 작은 Claude(haiku) 에이전트를 거쳐 일한다.
+  coliday 는 작업마다 그 팀원용 실행 파일(`~/.coliday/jobs/<id>/codex/`)을 만들고 그 파일만 권한 검사 없이 실행되게 허용한다
+  (`--allowedTools`). 허용하지 않으면 auto 권한 모드가 Codex 실행을 "허가받지 않은 외부 전송"으로 보고 막는다.
+  Codex 로 둔 팀원에게는 작업 명세와 저장소 내용이 Codex(OpenAI)로 전달된다.
 - Codex 팀장은 샌드박스(workspace-write) 안에서 실행되고, 팀원에게는 셸 명령으로 일을 맡긴다. 팀원은 coliday 가 샌드박스 밖에서 실행한다.
 - Codex 로 실행하는 역할은 수정 도구(Edit/Write)가 없으면 읽기 전용 샌드박스로 돈다 (architect, reviewer).
   팀원 정의에 `"codex_sandbox": "workspace-write"` 를 두면 쓰기를 허용한다 (verifier 는 빌드 산출물 때문에 기본으로 허용).
@@ -178,15 +181,55 @@ TUI 에서는 `ctrl+t` 창 맨 위에서 기본 에이전트를 고르고, 역�
 
 프로젝트별 규칙은 각 레포의 `AGENTS.md` / `CLAUDE.md` 를 따른다.
 
+## .env 파일 읽기 차단
+
+에이전트는 기본으로 `.env` 로 시작하는 파일(`.env`, `.env.local`, `.env.prod` …)을 **읽지 못한다**.
+사람이 그 작업에 대해 허용했을 때만 읽을 수 있다. 에이전트나 팀장이 스스로 허용할 수는 없다.
+
+```bash
+coliday run "배포 설정 점검" --allow-env          # 이 작업에서만 허용
+coliday continue 12 "이어서" --allow-env          # 이번 실행부터 허용 (--deny-env 로 다시 막는다)
+```
+
+TUI 에서는 새 작업 창(`ctrl+n`)의 ".env 파일 읽기 허용" 을 켠 작업만 허용된다. 채팅 입력으로 시작한 작업은 항상 막는다.
+타임라인 첫 줄에 막았는지 허용했는지가 남는다.
+
+작업 도중에 필요해지면 그 작업에만 허용할 수 있다.
+
+```bash
+coliday env 12            # 지금 상태 보기
+coliday env 12 allow      # 이 작업(세션)에만 허용. deny 로 다시 막는다
+```
+
+- 막힌 작업의 에이전트는 다른 방법으로 내용을 알아내려 하지 않고, `.env` 없이는 더 진행할 수 없으면 멈춘 뒤
+  보고 맨 위에 ".env 읽기 허용이 필요합니다" 와 이유를 적는다.
+- TUI 에서는 타임라인 아래의 `.env` 줄이 버튼이다: 클릭하거나 `ctrl+l` 을 누르면 선택한 작업에만 허용한다 (허용할 때는 한 번 묻는다).
+  에이전트가 허용을 기다리거나 읽으려다 막혔으면 그 줄이 눈에 띄게 바뀐다.
+- 허용하면 같은 세션을 허용된 상태로 이어서 실행한다: 허용을 기다리며 멈춘 작업은 바로, 실행 중인 작업은 지금 실행이 끝난 뒤에.
+  (실행 중인 에이전트의 권한은 도중에 바꿀 수 없다.) 그 밖의 끝난 작업은 다음에 이어서 시킬 때부터 적용된다.
+
+- Claude 는 읽기 금지 규칙과 Bash 샌드박스를 함께 쓴다. 규칙만으로는 `grep -r` 이나 `python -c "open('.env')"` 로 내용이 나오기 때문이다.
+  샌드박스 안에서도 네트워크와 홈·임시 폴더 쓰기는 열어 둔다 (빌드가 돌 수 있게).
+- Codex 는 권한 프로필에서 `.env*` 를 읽지 못하게 둔다.
+- 막을 수 없는 환경이면 막지 않은 채 돌리지 않고 시작 전에 알린다: `claude` 2.1.331 미만, `codex` 0.171.0 미만(팀장일 때),
+  리눅스에 `bubblewrap`·`socat` 이 없을 때. (Codex 팀원은 버전이 낮으면 Claude 로 돌린다.)
+- 이 컴퓨터(macOS)에서는 디스크 어디에 있든 막고, 서버에서는 작업 디렉토리와 원래 레포 아래만 막는다.
+- 막는 것은 이름이 `.env` 로 시작하는 파일뿐이다. `application-prod.yml` 같은 다른 비밀 파일은 막지 않는다. `.env.example` 도 함께 막힌다.
+- 샌드박스 밖에서 이미 돌고 있던 프로세스(예: 먼저 떠 있던 Gradle 데몬)가 읽는 것까지는 막지 못한다.
+
 ## 서버의 프로젝트 (SSH)
 
 프로젝트를 이 컴퓨터의 디렉토리 대신 SSH 로 접속하는 서버의 디렉토리로 연결할 수 있다. 디렉토리 자리에 `user@host:/경로` 를 쓴다.
 
 ```bash
-coliday project add dev@build-server:/srv/shop --name "운영 서버"   # TUI 는 ctrl+g 의 디렉토리 칸에 같은 값을 쓴다
+coliday project add dev@build-server:/srv/shop --name "운영 서버"
+coliday project add dev@build-server:/srv/shop --port 2222         # 포트가 22 가 아닐 때 (dev@build-server:2222:/srv/shop 과 같다)
 coliday project add myserver:~/work/shop                          # ~/.ssh/config 의 Host 별칭, ~ 는 서버의 홈
 coliday run "주문 취소 API 추가" -C dev@build-server:/srv/shop
 ```
+
+TUI 에서는 `ctrl+g` 창 맨 위에서 "이 컴퓨터의 폴더" 대신 "SSH 로 접속하는 서버의 폴더"를 고른다. 그러면 서버(`dev@build-server`),
+포트(비우면 22), 서버의 폴더, 비밀번호 칸이 나온다.
 
 에이전트가 **서버에서** 실행된다: 코드 수정·빌드·테스트가 모두 서버에서 돌고, 이 컴퓨터의 coliday 는 ssh 로 명령을 보내고
 진행 상황을 받아 온다. 작업 목록·타임라인·diff·이어서 시키기·취소·삭제는 로컬 프로젝트와 같다.
@@ -196,6 +239,11 @@ coliday run "주문 취소 API 추가" -C dev@build-server:/srv/shop
   PATH 밖에 있으면 `COLIDAY_REMOTE_CLAUDE_BIN` / `COLIDAY_REMOTE_CODEX_BIN` 으로 경로를 준다.
 - 키 인증으로 접속돼야 한다. 백그라운드에서 실행하므로 비밀번호나 호스트 키 확인을 물을 수 없다.
   먼저 터미널에서 `ssh dev@build-server` 가 아무것도 묻지 않고 되는지 확인한다. 포트·키·점프 호스트는 `~/.ssh/config` 를 따른다.
+- 키 인증이 안 돼 있으면 프로젝트를 추가할 때 서버 비밀번호를 준다: TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 비밀번호 칸, CLI 는
+  `coliday project add dev@build-server:/srv/shop --password` (비밀번호를 물어본다).
+  그 비밀번호로 **한 번만** 접속해 이 컴퓨터의 SSH 공개키를 서버의 `~/.ssh/authorized_keys` 에 등록하고, 그 뒤로는 키로 접속한다.
+  비밀번호는 저장하지 않는다. 이 컴퓨터에 SSH 키가 없으면 `~/.ssh/id_ed25519` 를 새로 만든다 (암호 없음).
+  이미 키로 접속되는 서버면 아무것도 바꾸지 않는다. 처음 접속하는 서버의 호스트 키는 이때 묻지 않고 받아들인다.
 - worktree 는 서버의 `~/.coliday/worktrees/<레포>-<id>` 에, 브랜치 `coliday/<id>` 로 만든다.
   결과물(스크린샷·영상)은 서버의 `~/.coliday/jobs/<id>/artifacts` 에 쌓이고 실행이 끝날 때마다 이 컴퓨터로 가져온다.
 - 팀장은 Claude 여야 한다 (Codex 팀장은 팀원에게 맡기는 데 coliday 가 필요해 서버에서는 쓸 수 없다). 팀원은 Codex 로 둘 수 있다.

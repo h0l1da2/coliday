@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import subprocess
@@ -49,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="coliday",
         description="팀장 에이전트에게 일을 시키고 진행 상황을 본다. 인자 없이 실행하면 TUI 를 연다.",
     )
-    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,project,model,team,prompt,ls,show,diff,open,cancel,rm,update}")
+    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,env,project,model,team,prompt,ls,show,diff,open,cancel,rm,update}")
 
     sub.add_parser("ui", help="TUI 열기 (인자 없이 실행한 것과 같다)")
 
@@ -58,6 +59,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("-C", "--dir", default=".",
                      help="프로젝트 디렉토리 (기본: 현재 디렉토리). 서버의 디렉토리는 user@host:/경로 (SSH)")
     run.add_argument("--no-worktree", action="store_true", help="worktree 없이 프로젝트 디렉토리에서 직접 작업")
+    run.add_argument("--allow-env", action="store_true",
+                     help="이 작업에서 에이전트가 .env 파일을 읽어도 된다 (기본: 읽지 못하게 막는다)")
     run.add_argument("-d", "--detach", action="store_true", help="시작만 하고 바로 돌아오기")
     run.add_argument("--model", help="이 작업만 쓸 팀장 에이전트·모델 (예: codex, claude:opus). 기본: coliday model 설정")
     run.set_defaults(func=_cmd_run)
@@ -67,6 +70,10 @@ def _parser() -> argparse.ArgumentParser:
     cont.add_argument("prompt", help="이어서 시킬 일")
     cont.add_argument("-d", "--detach", action="store_true", help="시작만 하고 바로 돌아오기")
     cont.add_argument("--model", help="이번 실행부터 쓸 팀장 모델 (기본: coliday model 설정, 없으면 이전과 같음)")
+    env = cont.add_mutually_exclusive_group()
+    env.add_argument("--allow-env", dest="allow_env", action="store_true", default=None,
+                     help="이번 실행부터 .env 파일 읽기를 허용한다 (기본: 작업을 시작할 때 정한 그대로)")
+    env.add_argument("--deny-env", dest="allow_env", action="store_false", help="이번 실행부터 .env 파일 읽기를 다시 막는다")
     cont.set_defaults(func=_cmd_continue)
 
     proj = sub.add_parser("project", help="연결된 프로젝트 디렉토리 보기/추가/빼기 (서버는 user@host:/경로 로 SSH 접속)")
@@ -74,6 +81,9 @@ def _parser() -> argparse.ArgumentParser:
     proj.add_argument("dir", nargs="?",
                       help="디렉토리 (add 는 기본: 현재 디렉토리). 서버는 user@host:/경로 또는 ~/.ssh/config 별칭:/경로")
     proj.add_argument("--name", help="add: 목록에 보일 이름 (기본: 폴더 이름). 이미 연결된 디렉토리면 이름만 바꾼다")
+    proj.add_argument("--port", help="add: 서버의 SSH 포트 (기본 22). user@host:2222:/경로 로 써도 된다")
+    proj.add_argument("--password", action="store_true",
+                      help="add: 서버 비밀번호를 물어 이 컴퓨터의 SSH 키를 서버에 등록한다 (키 인증이 안 돼 있을 때. 비밀번호는 저장하지 않는다)")
     proj.set_defaults(func=_cmd_project)
 
     model = sub.add_parser("model", help="기본 에이전트와 팀장·팀원의 에이전트·모델 보기/바꾸기 (다음 실행부터 적용)")
@@ -118,6 +128,11 @@ def _parser() -> argparse.ArgumentParser:
     opn.add_argument("id", type=int)
     opn.set_defaults(func=_cmd_open)
 
+    envp = sub.add_parser("env", help="작업 도중에 그 작업의 .env 파일 읽기를 허용하거나 다시 막기 (그 작업에만 해당)")
+    envp.add_argument("id", type=int)
+    envp.add_argument("action", nargs="?", choices=["allow", "deny"], help="생략하면 지금 상태 보기")
+    envp.set_defaults(func=_cmd_env)
+
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
     cancel.add_argument("id", type=int)
     cancel.set_defaults(func=_cmd_cancel)
@@ -150,7 +165,9 @@ def _cmd_ui(cfg: config.Config) -> int:
 
 
 def _cmd_run(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
-    launched = jobs.launch(cfg, store, args.prompt, args.dir, no_worktree=args.no_worktree, model=args.model)
+    launched = jobs.launch(
+        cfg, store, args.prompt, args.dir, no_worktree=args.no_worktree, model=args.model, allow_env=args.allow_env,
+    )
     for w in launched.warnings:
         print(f"주의: {w}", file=sys.stderr)
     job = launched.job
@@ -167,7 +184,7 @@ def _cmd_run(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
 
 def _cmd_continue(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     last = max((ev.id for ev in store.events(args.id)), default=0)  # 이번 실행의 이벤트만 따라본다
-    launched = jobs.continue_job(cfg, store, args.id, args.prompt, model=args.model)
+    launched = jobs.continue_job(cfg, store, args.id, args.prompt, model=args.model, allow_env=args.allow_env)
     for w in launched.warnings:
         print(f"주의: {w}", file=sys.stderr)
     job = launched.job
@@ -225,7 +242,18 @@ def _cmd_update(args: argparse.Namespace) -> int:
 
 def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     if args.action == "add":
-        path = jobs.add_project(cfg, store, args.dir or ".", args.name)
+        directory, password = args.dir or ".", None
+        host, path = remote.split(directory)
+        if args.port:
+            if host is None:
+                raise JobError("--port 는 서버의 프로젝트(user@host:/경로)에만 씁니다.")
+            try:
+                directory = f"{remote.with_port(host, args.port)}:{path}"
+            except remote.RemoteError as exc:
+                raise JobError(str(exc)) from exc
+        if args.password and host is not None:
+            password = getpass.getpass(f"{remote.split(directory)[0]} 의 비밀번호: ")
+        path = jobs.add_project(cfg, store, directory, args.name, password)
         print(f"연결했습니다: {jobs.project_names(cfg, store)[path]}  {path}")
         return 0
     if args.action == "rm":
@@ -357,6 +385,16 @@ def _cmd_open(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
           else f"아직 결과물(사진·영상)이 없습니다: {root}")
     for path in files:
         print(f"  {path.relative_to(root)}")
+    return 0
+
+
+def _cmd_env(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
+    job = store.get_job(args.id)
+    if args.action is None:
+        state = "허용 (에이전트가 읽을 수 있음)" if store.allow_env(job.id) else "차단 (에이전트가 읽지 못함)"
+        print(f"작업 #{job.id} 의 .env 읽기: {state}")
+        return 0
+    print(jobs.set_env_access(cfg, store, job.id, args.action == "allow"))
     return 0
 
 

@@ -2,6 +2,10 @@
 import json, os, sys, time
 from pathlib import Path
 
+if sys.argv[1:] == ["--version"]:  # 버전 확인은 기록하지 않는다
+    print(os.environ.get("FAKE_CLAUDE_VERSION", "2.1.331 (Claude Code)"))
+    sys.exit(0)
+
 stdin_prompt = sys.stdin.read()
 record = os.environ.get("FAKE_CLAUDE_ARGS")
 if record:

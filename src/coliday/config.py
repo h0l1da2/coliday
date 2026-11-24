@@ -39,6 +39,11 @@ class Config:
         return self.home / "team.json"
 
     @property
+    def protected_paths(self) -> list[str]:
+        """에이전트가 쓰면 안 되는 파일: 작업 기록 DB (작업별 허용 여부가 들어 있다)."""
+        return [f"{self.db_path}{suffix}" for suffix in ("", "-wal", "-shm")]
+
+    @property
     def update_stamp(self) -> Path:
         """새 버전을 마지막으로 확인한 시각 (파일의 수정 시각)."""
         return self.home / "update-check"

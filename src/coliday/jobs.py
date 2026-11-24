@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -11,9 +12,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from coliday import gitops, projects, remote, team
+from coliday import gitops, guard, projects, remote, team
 from coliday.config import Config
-from coliday.store import RESULT, Job, Store
+from coliday.store import RESULT, USER, Job, Store
 
 STATUS_ICON = {"queued": "…", "running": "●", "succeeded": "✓", "failed": "✗", "cancelled": "■"}
 _QUEUED_TIMEOUT_SEC = 60
@@ -23,6 +24,10 @@ _VIDEO_SUFFIXES = frozenset({".webm", ".mp4", ".mov", ".mkv", ".avi"})
 
 class JobError(Exception):
     """사용자에게 그대로 보여줄 수 있는 작업 오류."""
+
+
+class NotARepoError(JobError):
+    """git 저장소가 아닌 폴더에서 worktree 를 만들려 했다. worktree 없이 다시 시도할 수 있다."""
 
 
 class WorktreeRemoveError(JobError):
@@ -39,8 +44,9 @@ class Launched:
 
 def launch(
     cfg: Config, store: Store, prompt: str, directory: str | Path,
-    *, no_worktree: bool = False, model: str | None = None,
+    *, no_worktree: bool = False, model: str | None = None, allow_env: bool = False,
 ) -> Launched:
+    """allow_env 는 사람이 이 작업에서 .env 파일을 읽어도 된다고 한 경우에만 True 다 (기본은 읽지 못하게 막는다)."""
     prompt = prompt.strip()
     if not prompt:
         raise JobError("요청 내용이 비어 있습니다.")
@@ -54,6 +60,7 @@ def launch(
             check_remote(host, model)
         else:
             check_codex(cfg, model)
+        check_env_guard(cfg, host, model, allow_env)
         root = gitops.repo_root(target)
     except remote.RemoteError as exc:
         raise JobError(str(exc)) from exc
@@ -64,7 +71,9 @@ def launch(
 
     if no_worktree or root is None:
         if root is None and not no_worktree:
-            raise JobError("git 저장소가 아닙니다. 이 디렉토리에서 직접 작업하려면 worktree 없이 실행하세요 (--no-worktree).")
+            raise NotARepoError(
+                f"git 저장소가 아닙니다: {target}. 이 디렉토리에서 직접 작업하려면 worktree 없이 실행하세요 (--no-worktree)."
+            )
         job = store.create_job(prompt=prompt, repo=root or target, workdir=target, model=model)
     else:
         if gitops.is_dirty(root):
@@ -83,6 +92,8 @@ def launch(
         store.update_job(job.id, workdir=remote.join(wt, inside), branch=branch, base_commit=base)
         job = store.get_job(job.id)
 
+    if allow_env:
+        store.set_allow_env(job.id, True)
     _spawn_worker(cfg, job.id)
     try:
         add_project(cfg, store, target)
@@ -91,8 +102,12 @@ def launch(
     return Launched(job, warnings, project=target)
 
 
-def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: str | None = None) -> Launched:
+def continue_job(
+    cfg: Config, store: Store, job_id: int, prompt: str, *, model: str | None = None, allow_env: bool | None = None,
+) -> Launched:
     """작업의 세션과 작업 디렉토리를 그대로 이어받아 후속 요청을 실행한다.
+
+    allow_env 를 주면 이번 실행부터 .env 읽기 허용 여부를 바꾼다 (None 이면 작업을 시작할 때 정한 그대로).
 
     작업이 아직 실행 중이면 요청을 대기시킨다: 지금 실행이 끝나는 대로 같은 세션에 이어서 전달된다.
     """
@@ -102,6 +117,9 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
     job = reconcile(store, store.get_job(job_id))
     if not job.is_terminal and store.queue_message(job.id, prompt):
         notes = ["이 요청에 준 --model 은 무시됩니다 (실행 중인 팀장이 이어서 처리)."] if model else []
+        if allow_env is not None and allow_env != store.allow_env(job.id):
+            store.set_allow_env(job.id, allow_env)  # 지금 실행에는 적용되지 않는다: 이 요청을 처리하는 다음 실행부터다
+            notes.append(".env 읽기 허용 여부는 지금 실행이 끝난 뒤, 이 요청을 처리할 때부터 적용됩니다.")
         return Launched(job, notes, queued=True)
     job = store.get_job(job_id)  # 대기시키려는 사이에 끝났으면 바로 이어서 시킨다
     if not job.workdir or not _is_dir(job.workdir):
@@ -115,6 +133,7 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
         _remote(check_remote, host, model)
     else:
         check_codex(cfg, model)
+    _remote(check_env_guard, cfg, host, model, store.allow_env(job.id) if allow_env is None else allow_env)
     check_team(cfg)
     if switched and job.session_id:
         # Claude 세션과 Codex 세션은 서로 이어받을 수 없다. 작업 디렉토리(코드 변경)는 그대로 쓴다.
@@ -130,6 +149,8 @@ def continue_job(cfg: Config, store: Store, job_id: int, prompt: str, *, model: 
         store.update_job(job.id, model=model)
     if switched:
         store.update_job(job.id, session_id=None)
+    if allow_env is not None:
+        store.set_allow_env(job.id, allow_env)
     _spawn_worker(cfg, job.id)
     return Launched(store.get_job(job.id), warnings)
 
@@ -165,6 +186,75 @@ def check_remote(host: str, model: str | None) -> None:
             f"{host} 에서 {', '.join(missing)} 을(를) 찾을 수 없습니다. 서버에 설치하고 로그인해 두세요 "
             "(경로가 PATH 밖이면 COLIDAY_REMOTE_CLAUDE_BIN 으로 지정)."
         )
+
+
+def set_env_access(cfg: Config, store: Store, job_id: int, allow: bool) -> str:
+    """사람이 작업 도중이나 끝난 뒤에 그 작업의 .env 읽기를 허용하거나 다시 막는다. 한 일을 설명하는 문장을 돌려준다.
+
+    허용은 그 작업(세션)에만 해당한다. 실행 중인 에이전트의 권한은 바꿀 수 없으므로, 지금 실행이 끝난 뒤
+    같은 세션을 허용된 상태로 이어서 실행한다. 에이전트가 허용을 기다리며 멈춘 작업은 바로 이어서 시작한다.
+    """
+    job = reconcile(store, store.get_job(job_id))
+    if store.allow_env(job.id) == allow:
+        return f"작업 #{job.id} 은(는) 이미 .env 읽기를 {'허용한' if allow else '막은'} 상태입니다."
+    if not allow:
+        store.set_allow_env(job.id, False)
+        store.add_event(job.id, USER, "phase", "사람이 .env 읽기를 다시 막았습니다")
+        when = "다음에 이어서 시킬 때부터" if job.is_terminal else "지금 실행이 끝난 뒤 다음 실행부터"
+        return f"작업 #{job.id}: {when} .env 를 읽지 못하게 막습니다."
+    store.add_event(job.id, USER, "phase", "사람이 이 작업에서 .env 읽기를 허용했습니다")
+    if not job.is_terminal:
+        store.set_allow_env(job.id, True)
+        if store.queue_message(job.id, guard.ALLOWED_NOTE):
+            return f"작업 #{job.id}: .env 읽기를 허용했습니다. 지금 실행이 끝나면 허용된 상태로 이어서 진행합니다."
+        job = store.get_job(job.id)  # 그 사이에 끝났다
+    waiting = guard.NEED_MARKER in (job.result or "")
+    if waiting:
+        continue_job(cfg, store, job.id, guard.ALLOWED_NOTE, allow_env=True)
+        return f"작업 #{job.id}: .env 읽기를 허용하고 이어서 시작했습니다."
+    store.set_allow_env(job.id, True)
+    return f"작업 #{job.id}: .env 읽기를 허용했습니다. 다음에 이어서 시킬 때부터 적용됩니다."
+
+
+def cli_version(host: str | None, binary: str) -> tuple[int, ...] | None:
+    """이 컴퓨터(host=None)나 서버에 있는 CLI 의 버전. 알 수 없으면 None."""
+    if host is None:
+        return guard.local_version(binary)
+    proc = remote.run(host, f"{shlex.quote(binary)} --version")
+    return guard.parse_version(proc.stdout) if proc.returncode == 0 else None
+
+
+def check_env_guard(cfg: Config, host: str | None, model: str | None, allow_env: bool) -> None:
+    """.env 읽기를 막을 수 있는 환경인지 작업을 만들기 전에 확인한다. 막을 수 없으면 막지 않은 채 돌리지 않고 알린다."""
+    if allow_env:
+        return
+    codex_lead = team.is_codex(model)
+    binary = cfg.codex_bin if codex_lead else (remote_claude_bin() if host is not None else cfg.claude_bin)
+    name, minimum = ("codex", guard.MIN_CODEX) if codex_lead else ("claude", guard.MIN_CLAUDE)
+    where = f"{host} 의" if host is not None else "이 컴퓨터의"
+    version = cli_version(host, binary)
+    if version is None or version < minimum:
+        raise JobError(
+            f"{where} {name}({guard.show(version)})는 .env 읽기를 막지 못합니다. {guard.show(minimum)} 이상으로 올리세요 "
+            f"(예: {name} update). {guard.HOW_TO_ALLOW}."
+        )
+    if codex_lead:
+        return
+    # Claude 의 샌드박스: macOS 는 기본으로 있고, 리눅스는 bubblewrap 과 socat 이 있어야 한다.
+    tools = ("bwrap", "socat")
+    if host is not None:
+        missing = remote.missing_commands(host, *tools) if _remote_is_linux(host) else []
+    else:
+        missing = [t for t in tools if shutil.which(t) is None] if sys.platform.startswith("linux") else []
+    if missing:
+        raise JobError(
+            f"{where} {', '.join(missing)} 이(가) 없어 .env 읽기를 막을 수 없습니다. 설치하세요 "
+            f"(예: sudo apt install bubblewrap socat). {guard.HOW_TO_ALLOW}."
+        )
+
+
+def _remote_is_linux(host: str) -> bool:
+    return remote.check(host, "uname -s").strip() == "Linux"
 
 
 def remote_claude_bin() -> str:
@@ -252,11 +342,21 @@ def project_names(cfg: Config, store: Store) -> dict[str, str]:
     return {p: n or remote.name(p) for p, n in _project_entries(cfg, store).items()}
 
 
-def add_project(cfg: Config, store: Store, directory: str | Path, name: str | None = None) -> str:
+def add_project(
+    cfg: Config, store: Store, directory: str | Path, name: str | None = None, password: str | None = None,
+) -> str:
     """목록에 추가하고 정규화한 경로를 돌려준다.
 
     name 이 None 이면 이름을 건드리지 않고(이미 있으면 그대로), 빈 문자열이면 폴더 이름으로 되돌린다.
+    password 는 서버의 프로젝트에만 쓴다: 키로 접속되지 않으면 이 비밀번호로 한 번 접속해 SSH 키를 등록한다 (저장하지 않는다).
     """
+    host = remote.split(str(directory).strip())[0]
+    if password and host is not None:
+        try:
+            if not remote.key_works(host):  # 이미 키로 접속되면 서버를 건드리지 않는다
+                remote.install_key(host, password)
+        except remote.RemoteError as exc:
+            raise JobError(str(exc)) from exc
     items = _project_entries(cfg, store)
     # 이미 연결된 항목은 이름만 바꾸는 것이다: 다시 확인하지 않는다 (서버에 접속하지 못해도 이름은 바꿀 수 있게).
     path = str(directory) if str(directory) in items else _location(directory)

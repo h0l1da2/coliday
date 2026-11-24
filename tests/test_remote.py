@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -186,8 +187,14 @@ def test_서버에서는_codex_팀장을_막고_claude가_없으면_알린다(en
     assert cli.main(["run", "x", "-C", app]) == 0
     assert not any("codex 가 없어" in e.message for e in _store().events(1))
     agents = json.loads((env / "server-home" / ".coliday" / "jobs" / "1" / "agents.json").read_text())
-    assert f"{shlex.quote(str(env / 'codex'))} exec -C" in agents["coder"]["prompt"]
-    assert str(env / "server-home" / ".coliday" / "jobs" / "1" / "artifacts") in agents["coder"]["prompt"]
+    runner = env / "server-home" / ".coliday" / "jobs" / "1" / "codex" / "1-coder"   # 실행 파일도 서버에 둔다
+    assert f"{shlex.quote(str(runner))} <1에서 쓴 파일의 경로>" in agents["coder"]["prompt"] and os.access(runner, os.X_OK)
+    assert f"{shlex.quote(str(env / 'codex'))} exec -C" in runner.read_text()
+    assert str(env / "server-home" / ".coliday" / "jobs" / "1" / "artifacts") in runner.read_text()
+    argv = json.loads((env / "args.json").read_text())["argv"]
+    assert argv[argv.index("--allowedTools") + 1] == f"Bash({shlex.quote(str(runner))}:*)"
+    tasks = runner.parent.parent / "codex-tasks"                          # 명세를 쓸 폴더도 서버에 만들고 열어 둔다
+    assert tasks.is_dir() and str(tasks) in [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
 
 
 def test_취소하면_서버의_에이전트도_끝낸다(env, app):
@@ -240,8 +247,8 @@ def test_서버의_결과물_경로는_이_컴퓨터에서_풀지_않는다(tmp_
     assert roots(local=False) == [path]
     assert roots() == [str(tmp_path.resolve() / "jobs" / "1" / "artifacts")]
     resolved = team.resolve_agents(team.DEFAULT_AGENTS, team.Models(agents={"coder": "codex"}))
-    wrapper = team.claude_agents(resolved, "codex", path, local=False)["coder"]["prompt"]
-    assert shlex.quote(team.codex_writable_roots(path, local=False)[1]) in wrapper
+    _, script = team.codex_runners(resolved, "codex", path, local=False)["coder"]
+    assert shlex.quote(team.codex_writable_roots(path, local=False)[1]) in script
 
 
 def test_서버에_codex가_없으면_codex_팀원을_claude로_돌린다(env, app, monkeypatch, capsys):
@@ -250,9 +257,129 @@ def test_서버에_codex가_없으면_codex_팀원을_claude로_돌린다(env, a
     assert cli.main(["run", "x", "-C", app]) == 0                         # codex 가 없어도 시작되고 끝난다
     agents = json.loads((env / "server-home" / ".coliday" / "jobs" / "1" / "agents.json").read_text())
     for name in ("codex-coder", "reviewer"):                              # 기본 Codex 팀원과 직접 고른 팀원 모두
-        assert "model" not in agents[name] and "exec -C" not in agents[name]["prompt"], name
+        assert "model" not in agents[name] and "Codex CLI" not in agents[name]["prompt"], name
     assert agents["codex-coder"]["prompt"].startswith("너는 시니어 개발자다")   # 역할 지침과 도구는 그대로
     assert agents["codex-coder"]["tools"] == ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
     assert agents["architect"]["model"] == "opus"                         # Claude 팀원은 건드리지 않는다
     notes = [e.message for e in _store().events(1) if "codex 가 없어" in e.message]
     assert notes == [f"{HOST} 에 codex 가 없어 codex-coder, reviewer 은(는) Claude 로 실행합니다"]
+
+
+@pytest.fixture
+def password_server(env, monkeypatch):
+    """키 인증이 안 돼 있어 비밀번호가 있어야 접속되는 서버. 이 컴퓨터의 홈도 비어 있다 (SSH 키 없음)."""
+    local_home = env / "local-home"
+    local_home.mkdir()
+    monkeypatch.setenv("HOME", str(local_home))
+    monkeypatch.setenv("FAKE_SSH_PASSWORD", "s3cret 'pw' $HOME")
+    return local_home
+
+
+def test_비밀번호로_한_번_접속해_SSH_키를_등록하고_프로젝트를_추가한다(env, app, password_server):
+    cfg, store = config.load(), _store()
+    authorized = env / "server-home" / ".ssh" / "authorized_keys"
+    with pytest.raises(jobs.JobError, match="Permission denied"):
+        jobs.add_project(cfg, store, app)                                  # 키도 비밀번호도 없으면 접속하지 못한다
+    with pytest.raises(jobs.JobError, match="SSH 키를 등록하지 못했습니다.*비밀번호가 맞는지"):
+        jobs.add_project(cfg, store, app, None, "wrong")
+    assert not authorized.exists() and jobs.project_names(cfg, store) == {}
+
+    assert jobs.add_project(cfg, store, app, "서버 앱", "s3cret 'pw' $HOME") == app
+    public = (password_server / ".ssh" / "id_ed25519.pub").read_text().strip()   # 키가 없어서 새로 만들었다
+    assert authorized.read_text() == public + "\n"
+    assert authorized.stat().st_mode & 0o077 == 0 and (password_server / ".ssh" / "id_ed25519").stat().st_mode & 0o077 == 0
+    assert jobs.add_project(cfg, store, app) == app                        # 이제 비밀번호 없이 된다
+
+    # 비밀번호는 어디에도 남지 않는다: ssh 명령 인자, 프로젝트 목록, 임시 파일
+    assert "s3cret" not in (env / "ssh.jsonl").read_text() and "s3cret" not in cfg.projects_path.read_text()
+    assert not list(Path(tempfile.gettempdir()).glob("coliday-askpass-*"))
+
+
+def test_이미_키로_접속되면_비밀번호를_받아도_서버를_건드리지_않는다(env, app, password_server):
+    authorized = env / "server-home" / ".ssh" / "authorized_keys"
+    authorized.parent.mkdir()
+    authorized.write_text("ssh-ed25519 AAAA other\n")
+    assert jobs.add_project(config.load(), _store(), app, None, "아무거나") == app
+    assert authorized.read_text() == "ssh-ed25519 AAAA other\n" and not (password_server / ".ssh" / "id_ed25519").exists()
+    assert not any("PubkeyAuthentication=no" in c["options"] for c in _ssh_calls(env))
+
+
+def test_있는_키는_다시_만들지_않고_두_번_등록해도_한_줄만_남는다(env, password_server):
+    ssh_dir = password_server / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "id_rsa").write_text("private")
+    (ssh_dir / "id_rsa.pub").write_text("ssh-rsa AAAA mine\n")
+    authorized = env / "server-home" / ".ssh" / "authorized_keys"
+    authorized.parent.mkdir()
+    authorized.write_text("ssh-ed25519 AAAA other\n")
+    for _ in range(2):
+        assert remote.install_key(HOST, "s3cret 'pw' $HOME") == ssh_dir / "id_rsa.pub"
+    assert authorized.read_text() == "ssh-ed25519 AAAA other\nssh-rsa AAAA mine\n"
+    assert (ssh_dir / "id_rsa").read_text() == "private" and not (ssh_dir / "id_ed25519").exists()
+    with pytest.raises(remote.RemoteError, match="호스트 이름이 올바르지 않습니다"):
+        remote.install_key("-oProxyCommand=x", "pw")
+
+
+def test_project_add_password는_비밀번호를_물어_키를_등록한다(env, app, password_server, monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr("getpass.getpass", lambda prompt: asked.append(prompt) or "s3cret 'pw' $HOME")
+    assert cli.main(["project", "add", app, "--password"]) == 0
+    assert asked == [f"{HOST} 의 비밀번호: "] and "연결했습니다" in capsys.readouterr().out
+    assert (env / "server-home" / ".ssh" / "authorized_keys").exists()
+    assert cli.main(["project", "add", str(env / "srv" / "app"), "--password"]) == 0   # 이 컴퓨터의 폴더면 묻지 않는다
+    assert len(asked) == 1
+
+
+def test_포트는_호스트_뒤에_붙이고_ssh에는_p_옵션으로_넘긴다(env, app, capsys):
+    host, path = app.split(":", 1)
+    spec = f"{host}:2222:{path}"
+    assert remote.split(spec) == (f"{host}:2222", path) and remote.is_remote(spec)
+    assert remote.split(f"{host}:{path}") == (host, path)                 # 포트가 없으면 종전대로
+    assert remote.target(f"{host}:2222") == ["-p", "2222", host] and remote.target(host) == [host]
+    assert remote.with_port(host, " 2222 ") == f"{host}:2222" and remote.with_port(host, "") == host
+    for bad in ("0", "65536", "22a", "-1"):
+        with pytest.raises(remote.RemoteError, match="포트는 1~65535"):
+            remote.with_port(host, bad)
+    with pytest.raises(remote.RemoteError):
+        remote.target(f"{host}:99999")
+
+    assert cli.main(["project", "add", f"{host}:{path}", "--port", "2222", "--name", "포트 서버"]) == 0
+    assert jobs.project_names(config.load(), _store()) == {spec: "포트 서버"}
+    assert all(c["options"][-2:] == ["-p", "2222"] and c["host"] == host for c in _ssh_calls(env))
+    assert cli.main(["run", "x", "-C", spec]) == 0                         # 작업도 그 포트로 접속해 실행한다
+    job = _store().get_job(1)
+    assert job.status == "succeeded" and job.workdir.startswith(f"{host}:2222:/")
+    assert all(c["options"][-2:] == ["-p", "2222"] for c in _ssh_calls(env))
+    assert cli.main(["project", "add", str(env / "srv" / "app"), "--port", "2222"]) == 2
+    assert "--port 는 서버의 프로젝트" in capsys.readouterr().err
+
+
+def test_포트가_있는_서버에도_비밀번호로_키를_등록한다(env, app, password_server):
+    host, path = app.split(":", 1)
+    assert jobs.add_project(config.load(), _store(), f"{host}:2222:{path}", None, "s3cret 'pw' $HOME") == f"{host}:2222:{path}"
+    first = _ssh_calls(env)
+    assert any("PubkeyAuthentication=no" in c["options"] and c["options"][-2:] == ["-p", "2222"] for c in first)
+
+
+def test_서버에서도_기본으로_env_읽기를_막고_막을_수_없으면_알린다(env, app, monkeypatch, capsys):
+    monkeypatch.setattr(jobs, "_remote_is_linux", lambda host: False)     # 테스트의 "서버"는 이 컴퓨터다
+    assert cli.main(["run", "x", "-C", app]) == 0
+    argv = json.loads((env / "args.json").read_text())["argv"]
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    workdir = remote.split(_store().get_job(1).workdir)[1]
+    # 서버에서는 디스크 전체가 아니라 작업 디렉토리와 원래 레포 아래만 막는다. 이 컴퓨터의 DB 경로는 넘기지 않는다
+    assert settings["sandbox"]["filesystem"]["denyRead"] == [f"{workdir}/**/.env*", f"{env / 'srv' / 'app'}/**/.env*"]
+    assert settings["sandbox"]["filesystem"]["denyWrite"] == [] and settings["sandbox"]["failIfUnavailable"] is True
+
+    monkeypatch.setenv("FAKE_CLAUDE_VERSION", "1.0.58 (Claude Code)")     # 서버의 claude 가 낮다
+    assert cli.main(["run", "y", "-C", app]) == 2
+    assert f"{HOST} 의 claude(1.0.58)는 .env 읽기를 막지 못합니다" in capsys.readouterr().err
+    assert cli.main(["run", "y", "-C", app, "--allow-env"]) == 0
+    argv = json.loads((env / "args.json").read_text())["argv"]
+    assert "--settings" not in argv
+
+    monkeypatch.delenv("FAKE_CLAUDE_VERSION")
+    monkeypatch.setattr(jobs, "_remote_is_linux", lambda host: True)      # 리눅스 서버에 bubblewrap 이 없다
+    monkeypatch.setattr(remote, "missing_commands", lambda host, *names: [n for n in names if n == "bwrap"])
+    assert cli.main(["run", "z", "-C", app]) == 2
+    assert "bwrap 이(가) 없어 .env 읽기를 막을 수 없습니다" in capsys.readouterr().err

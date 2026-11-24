@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id, id);
+CREATE TABLE IF NOT EXISTS job_options (
+    job_id    INTEGER PRIMARY KEY REFERENCES jobs(id),
+    allow_env INTEGER NOT NULL DEFAULT 0
+);
 """
 
 _UPDATABLE = frozenset(
@@ -107,6 +111,19 @@ class Store:
             (prompt, repo, workdir, model, time.time()),
         )
         return self.get_job(int(cur.lastrowid))
+
+    # 작업별 선택 사항은 jobs 에 열을 늘리지 않고 따로 둔다 (실행 중인 이전 버전 worker 가 모르는 열을 읽고 죽지 않게).
+    def set_allow_env(self, job_id: int, allow: bool) -> None:
+        """사람이 이 작업에서 .env 파일을 읽어도 된다고 했는지 남긴다."""
+        self._conn.execute(
+            "INSERT INTO job_options(job_id, allow_env) VALUES (?, ?) "
+            "ON CONFLICT(job_id) DO UPDATE SET allow_env = excluded.allow_env",
+            (job_id, int(allow)),
+        )
+
+    def allow_env(self, job_id: int) -> bool:
+        row = self._conn.execute("SELECT allow_env FROM job_options WHERE job_id = ?", (job_id,)).fetchone()
+        return bool(row and row["allow_env"])
 
     def get_job(self, job_id: int) -> Job:
         row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -243,6 +260,7 @@ class Store:
             )
             if cur.rowcount == 1:
                 self._conn.execute("DELETE FROM events WHERE job_id = ?", (job_id,))
+                self._conn.execute("DELETE FROM job_options WHERE job_id = ?", (job_id,))
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")

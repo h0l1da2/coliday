@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from textual.widgets import DataTable, Input, Markdown, Static, TextArea  # noqa: E402
+from textual.widgets import DataTable, Input, Label, Markdown, Static, TextArea  # noqa: E402
 
 from coliday import config, jobs, team  # noqa: E402
 from coliday.store import Store  # noqa: E402
@@ -97,7 +97,7 @@ def test_새_작업을_입력하면_실행되고_타임라인과_diff가_갱신�
         store.close()
 
 
-def test_git_저장소가_아닌_디렉토리로_시작하면_오류를_알리고_작업을_만들지_않는다(env, tmp_path):
+def test_git_저장소가_아닌_디렉토리로_시작하면_직접_작업할지_묻는다(env, tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     cfg = config.load()
@@ -110,8 +110,24 @@ def test_git_저장소가_아닌_디렉토리로_시작하면_오류를_알리�
             app.screen.query_one("#prompt", Input).value = "x"
             await pilot.press("enter")
             await pilot.pause()
-            assert store.list_jobs() == []
-            assert any("git 저장소가 아닙니다" in n.message for n in app._notifications)
+            assert isinstance(app.screen, ConfirmScreen) and store.list_jobs() == []   # 묻기 전에는 만들지 않는다
+            question = str(app.screen.query_one(Label).render())
+            assert "git 저장소가 아닙니다" in question and "되돌릴 수도 없습니다" in question
+            await pilot.press("n")
+            await pilot.pause()
+            assert store.list_jobs() == [] and len(app.screen_stack) == 1
+
+            chat = app.query_one("#chat", Input)                # 채팅 입력으로 시작해도 같다
+            chat.focus()
+            chat.value = "배포 스크립트 고쳐줘"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen) and chat.value == "배포 스크립트 고쳐줘"
+            await pilot.press("y")
+            await _until(pilot, lambda: len(store.list_jobs()) == 1)
+            job = store.list_jobs()[0]
+            assert job.workdir == str(plain.resolve()) and job.branch is None   # worktree 없이 그 폴더에서 직접
+            assert chat.value == ""
 
     try:
         _run(scenario())
@@ -904,6 +920,160 @@ def test_새_버전이_있으면_화면을_열_때_알린다(env, repo, monkeypa
             app._check_update()   # 다시 확인해도 같은 알림을 또 띄우지 않는다
             await pilot.pause(0.1)
             assert sum("커밋 3개" in n.message for n in app._notifications) == 1
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여_준다(env, repo, monkeypatch):
+    from textual.widgets import Select
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    calls = []
+    real = jobs.add_project
+
+    def add_project(cfg, store, directory, name=None, password=None):
+        calls.append((str(directory), name, password))
+        return str(directory) if "@" in str(directory) else real(cfg, store, directory, name, password)
+
+    monkeypatch.setattr(jobs, "add_project", add_project)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(120, 40)) as pilot:
+            calls.clear()
+            await pilot.press("ctrl+g")
+            screen = app.screen
+            shown = lambda: {i.id for i in screen.query(Input) if all(n.display for n in i.ancestors_with_self)}
+            assert shown() == {"dir", "name"} and not screen.query_one("#ssh-hint").display   # 처음에는 이 컴퓨터의 폴더
+
+            screen.query_one("#kind", Select).value = "ssh"
+            await pilot.pause()
+            assert shown() == {"host", "port", "remote-dir", "password", "name"} and screen.query_one("#ssh-hint").display
+            assert screen.query_one("#password", Input).password
+            assert "저장하지 않는다" in str(screen.query_one("#ssh-hint").render())
+
+            screen.query_one("#remote-dir", Input).value = "/srv/app"
+            await pilot.press("enter")                        # 서버 주소가 비었다
+            await pilot.pause()
+            assert app.screen is screen and calls == []
+            screen.query_one("#host", Input).value = "dev@server"
+            screen.query_one("#port", Input).value = "70000"
+            screen.query_one("#host", Input).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen is screen and any("포트는 1~65535" in n.message for n in app._notifications)
+
+            screen.query_one("#port", Input).value = "2222"
+            screen.query_one("#password", Input).value = " s3cret "   # 비밀번호는 앞뒤 공백도 그대로
+            await pilot.press("enter")
+            await pilot.pause()
+            assert calls == [("dev@server:2222:/srv/app", None, " s3cret ")]
+
+            await pilot.press("ctrl+g")                       # 포트와 비밀번호를 비우면 붙이지 않는다
+            app.screen.query_one("#kind", Select).value = "ssh"
+            await pilot.pause()
+            app.screen.query_one("#host", Input).value = "dev@server"
+            app.screen.query_one("#remote-dir", Input).value = "~/app"
+            app.screen.query_one("#host", Input).focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert calls[-1] == ("dev@server:~/app", None, None)
+
+            await pilot.press("ctrl+g")                       # 이 컴퓨터의 폴더
+            app.screen.query_one("#dir", Input).value = str(repo)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert calls[-1] == (str(repo), None, None)
+
+            await pilot.press("ctrl+o")
+            await pilot.press("ctrl+e")                       # 이름 바꾸기에는 위치 선택도 서버 칸도 없다
+            assert isinstance(app.screen, AddProjectScreen)
+            assert not app.screen.query("#kind") and not app.screen.query("#password")
+            assert app.screen.query_one("#dir", Input).disabled
+            await pilot.press("enter")
+            await pilot.pause()
+            assert calls[-1][2] is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_env_읽기_허용은_새_작업_창에서_사람이_켠_작업에만_들어간다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            chat = app.query_one("#chat", Input)                # 채팅 입력으로 시작한 작업은 허용하지 않는다
+            chat.focus()
+            chat.value = "첫 작업"
+            await pilot.press("enter")
+            await _until(pilot, lambda: len(store.list_jobs()) == 1)
+            assert not store.allow_env(1)
+
+            await pilot.press("ctrl+n")
+            box = app.screen.query_one("#allow-env")
+            assert box.value is False                           # 기본은 꺼져 있다
+            app.screen.query_one("#prompt", Input).value = "둘째 작업"
+            box.value = True
+            await pilot.press("enter")
+            await _until(pilot, lambda: len(store.list_jobs()) == 2)
+            assert store.allow_env(2) and not store.allow_env(1)
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_작업_도중에_env_읽기를_버튼으로_그_작업에만_허용한다(env, repo, monkeypatch):
+    from coliday import guard
+    from coliday.tui import EnvBar
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    first = jobs.launch(cfg, store, "첫 작업", repo).job
+    other = jobs.launch(cfg, store, "다른 작업", repo).job
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: all(store.get_job(j.id).is_terminal for j in (first, other)))
+            app.select_job(first.id)
+            await pilot.pause()
+            bar = app.query_one("#env-access", EnvBar)
+            assert "차단 중" in str(bar.render()) and not bar.has_class("-needed")
+
+            # 에이전트가 .env 가 필요하다고 멈췄다: 줄이 눈에 띄게 바뀐다
+            store.update_job(first.id, result=f"{guard.NEED_MARKER}\n.env 의 DB_URL 이 필요합니다.")
+            await _until(pilot, lambda: bar.has_class("-needed"))
+            assert "읽어야 합니다" in str(bar.render())
+
+            await pilot.click("#env-access")                      # 버튼(줄)을 누르면 먼저 묻는다
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen) and not store.allow_env(first.id)
+            await pilot.press("n")
+            await pilot.pause()
+            assert not store.allow_env(first.id)
+
+            await pilot.press("ctrl+l")                           # 단축키도 같다
+            await pilot.pause()
+            await pilot.press("y")
+            await _until(pilot, lambda: store.allow_env(first.id))
+            assert not store.allow_env(other.id)                  # 그 작업에만 해당한다
+            # 허용을 기다리던 작업은 같은 세션으로 바로 이어서 실행한다
+            await _until(pilot, lambda: any(e.message == guard.ALLOWED_NOTE for e in store.events(first.id)))
+            await _until(pilot, lambda: "허용됨" in str(bar.render()))
+
+            await _until(pilot, lambda: store.get_job(first.id).is_terminal)
+            await pilot.press("ctrl+l")                           # 다시 막는 쪽은 묻지 않는다
+            await _until(pilot, lambda: not store.allow_env(first.id))
+            assert len(app.screen_stack) == 1
 
     try:
         _run(scenario())

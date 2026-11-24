@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from coliday import cli, config, jobs, team, worker
+from coliday import cli, config, jobs, members, team, worker
 from coliday.store import Store
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_claude.py"
@@ -341,7 +341,10 @@ def test_오래된_작업을_이어서_시켜도_대기_시간초과로_정리�
 def test_이어서_시킨_실행이_세션_없이_실패해도_이전_세션은_남는다(env, repo, monkeypatch):
     cli.main(["run", "x", "-C", str(repo)])
     fake_bin = env / "claude"
-    fake_bin.write_text("#!/bin/sh\necho 'No conversation found' >&2\nexit 1\n")
+    fake_bin.write_text(
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.331 (Claude Code)'; exit 0; }\n"
+        "echo 'No conversation found' >&2\nexit 1\n"
+    )
 
     assert cli.main(["continue", "1", "더 해줘"]) == 1
 
@@ -354,6 +357,12 @@ def _recorded(env):
     argv = recorded["argv"]
     agents = json.loads(Path(argv[argv.index("--agents") + 1]).read_text())
     return argv, agents
+
+
+def _role_prompt(agents, name, job_id=1):
+    """팀원이 실제로 받는 역할 지침: Codex 팀원이면 실행 파일에 들어 있다 (래퍼 프롬프트가 아니라)."""
+    runners = [p for p in (config.load().job_dir(job_id) / "codex").glob(f"*-{name}")]
+    return runners[0].read_text() if runners else agents[name]["prompt"]
 
 
 def test_model로_바꾼_팀장과_팀원_모델이_다음_실행에_적용된다(env, repo, capsys):
@@ -633,8 +642,9 @@ def test_최대_시도_횟수는_기본_5번이고_팀장과_팀원_지침에_�
     assert "최대 5번까지만 시도한다" in lead and "## 실패한 작업 정리" in lead
     assert "5번 시도해도 실패하거나" in lead and "{max_attempts}" not in lead
     for name in ("architect", "coder", "reviewer", "verifier", "codex-coder"):  # Codex 래퍼도 역할 지침째로 넘긴다
-        assert "최대 5번까지만 시도한다" in agents[name]["prompt"], name
-        assert '"최대 시도 횟수 도달"' in agents[name]["prompt"] and "{max_attempts}" not in agents[name]["prompt"]
+        prompt = _role_prompt(agents, name)
+        assert "최대 5번까지만 시도한다" in prompt, name
+        assert '"최대 시도 횟수 도달"' in prompt and "{max_attempts}" not in prompt
 
 
 def test_COLIDAY_MAX_ATTEMPTS로_최대_시도_횟수를_바꾼다(env, repo, monkeypatch, capsys):
@@ -676,8 +686,9 @@ def test_화면_작업의_결과물_폴더가_팀장과_쓰기_가능한_팀원_
     assert "## 화면 작업의 결과물" in lead and f"- 결과물 폴더: {folder}" in lead
     assert argv[argv.index("--add-dir") + 1] == folder and Path(folder).is_dir()
     for name in ("coder", "codex-coder", "verifier"):
-        assert f"이 폴더에 저장한다: {folder}" in agents[name]["prompt"], name
-        assert "하위 폴더를 만들지 말고" in agents[name]["prompt"] and "작업 공간으로 쓰지 않는다" in agents[name]["prompt"]
+        prompt = _role_prompt(agents, name)
+        assert f"이 폴더에 저장한다: {folder}" in prompt, name
+        assert "하위 폴더를 만들지 말고" in prompt and "작업 공간으로 쓰지 않는다" in prompt
     for name in ("architect", "reviewer"):  # 읽기만 하는 역할
         assert "화면 작업의 결과물" not in agents[name]["prompt"], name
 
@@ -772,7 +783,7 @@ def test_결과물이_아직_없어도_open은_폴더를_열고_없다고_알린
 def test_codex로_도는_역할도_결과물_폴더에_쓸_수_있게_샌드박스를_연다(env, repo, monkeypatch):
     cli.main(["model", "default", "codex"])
     monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
-    cli.main(["run", "x", "-C", str(repo)])
+    cli.main(["run", "x", "-C", str(repo), "--allow-env"])
 
     folder = str(config.load().artifacts_dir(1))
     lead, member = sorted(_codex_calls(env), key=lambda c: "# 사용자 요청" not in c["stdin"])
@@ -782,9 +793,9 @@ def test_codex로_도는_역할도_결과물_폴더에_쓸_수_있게_샌드박�
     assert f"이 폴더에 저장한다: {folder}" in member["stdin"]
 
     monkeypatch.setenv("FAKE_CODEX_DELEGATE", "reviewer")   # 읽기 전용 역할은 열지 않는다
-    cli.main(["run", "y", "-C", str(repo)])
+    cli.main(["run", "y", "-C", str(repo), "--allow-env"])
     member = [c for c in _codex_calls(env) if "# 사용자 요청" not in c["stdin"]][-1]
-    assert "read-only" in member["argv"] and not any("writable_roots" in a for a in member["argv"])
+    assert 'sandbox_mode="read-only"' in member["argv"] and not any("writable_roots" in a for a in member["argv"])
 
 
 def test_홈이_심볼릭_링크여도_codex에는_링크를_푼_경로만_넘긴다(env, repo, monkeypatch):
@@ -796,7 +807,7 @@ def test_홈이_심볼릭_링크여도_codex에는_링크를_푼_경로만_넘�
     monkeypatch.setenv("COLIDAY_HOME", str(link))
     cli.main(["model", "default", "codex"])
     monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
-    cli.main(["run", "x", "-C", str(repo)])
+    cli.main(["run", "x", "-C", str(repo), "--allow-env"])
 
     calls = _codex_calls(env)
     assert len(calls) == 2  # 팀장, 팀원
@@ -841,28 +852,75 @@ def test_claude_팀장_아래_팀원을_codex로_바꾸면_codex를_돌리는_�
     cli.main(["model", "verifier", "codex"])
     cli.main(["model", "codex-coder", "sonnet"])  # 반대로 Codex 기본 팀원을 Claude 로
 
-    cli.main(["run", "x", "-C", str(repo)])
+    cli.main(["run", "x", "-C", str(repo), "--allow-env"])
 
     argv, agents = _recorded(env)
     assert "--agents" in argv and _codex_calls(env) == []  # 팀장은 Claude
     import shlex
     codex = shlex.quote(os.environ["COLIDAY_CODEX_BIN"])  # 경로에 한글·공백이 있어도 명령이 깨지지 않게 인용된다
     roots = shlex.quote(f'sandbox_workspace_write.writable_roots={json.dumps([str(config.load().artifacts_dir(1))])}')
-    assert (f'{codex} exec -C "$(pwd -P)" -s workspace-write --skip-git-repo-check -c {roots} -o "$OUT" - < "$PROMPT"'
-            in agents["coder"]["prompt"])
-    assert "너는 시니어 개발자다" in agents["coder"]["prompt"]  # 역할 지침은 그대로 Codex 에 전달
-    assert (agents["coder"]["model"], agents["coder"]["tools"]) == ("haiku", ["Bash", "Read"])
-    assert "-s read-only --skip-git-repo-check -m gpt-x" in agents["reviewer"]["prompt"]  # 수정 도구가 없는 역할
-    assert "-s workspace-write" in agents["verifier"]["prompt"]  # 빌드 산출물을 써야 한다
-    assert agents["codex-coder"]["model"] == "sonnet" and "codex exec" not in agents["codex-coder"]["prompt"]
+    # Codex 팀원마다 실행 파일을 하나씩 만들고, 래퍼는 그 파일에 작업 명세만 넘긴다
+    runners = {p.name.split("-", 1)[1]: p for p in (config.load().job_dir(1) / "codex").iterdir()}
+    assert sorted(runners) == ["coder", "reviewer", "verifier"]
+    coder = runners["coder"].read_text()
+    mode = shlex.quote('sandbox_mode="workspace-write"')
+    assert f'{codex} exec -C "$(pwd -P)" --skip-git-repo-check -c {mode} -c {roots} -o "$OUT" -' in coder
+    assert "너는 시니어 개발자다" in coder  # 역할 지침은 그대로 Codex 에 전달
+    tasks = config.load().job_dir(1) / "codex-tasks"   # 명세는 파일로 써서 경로만 넘긴다 (heredoc 은 허용 규칙이 어긋난다)
+    assert f"{shlex.quote(str(runners['coder']))} <1에서 쓴 파일의 경로>" in agents["coder"]["prompt"]
+    assert f"{tasks}/{runners['coder'].name}-<임의의 숫자 6자리>.md" in agents["coder"]["prompt"] and tasks.is_dir()
+    assert "<<" not in agents["coder"]["prompt"] and str(tasks) in [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+    assert (agents["coder"]["model"], agents["coder"]["tools"]) == ("haiku", ["Bash", "Read", "Write"])
+    read_only = shlex.quote('sandbox_mode="read-only"')
+    assert f"--skip-git-repo-check -c {read_only} -m gpt-x" in runners["reviewer"].read_text()  # 수정 도구가 없는 역할
+    assert mode in runners["verifier"].read_text()  # 빌드 산출물을 써야 한다
+    assert agents["codex-coder"]["model"] == "sonnet" and "Codex CLI" not in agents["codex-coder"]["prompt"]
     assert all("codex_sandbox" not in spec for spec in agents.values())
-    assert "codex exec" not in agents["architect"]["prompt"]
+    assert "Codex CLI" not in agents["architect"]["prompt"]
+    # auto 권한 모드의 분류기가 codex 실행을 막지 않게, 그 실행 파일만 허용 규칙으로 연다
+    start = argv.index("--allowedTools") + 1
+    assert sorted(argv[start:start + 3]) == sorted(f"Bash({shlex.quote(str(p))}:*)" for p in runners.values())
+
+
+def test_codex_실행_파일은_역할_지침과_작업_명세를_넘기고_답을_출력한다(env, repo, monkeypatch):
+    import subprocess
+    cli.main(["model", "coder", "codex"])
+    cli.main(["run", "x", "-C", str(repo)])
+    runner = next(p for p in (config.load().job_dir(1) / "codex").iterdir() if p.name.endswith("-coder"))
+    assert os.access(runner, os.X_OK)
+
+    done = subprocess.run([str(runner)], input="로그인 구현\n'따옴표' $HOME", cwd=repo, capture_output=True, text=True)
+    assert (done.returncode, done.stdout) == (0, "코덱스 팀원 보고\n")  # 진행 로그 없이 Codex 의 마지막 답만
+    call = _codex_calls(env)[-1]
+    assert call["stdin"].startswith("너는 시니어 개발자다")
+    assert call["stdin"].endswith("\n\n# 작업 명세\n로그인 구현\n'따옴표' $HOME")  # 명세는 고치지 않고 그대로
+    assert Path(call["cwd"]).resolve() == repo.resolve()
+
+    spec = repo / "spec.md"                            # 래퍼는 명세를 파일로 넘긴다
+    spec.write_text("심각도 [P0]~[P3] `git diff` $(pwd)")
+    assert subprocess.run([str(runner), str(spec)], cwd=repo, capture_output=True, text=True).stdout == "코덱스 팀원 보고\n"
+    assert _codex_calls(env)[-1]["stdin"].endswith("\n\n# 작업 명세\n심각도 [P0]~[P3] `git diff` $(pwd)")
+    missing = subprocess.run([str(runner), str(repo / "none.md")], cwd=repo, capture_output=True, text=True)
+    assert missing.returncode == 2 and "작업 명세 파일이 없거나 비어 있습니다" in missing.stderr
+    assert len(_codex_calls(env)) == 2                 # 명세가 없으면 Codex 를 부르지 않는다
+
+    monkeypatch.setenv("FAKE_CODEX_EXIT", "3")
+    failed = subprocess.run([str(runner)], input="x", cwd=repo, capture_output=True, text=True)
+    assert failed.returncode == 3 and failed.stdout == ""
+    assert "codex 실행 실패 (종료 코드 3)" in failed.stderr and "codex stderr tail" in failed.stderr
+
+
+def test_역할_지침에_heredoc_표시가_있어도_실행_파일이_깨지지_않는다():
+    resolved = {"qa": {"prompt": "첫 줄\nCOLIDAY_ROLE_PROMPT\n끝 줄", "model": "codex"}}
+    _, script = team.codex_runners(resolved)["qa"]
+    assert "cat <<'COLIDAY_ROLE_PROMPT_'\n첫 줄\nCOLIDAY_ROLE_PROMPT\n끝 줄\nCOLIDAY_ROLE_PROMPT_\n" in script
+    assert team.codex_runners({"이상한 이름/..": {"prompt": "p", "model": "codex"}})["이상한 이름/.."][0] == "1-_________"
 
 
 def test_기본_codex_coder는_codex_래퍼다(env, repo, capsys):
     cli.main(["run", "x", "-C", str(repo)])
     _, agents = _recorded(env)
-    assert " exec -C " in agents["codex-coder"]["prompt"] and agents["codex-coder"]["model"] == "haiku"
+    assert "Codex CLI" in agents["codex-coder"]["prompt"] and agents["codex-coder"]["model"] == "haiku"
 
     capsys.readouterr()
     cli.main(["model"])
@@ -873,7 +931,7 @@ def test_기본_codex_coder는_codex_래퍼다(env, repo, capsys):
 def test_팀장을_codex로_바꾸면_codex가_실행되고_타임라인과_보고가_남는다(env, repo, capsys):
     assert cli.main(["model", "lead", "codex:gpt-x"]) == 0
 
-    assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo)]) == 0
+    assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--allow-env"]) == 0
 
     assert not (env / "args.json").exists()  # claude 는 실행하지 않았다
     (call,) = _codex_calls(env)
@@ -930,24 +988,24 @@ def test_codex_팀장이_codex_팀원과_없는_역할에_맡기는_경우(env, 
     monkeypatch.setenv("FAKE_CODEX_DELEGATE", "reviewer")
     cli.main(["model", "reviewer", "codex:gpt-r"])
 
-    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+    assert cli.main(["run", "x", "-C", str(repo), "--allow-env"]) == 0
 
     lead, member = sorted(_codex_calls(env), key=lambda c: "# 사용자 요청" not in c["stdin"])
-    assert member["argv"] == ["exec", "--json", "--skip-git-repo-check", "-s", "read-only", "-m", "gpt-r", "-"]
+    assert member["argv"] == ["exec", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="read-only"', "-m", "gpt-r", "-"]
     assert member["stdin"].startswith("너는 코드 리뷰어다") and member["stdin"].endswith("# 작업 명세\n로그인 구현\n세부 명세")
     events = [(e.actor, e.kind, e.message) for e in _store().events(1)]
     assert ("reviewer", "tool", "Bash ls -la") in events
     assert ("팀장", "text", "팀원 보고(0): 코덱스 팀원 보고") in events
 
     monkeypatch.setenv("FAKE_CODEX_DELEGATE", "nobody")
-    cli.main(["run", "y", "-C", str(repo)])
+    cli.main(["run", "y", "-C", str(repo), "--allow-env"])
     texts = [e.message for e in _store().events(2) if e.kind == "text"]
     assert any(t.startswith("팀원 보고(1): 알 수 없는 역할: nobody") for t in texts)
 
 
 def test_codex_팀장을_이어서_시키면_resume하고_claude와_바꾸면_새_세션으로_시작한다(env, repo, capsys):
     cli.main(["model", "lead", "codex"])
-    cli.main(["run", "x", "-C", str(repo)])
+    cli.main(["run", "x", "-C", str(repo), "--allow-env"])
 
     assert cli.main(["continue", "1", "더 해줘"]) == 0
     call = _codex_calls(env)[-1]
@@ -1136,6 +1194,131 @@ def test_이_컴퓨터에_codex가_없으면_codex_팀원을_claude로_돌린다
     monkeypatch.setenv("COLIDAY_CODEX_BIN", "no-such-codex")
     assert cli.main(["run", "x", "-C", str(repo)]) == 0
     _, agents = _recorded(env)
-    assert "model" not in agents["codex-coder"] and "exec -C" not in agents["codex-coder"]["prompt"]
+    assert "model" not in agents["codex-coder"] and "Codex CLI" not in agents["codex-coder"]["prompt"]
+    argv = _recorded(env)[0]
+    assert "--allowedTools" not in argv and argv.count("--add-dir") == 1 and not (config.load().job_dir(1) / "codex").exists()
     assert any("이 컴퓨터에 codex 가 없어 codex-coder 은(는) Claude 로 실행합니다" == e.message for e in _store().events(1))
     assert cli.main(["run", "y", "-C", str(repo), "--model", "codex"]) == 2   # Codex 팀장은 대신할 수 없다: 종전대로 알린다
+
+
+# ── .env 읽기 차단 (guard.py) ──────────────────────────────────────────
+def _settings(argv):
+    return json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else None
+
+
+def test_기본으로는_env_파일을_읽지_못하게_막고_실행한다(env, repo):
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+    argv, agents = _recorded(env)
+    cfg = config.load()
+    settings = _settings(argv)
+    assert settings["permissions"]["deny"] == ["Read(**/.env*)", "Read(//**/.env*)"]   # 작업 디렉토리 안과 밖
+    sandbox = settings["sandbox"]
+    # 규칙만으로는 grep -r 이나 python open() 으로 샌다: OS 샌드박스를 켜고, 밖에서 다시 실행하는 길도 닫는다
+    assert (sandbox["enabled"], sandbox["allowUnsandboxedCommands"], sandbox["failIfUnavailable"]) == (True, False, True)
+    assert all(g.endswith("/**/.env*") for g in sandbox["filesystem"]["denyRead"]) and sandbox["filesystem"]["denyRead"]
+    assert str(cfg.db_path) in sandbox["filesystem"]["denyWrite"]         # 에이전트가 허용 여부를 스스로 바꾸지 못하게
+    assert str(cfg.artifacts_dir(1)) in sandbox["filesystem"]["allowWrite"]
+    assert sandbox["network"]["allowedDomains"] == ["*"]                   # 빌드가 의존성을 받을 수 있게 네트워크는 막지 않는다
+
+    runner = next((cfg.job_dir(1) / "codex").glob("*-codex-coder"))        # Codex 팀원은 Codex 의 권한 프로필로 막는다
+    script = runner.read_text()
+    assert 'default_permissions="coliday"' in script and '"**/.env*"="none"' in script and "sandbox_mode" not in script
+    assert f'"{cfg.artifacts_dir(1)}"="write"' in script
+    import shlex
+    assert sandbox["excludedCommands"] == [f"{shlex.quote(str(runner))} *"]  # Codex 는 Claude 의 샌드박스 밖에서 돈다
+    assert not _store().allow_env(1)
+    assert any(".env 파일은 읽지 못하게 막고 실행합니다" in e.message for e in _store().events(1))
+
+
+def test_사람이_허용한_작업에서만_env_읽기를_막지_않는다(env, repo, capsys):
+    assert cli.main(["run", "x", "-C", str(repo), "--allow-env"]) == 0
+    argv, _ = _recorded(env)
+    assert _settings(argv) is None and _store().allow_env(1)
+    assert any("사람이 허용한 작업입니다" in e.message for e in _store().events(1))
+    assert "sandbox_mode" in next((config.load().job_dir(1) / "codex").glob("*-codex-coder")).read_text()
+
+    assert cli.main(["continue", "1", "더 해줘"]) == 0                      # 이어서 시키면 처음 정한 대로다
+    assert _settings(_recorded(env)[0]) is None
+    assert cli.main(["continue", "1", "더 해줘", "--deny-env"]) == 0         # 사람이 다시 막을 수 있다
+    assert _settings(_recorded(env)[0]) is not None and not _store().allow_env(1)
+    assert cli.main(["continue", "1", "더 해줘", "--allow-env"]) == 0
+    assert _settings(_recorded(env)[0]) is None and _store().allow_env(1)
+
+    assert cli.main(["run", "y", "-C", str(repo)]) == 0                    # 허용은 그 작업에만 해당한다
+    assert _settings(_recorded(env)[0]) is not None and not _store().allow_env(2)
+
+
+def test_env를_막지_못하는_버전이면_막지_않은_채_돌리지_않고_알린다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_VERSION", "1.0.58 (Claude Code)")
+    assert cli.main(["run", "x", "-C", str(repo)]) == 2
+    err = capsys.readouterr().err
+    assert "claude(1.0.58)는 .env 읽기를 막지 못합니다" in err and "2.1.331 이상" in err and "--allow-env" in err
+    assert _store().list_jobs() == []
+    assert cli.main(["run", "x", "-C", str(repo), "--allow-env"]) == 0     # 사람이 허용하면 시작한다
+    assert cli.main(["continue", "1", "y", "--deny-env"]) == 2             # 다시 막으려 해도 막을 수 없으면 거부한다
+    assert _store().allow_env(1)
+
+    monkeypatch.delenv("FAKE_CLAUDE_VERSION")
+    monkeypatch.setenv("FAKE_CODEX_VERSION", "codex-cli 0.120.0")          # 낮은 Codex: 팀원은 Claude 로 돌리고, 팀장은 거부
+    assert cli.main(["run", "z", "-C", str(repo)]) == 0
+    _, agents = _recorded(env)
+    assert "Codex CLI" not in agents["codex-coder"]["prompt"] and "model" not in agents["codex-coder"]
+    assert any("codex(0.120.0)가 .env 읽기를 막지 못해 codex-coder 은(는) Claude 로 실행합니다" in e.message
+               for e in _store().events(2))
+    assert cli.main(["run", "w", "-C", str(repo), "--model", "codex"]) == 2
+    assert "codex(0.120.0)는 .env 읽기를 막지 못합니다" in capsys.readouterr().err
+
+
+def test_codex_팀장과_그_팀원도_env를_읽지_못하게_막는다(env, repo, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", "coder")
+    assert cli.main(["run", "x", "-C", str(repo), "--model", "codex"]) == 0
+    lead = next(c for c in _codex_calls(env) if "# 사용자 요청" in c["stdin"])
+    profile = next(a for a in lead["argv"] if a.startswith("permissions.coliday.filesystem="))
+    assert 'default_permissions="coliday"' in lead["argv"] and not any("sandbox_mode" in a for a in lead["argv"])
+    assert '":project_roots"={"."="write","**/.env*"="none"}' in profile
+    assert f'"{members.rpc_dir(1).resolve()}"="write"' in profile             # 팀원에게 맡기는 요청 폴더는 쓸 수 있어야 한다
+    argv, _ = json.loads((env / "args.json").read_text())["argv"], None      # Claude 팀원(coder)
+    assert _settings(argv)["sandbox"]["enabled"] is True
+
+
+def test_codex_권한_프로필은_읽기_전용_역할에_쓰기를_주지_않는다():
+    from coliday import guard
+    g = guard.EnvGuard(("/w", "/repo"))
+    read_only = g.codex_args("read-only", ["/art"])[3]
+    assert '":project_roots"={"."="read","**/.env*"="none"}' in read_only and '"/art"' not in read_only
+    assert '"/w/**/.env*"="none","/repo/**/.env*"="none"' in read_only and '":root"="read"' in read_only
+    assert '"/art"="write"' in g.codex_args("workspace-write", ["/art"])[3]
+    assert json.loads(g.claude_settings())["sandbox"]["filesystem"]["denyRead"] == ["/w/**/.env*", "/repo/**/.env*"]
+    assert json.loads(guard.EnvGuard(("/w",), everywhere=True).claude_settings())["sandbox"]["filesystem"]["denyRead"] == ["/**/.env*"]
+    assert guard.parse_version("codex-cli 0.171.0") == (0, 171, 0) and guard.parse_version("이상한 출력") is None
+
+
+def test_env_명령으로_작업_도중에_허용하고_막힌_읽기를_타임라인에_알린다(env, repo, monkeypatch, capsys):
+    from coliday import guard
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+    lead = _recorded(env)[0]
+    rule = lead[lead.index("--append-system-prompt") + 1]
+    assert "## .env 파일" in rule and guard.NEED_MARKER in rule and "우회하지 않는다" in rule   # 막힌 작업의 팀장만 받는 규칙
+    capsys.readouterr()
+    assert cli.main(["env", "1"]) == 0 and "차단" in capsys.readouterr().out
+
+    assert cli.main(["env", "1", "allow"]) == 0                            # 끝난 작업: 다음에 이어서 시킬 때부터
+    assert "다음에 이어서 시킬 때부터 적용" in capsys.readouterr().out and _store().allow_env(1)
+    assert cli.main(["env", "1", "allow"]) == 0 and "이미" in capsys.readouterr().out
+    assert cli.main(["continue", "1", "더"]) == 0
+    lead = _recorded(env)[0]
+    assert "--settings" not in lead and "## .env 파일" not in lead[lead.index("--append-system-prompt") + 1]
+    assert cli.main(["env", "1", "deny"]) == 0 and not _store().allow_env(1)
+
+    # 에이전트가 허용을 기다리며 멈춘 작업은 허용하면 같은 세션으로 바로 이어서 실행한다
+    _store().update_job(1, result=f"{guard.NEED_MARKER}: .env 의 DB_URL")
+    capsys.readouterr()
+    assert cli.main(["env", "1", "allow"]) == 0 and "이어서 시작했습니다" in capsys.readouterr().out
+    _wait(lambda: _store().get_job(1).is_terminal and "--resume" in json.loads((env / "args.json").read_text())["argv"])
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["stdin"] == guard.ALLOWED_NOTE and "--resume" in recorded["argv"] and "--settings" not in recorded["argv"]
+
+    assert guard.blocked_read({"type": "user", "message": {"content": [{"type": "tool_result", "content": "cat: .env: Operation not permitted"}]}})
+    assert guard.blocked_read({"type": "user", "x": "/w/.env.prod File is in a directory that is denied by your permission settings."})
+    assert not guard.blocked_read({"type": "user", "x": "cat: a.txt: Operation not permitted"})
+    assert not guard.blocked_read({"type": "system", "x": ".env Operation not permitted"})

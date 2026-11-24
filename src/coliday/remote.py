@@ -1,11 +1,13 @@
 """SSH 로 접속하는 원격 프로젝트.
 
 원격 위치는 `host:/절대/경로` 문자열이다 (`user@host:/srv/app`, `~/.ssh/config` 의 별칭 `myserver:/srv/app`).
+포트가 22 가 아니면 호스트 뒤에 붙인다: `user@host:2222:/srv/app`. 이때 "호스트"는 `user@host:2222` 전체다.
 로컬 경로는 항상 `/` 로 시작하므로 저장된 값만 보고 구분할 수 있다.
 
 서버에는 coliday 를 설치하지 않는다: git 과 에이전트 CLI(claude, codex)만 있으면 되고, 이 컴퓨터의 coliday 가
 ssh 로 명령을 실행하고 출력을 받아 온다. 접속 설정(포트·키·점프 호스트)은 `~/.ssh/config` 를 그대로 따른다.
-백그라운드에서 실행하므로 비밀번호를 물을 수 없다 (키 인증이어야 한다).
+백그라운드에서 실행하므로 비밀번호를 물을 수 없다 (키 인증이어야 한다). 키 인증이 안 돼 있으면
+프로젝트를 추가할 때 비밀번호를 한 번 받아 이 컴퓨터의 공개키를 서버에 등록한다 (`install_key`). 비밀번호는 저장하지 않는다.
 """
 
 from __future__ import annotations
@@ -15,8 +17,10 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 
@@ -24,7 +28,8 @@ class RemoteError(RuntimeError):
     pass
 
 
-_HOST = r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*"  # '-' 로 시작하면 ssh 옵션으로 읽힌다
+_BARE_HOST = r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*"  # '-' 로 시작하면 ssh 옵션으로 읽힌다
+_HOST = rf"{_BARE_HOST}(?::[0-9]{{1,5}})?"  # 뒤의 숫자는 포트
 _SPEC_RE = re.compile(rf"(?P<host>{_HOST}):(?P<path>[^\0\n]*)")
 _CONNECT_TIMEOUT = 10
 # 서버의 로그인 셸에서 실행한다 (~/.local/bin 처럼 프로필이 넣는 PATH 가 있어야 claude·codex 를 찾는다).
@@ -59,6 +64,30 @@ def name(location: str | os.PathLike) -> str:
     return posixpath.basename(split(location)[1].rstrip("/")) or str(location)
 
 
+def with_port(host: str, port: str | int | None) -> str:
+    """`user@host` 에 포트를 붙인 호스트. 포트가 비었으면 그대로다 (22, 또는 ~/.ssh/config 의 설정)."""
+    text = str(port or "").strip()
+    if not text:
+        return host
+    if not text.isdigit() or not 1 <= int(text) <= 65535:
+        raise RemoteError(f"포트는 1~65535 의 숫자여야 합니다: {text}")
+    if not re.fullmatch(_BARE_HOST, host):
+        raise RemoteError(f"호스트 이름이 올바르지 않습니다: {host!r}")
+    return f"{host}:{int(text)}"
+
+
+def target(host: str) -> list[str]:
+    """ssh 명령에 넣을 접속 대상 인자: `user@host`, 포트가 있으면 `-p 포트 user@host`."""
+    if not re.fullmatch(_HOST, host):
+        raise RemoteError(f"호스트 이름이 올바르지 않습니다: {host!r}")
+    bare, _, port = host.partition(":")
+    if not port:
+        return [bare]
+    if not 1 <= int(port) <= 65535:
+        raise RemoteError(f"포트는 1~65535 의 숫자여야 합니다: {port}")
+    return ["-p", str(int(port)), bare]
+
+
 def ssh_bin() -> str:
     return os.environ.get("COLIDAY_SSH_BIN") or "ssh"
 
@@ -80,11 +109,9 @@ def _options() -> list[str]:
 
 def command(host: str, script: str) -> list[str]:
     """host 에서 셸 스크립트를 실행하는 ssh 명령."""
-    if not re.fullmatch(_HOST, host):
-        raise RemoteError(f"호스트 이름이 올바르지 않습니다: {host!r}")
     quoted = shlex.quote(_PATH + script)
     wrapped = f'case "$SHELL" in */bash|*/zsh) exec "$SHELL" -lc {quoted};; *) exec /bin/sh -c {quoted};; esac'
-    return [ssh_bin(), *_options(), host, wrapped]
+    return [ssh_bin(), *_options(), *target(host), wrapped]
 
 
 def run(host: str, script: str, *, stdin: str | None = None, timeout: float = 30) -> subprocess.CompletedProcess[str]:
@@ -113,6 +140,95 @@ def check(host: str, script: str, *, stdin: str | None = None, timeout: float = 
     if proc.returncode != 0:
         raise RemoteError(f"{host}: {proc.stderr.strip() or proc.stdout.strip() or f'명령 실패 ({proc.returncode})'}")
     return proc.stdout
+
+
+_PASSWORD_ENV = "COLIDAY_SSH_PASSWORD"
+_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa")
+# 받은 공개키(stdin)가 없을 때만 한 줄 덧붙인다. 파일과 폴더는 본인만 읽게 만든다 (아니면 sshd 가 키를 무시한다).
+_ADD_KEY = (
+    'umask 077; mkdir -p "$HOME/.ssh" && key=$(cat) && [ -n "$key" ] && '
+    '{ grep -qxF "$key" "$HOME/.ssh/authorized_keys" 2>/dev/null || printf \'%s\\n\' "$key" >> "$HOME/.ssh/authorized_keys"; }'
+)
+
+
+def key_works(host: str) -> bool:
+    """비밀번호 없이(키로) 접속되는지."""
+    try:
+        return run(host, "true").returncode == 0
+    except RemoteError:
+        return False
+
+
+def install_key(host: str, password: str) -> Path:
+    """비밀번호로 한 번 접속해 이 컴퓨터의 공개키를 서버의 authorized_keys 에 등록한다. 등록한 공개키 파일을 돌려준다.
+
+    비밀번호는 이 접속에만 쓰고 어디에도 저장하지 않는다 (명령 인자나 로그에도 남기지 않고 자식 프로세스의 환경으로만 넘긴다).
+    처음 보는 서버의 호스트 키는 묻지 않고 받아들인다 (터미널에서 yes 를 누르는 것과 같다. 이미 아는 서버의 키가 바뀌었으면 실패한다).
+    """
+    destination = target(host)
+    public = _public_key()
+    work = Path(tempfile.mkdtemp(prefix="coliday-askpass-"))
+    try:
+        askpass = work / "askpass"
+        askpass.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "${_PASSWORD_ENV}"\n', encoding="utf-8")
+        askpass.chmod(0o700)
+        env = dict(os.environ, SSH_ASKPASS=str(askpass), SSH_ASKPASS_REQUIRE="force")
+        env.setdefault("DISPLAY", ":0")  # 오래된 ssh 는 DISPLAY 가 있어야 SSH_ASKPASS 를 쓴다
+        env[_PASSWORD_ENV] = password
+        cmd = [
+            ssh_bin(),
+            "-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no",
+            "-o", "NumberOfPasswordPrompts=1", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ControlPath=none", "-o", f"ConnectTimeout={_CONNECT_TIMEOUT}",
+            *destination, _ADD_KEY,
+        ]
+        try:
+            # 터미널에서 떼어 낸다: ssh 가 터미널에 직접 비밀번호를 묻지 않고 askpass 를 쓰게.
+            proc = subprocess.run(
+                cmd, input=public.read_text(encoding="utf-8").strip() + "\n", capture_output=True, text=True,
+                timeout=30, check=False, env=env, start_new_session=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteError(f"{host}: 응답이 없습니다 (30초 초과)") from exc
+        except OSError as exc:
+            raise RemoteError(f"ssh 를 실행할 수 없습니다 ({ssh_bin()}): {exc}") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if proc.returncode != 0:
+        reason = (proc.stderr.strip().splitlines() or ["접속 실패"])[-1]
+        hint = "비밀번호가 맞는지, 서버가 비밀번호 로그인을 허용하는지 확인하세요" if proc.returncode == 255 else "서버에 키를 쓰지 못했습니다"
+        raise RemoteError(f"{host}: SSH 키를 등록하지 못했습니다 ({reason}). {hint}.")
+    if not key_works(host):
+        raise RemoteError(
+            f"{host}: 키({public})를 등록했지만 키로 접속되지 않습니다. 키에 암호가 걸려 있으면 ssh-add 로 등록하고, "
+            f"터미널에서 ssh {' '.join(destination)} 가 비밀번호 없이 되는지 확인하세요."
+        )
+    return public
+
+
+def _public_key() -> Path:
+    """이 컴퓨터의 공개키 파일. 없으면 암호 없는 ed25519 키를 새로 만든다."""
+    directory = Path.home() / ".ssh"
+    for key_name in _KEY_NAMES:
+        if (directory / key_name).is_file() and (directory / f"{key_name}.pub").is_file():
+            return directory / f"{key_name}.pub"
+    target = directory / _KEY_NAMES[0]
+    try:
+        directory.mkdir(mode=0o700, exist_ok=True)
+        if target.exists():  # 개인키만 있다: 덮어쓰지 않고 공개키만 다시 뽑는다
+            made = subprocess.run(["ssh-keygen", "-y", "-P", "", "-f", str(target)], capture_output=True, text=True, check=False)
+            if made.returncode == 0:
+                target.with_name(target.name + ".pub").write_text(made.stdout, encoding="utf-8")
+        else:
+            made = subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "coliday", "-f", str(target)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+            )
+    except OSError as exc:
+        raise RemoteError(f"SSH 키를 만들 수 없습니다: {exc}") from exc
+    if made.returncode != 0:
+        raise RemoteError(f"SSH 키를 만들 수 없습니다: {made.stderr.strip() or 'ssh-keygen 실패'}")
+    return target.with_name(target.name + ".pub")
 
 
 @functools.lru_cache(maxsize=32)

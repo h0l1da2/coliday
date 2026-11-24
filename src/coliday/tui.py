@@ -28,14 +28,14 @@ from textual.widgets import (
     Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static, TextArea,
 )
 
-from coliday import gitops, jobs, projects, remote, team
+from coliday import gitops, guard, jobs, projects, remote, team
 from coliday.config import Config
-from coliday.jobs import STATUS_ICON, JobError, WorktreeRemoveError
+from coliday.jobs import STATUS_ICON, JobError, NotARepoError, WorktreeRemoveError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
-    "models", "prompts", "cancel_job", "remove_job", "timeline_scroll", "open_artifacts",
+    "models", "prompts", "cancel_job", "remove_job", "timeline_scroll", "open_artifacts", "env_access",
 })
 POLL_SEC = 1.0
 DIFF_EVERY_TICKS = 2
@@ -52,7 +52,9 @@ _KIND_STYLE = {
 }
 
 
-class NewJobScreen(ModalScreen[tuple[str, str, bool] | None]):
+class NewJobScreen(ModalScreen[tuple[str, str, bool, bool] | None]):
+    """결과는 (요청, 디렉토리, worktree 없이, .env 읽기 허용)이다."""
+
     BINDINGS = [Binding("escape", "close", "닫기")]
 
     def __init__(self, default_dir: str) -> None:
@@ -65,6 +67,8 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool] | None]):
             yield Input(placeholder="팀장에게 시킬 일 (Enter 로 시작)", id="prompt")
             yield Input(value=self._default_dir, placeholder="프로젝트 디렉토리 (서버는 user@host:/경로)", id="dir")
             yield Checkbox("worktree 없이 이 디렉토리에서 직접 작업", id="no-worktree")
+            # 기본은 막는다: 에이전트는 사람이 여기서 켠 작업에서만 .env 를 읽을 수 있다.
+            yield Checkbox("이 작업에서 .env 파일 읽기 허용 (기본: 에이전트가 읽지 못하게 막음)", id="allow-env")
             with Horizontal(id="dialog-buttons"):
                 yield Button("시작", variant="primary", id="ok")
                 yield Button("닫기", id="close")
@@ -79,7 +83,10 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool] | None]):
         if not prompt:
             self.notify("요청 내용을 입력하세요.", severity="warning")
             return
-        self.dismiss((prompt, self.query_one("#dir", Input).value, self.query_one("#no-worktree", Checkbox).value))
+        self.dismiss((
+            prompt, self.query_one("#dir", Input).value,
+            self.query_one("#no-worktree", Checkbox).value, self.query_one("#allow-env", Checkbox).value,
+        ))
 
     @on(Button.Pressed, "#close")
     def action_close(self) -> None:
@@ -93,6 +100,13 @@ class ArtifactBar(Static):
         self.app.action_open_artifacts()
 
 
+class EnvBar(Static):
+    """선택한 작업의 .env 읽기 상태 한 줄. 클릭하면 그 작업에 허용하거나 다시 막는다 (버튼)."""
+
+    def on_click(self) -> None:
+        self.app.action_env_access()
+
+
 class ProjectTable(DataTable):
     """연결된 프로젝트 목록. 커서가 있는 줄이 새 작업을 시작할 프로젝트다."""
 
@@ -102,44 +116,99 @@ class ProjectTable(DataTable):
     ]
 
 
-class AddProjectScreen(ModalScreen[tuple[str, str] | None]):
-    """프로젝트 디렉토리와 이름 입력. 연결과 이름 바꾸기에 함께 쓴다."""
+_LOCAL, _SSH = "local", "ssh"
+
+
+class AddProjectScreen(ModalScreen[tuple[str, str, str] | None]):
+    """프로젝트 위치와 이름 입력. 결과는 (위치, 이름, 서버 비밀번호)다.
+
+    추가할 때는 먼저 이 컴퓨터의 폴더인지 SSH 서버인지 고르고, SSH 일 때만 주소·포트·비밀번호 칸이 나온다.
+    이름만 바꿀 때(adding=False)는 위치를 그대로 보여 주고 이름만 받는다.
+    """
 
     BINDINGS = [Binding("escape", "close", "닫기")]
 
-    def __init__(self, directory: str, name: str = "", title: str = "프로젝트 추가") -> None:
+    def __init__(self, directory: str, name: str = "", title: str = "프로젝트 추가", adding: bool = True) -> None:
         super().__init__()
         self._directory = directory
         self._name = name
         self._title = title
+        self._adding = adding
 
     def compose(self) -> ComposeResult:
+        host, path = remote.split(self._directory)
         with Vertical(id="dialog"):
             yield Label(self._title, id="dialog-title")
-            yield Input(value=self._directory, placeholder="프로젝트 디렉토리, 또는 SSH 로 접속할 서버의 user@host:/경로", id="dir")
+            if not self._adding:
+                yield Input(value=self._directory, id="dir", disabled=True)
+                yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
+                yield Label("Enter 로 저장, Esc 로 닫기", classes="hint")
+                return
+            yield Select(
+                [("이 컴퓨터의 폴더", _LOCAL), ("SSH 로 접속하는 서버의 폴더", _SSH)],
+                value=_LOCAL if host is None else _SSH, allow_blank=False, id="kind",
+            )
+            with Vertical(id="local-fields"):
+                yield Input(value=path if host is None else "", placeholder="프로젝트 디렉토리 (예: ~/work_dir/shop-be)", id="dir")
+            with Vertical(id="ssh-fields"):
+                bare, _, port = (host or "").partition(":")
+                with Horizontal(id="ssh-address"):
+                    yield Input(value=bare, placeholder="서버 (예: dev@192.168.0.10, 또는 ~/.ssh/config 의 별칭)", id="host")
+                    yield Input(value=port, placeholder="포트 (22)", id="port", max_length=5)
+                yield Input(value=path if host is not None else "", placeholder="서버의 폴더 (예: /srv/shop, ~/shop)", id="remote-dir")
+                yield Input(password=True, placeholder="비밀번호 (키로 접속되면 비운다)", id="password")
             yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
-            yield Label(Text(  # Text: 예시의 대괄호·@ 가 markup 으로 해석되지 않게 한다
-                "작성 예시\n"
-                "  ~/work_dir/shop-be                 이 컴퓨터의 폴더\n"
-                "  dev@192.168.0.10:/srv/shop         서버의 폴더 (사용자@주소:/절대경로)\n"
-                "  dev@build.example.com:~/shop       ~ 는 서버의 홈 폴더\n"
-                "  myserver:/srv/shop                 ~/.ssh/config 의 별칭 (포트·키 포함)"
-            ), classes="hint", id="project-examples")
-            yield Label("서버의 프로젝트는 에이전트가 그 서버에서 실행된다. 서버에 git 과 claude 가 설치·로그인돼 있어야 하고, "
-                        "터미널에서 ssh dev@192.168.0.10 이 비밀번호를 묻지 않고(키 인증) 접속돼야 한다.",
-                        classes="hint")
+            yield Label("에이전트가 그 서버에서 실행된다: 서버에 git 과 claude 가 설치·로그인돼 있어야 한다. "
+                        "비밀번호는 한 번만 써서 이 컴퓨터의 SSH 키를 서버에 등록하고 저장하지 않는다 (그 뒤로는 키로 접속).",
+                        classes="hint", id="ssh-hint")
             yield Label("Enter 로 저장, Tab 으로 칸 이동, Esc 로 닫기", classes="hint")
 
     def on_mount(self) -> None:
-        self.query_one("#dir", Input).focus()
+        if not self._adding:
+            self.query_one("#name", Input).focus()
+            return
+        self._show_fields()
+        self.query_one("#dir" if self._kind == _LOCAL else "#host", Input).focus()
+
+    @property
+    def _kind(self) -> str:
+        return str(self.query_one("#kind", Select).value)
+
+    def _show_fields(self) -> None:
+        ssh = self._kind == _SSH
+        self.query_one("#local-fields").display = not ssh
+        self.query_one("#ssh-fields").display = ssh
+        self.query_one("#ssh-hint").display = ssh
+
+    @on(Select.Changed, "#kind")
+    def _kind_changed(self) -> None:
+        self._show_fields()
+
+    def _text(self, selector: str) -> str:
+        return self.query_one(selector, Input).value.strip()
 
     @on(Input.Submitted)
     def _submit(self) -> None:
-        value = self.query_one("#dir", Input).value.strip()
-        if not value:
-            self.notify("디렉토리를 입력하세요.", severity="warning")
+        if not self._adding:
+            self.dismiss((self._directory, self._text("#name"), ""))
             return
-        self.dismiss((value, self.query_one("#name", Input).value.strip()))
+        if self._kind == _LOCAL:
+            if not self._text("#dir"):
+                self.notify("디렉토리를 입력하세요.", severity="warning")
+                return
+            self.dismiss((self._text("#dir"), self._text("#name"), ""))
+            return
+        host, path = self._text("#host"), self._text("#remote-dir")
+        if not host or not path:
+            self.notify("서버와 서버의 폴더를 입력하세요.", severity="warning")
+            return
+        try:
+            location = f"{remote.with_port(host, self._text('#port'))}:{path}"
+            remote.target(remote.split(location)[0] or "")  # 주소 형식이 틀리면 여기서 알린다
+        except remote.RemoteError as exc:
+            self.notify(str(exc), severity="warning")
+            return
+        self.dismiss((location, self._text("#name"), self.query_one("#password", Input).value))
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -508,7 +577,14 @@ class ColidayApp(App[None]):
     #artifacts.-shown { display: block; }
     #artifacts.-has { color: $success; }
     #artifacts:hover { background: $primary; color: $text; }
+    #env-access { height: auto; padding: 0 1; background: $boost; color: $text-muted; display: none; }
+    #env-access.-shown { display: block; }
+    #env-access.-needed { background: $warning; color: $background; text-style: bold; }
+    #env-access.-allowed { color: $success; }
+    #env-access:hover { background: $primary; color: $text; }
     #diff-pane { width: 2fr; border: round $accent; }
+    #chat, #chat:focus { border-left: none; border-right: none; }
+    #prompt, #prompt:focus { border-left: none; border-right: none; }
     #projects:focus-within, #jobs:focus-within, #timeline:focus, #diff-pane:focus-within { border: round $warning; }
     NewJobScreen, AddProjectScreen, ModelScreen, TeamScreen, RoleEditScreen, ConfirmScreen { align: center middle; }
     #team { width: 92%; height: 92%; padding: 0 1; border: thick $primary; background: $surface; }
@@ -523,7 +599,12 @@ class ColidayApp(App[None]):
     .model-row Input { width: 1fr; }
     ModelScreen #dialog { width: 96; }
     #dialog { width: 80; height: auto; max-height: 100%; overflow-y: auto; padding: 1 2; border: thick $primary; background: $surface; }
-    #dialog Input, #dialog Checkbox { margin-top: 1; }
+    #dialog Input, #dialog Checkbox, #dialog Select { margin-top: 1; }
+    #local-fields, #ssh-fields, #ssh-address { height: auto; }
+    #ssh-fields Input { margin-top: 0; }  /* 칸이 많다: 테두리만으로 구분해 낮은 터미널에서도 한 화면에 들어오게 */
+    #ssh-fields { margin-top: 1; }
+    #host { width: 1fr; }
+    #port { width: 16; }
     #dialog-title { text-style: bold; }
     #dialog-buttons { height: auto; margin-top: 1; align-horizontal: right; }
     #dialog-buttons Button { margin-left: 2; }
@@ -538,6 +619,7 @@ class ColidayApp(App[None]):
         Binding("ctrl+t", "models", "모델", priority=True, key_display="T"),
         Binding("ctrl+p", "prompts", "팀·프롬프트", priority=True, key_display="P"),
         Binding("ctrl+f", "open_artifacts", "결과물 폴더", priority=True, key_display="F"),
+        Binding("ctrl+l", "env_access", ".env 허용", priority=True, key_display="L"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
         Binding("tab", "focus_next", "패널 이동", show=False),
@@ -567,6 +649,7 @@ class ColidayApp(App[None]):
         self._diff_text: str | None = None
         self._copied: str | None = None
         self._artifacts_text = ""
+        self._env_state: tuple[bool, bool] | None = None  # (허용됨, 에이전트가 필요로 함)
         self._ticks = 0
 
     # ── 화면 구성 ────────────────────────────────────────────
@@ -578,10 +661,13 @@ class ColidayApp(App[None]):
                 yield DataTable(id="jobs", cursor_type="row", zebra_stripes=True)
                 yield VerticalScroll(id="timeline")
                 yield ArtifactBar(id="artifacts")
-                # select_on_focus 를 끄지 않으면 포커스를 받을 때 전체 선택돼 다음 글자가 쓴 내용을 지운다.
-                yield Input(id="chat", select_on_focus=False)
+                yield EnvBar(id="env-access")
             with VerticalScroll(id="diff-pane"):
                 yield Static("작업을 선택하세요.", id="diff")
+        # 입력 칸은 화면 너비를 다 쓰고 좌우 테두리가 없다: 한글을 조합하는 동안 터미널(macOS 터미널 등)이 조합 중인 글자를
+        # 커서 자리에 끼워 넣어 그 줄의 오른쪽을 밀어내는데, 오른쪽에 테두리나 다른 패널이 있으면 그것이 튀어나와 보인다.
+        # select_on_focus 를 끄지 않으면 포커스를 받을 때 전체 선택돼 다음 글자가 쓴 내용을 지운다.
+        yield Input(id="chat", select_on_focus=False)
         yield Static("아래 단축키는 Ctrl 키를 누른 채로 입력합니다 (예: Ctrl+N 새 작업). 글자만 치면 채팅 입력으로 들어갑니다.", id="key-hint")
         yield Footer()
 
@@ -677,21 +763,21 @@ class ColidayApp(App[None]):
 
     def action_add_project(self) -> None:
         # 추가 창에서 이름을 비우면 (이미 연결된 디렉토리의) 기존 이름을 지우지 않는다.
-        self.push_screen(AddProjectScreen(self.default_dir), lambda a: self._save_project(a and (a[0], a[1] or None)))
+        self.push_screen(AddProjectScreen(self.default_dir), lambda a: self._save_project(a and (a[0], a[1] or None, a[2])))
 
     def action_rename_project(self) -> None:
         if self.project_dir is None:
             self.notify("선택된 프로젝트가 없습니다.", severity="warning")
             return
         current = dict(self._projects or []).get(self.project_dir, "")
-        self.push_screen(AddProjectScreen(self.project_dir, current, "프로젝트 이름 바꾸기"), self._save_project)
+        self.push_screen(AddProjectScreen(self.project_dir, current, "프로젝트 이름 바꾸기", adding=False), self._save_project)
 
-    def _save_project(self, answer: tuple[str, str | None] | None) -> None:
+    def _save_project(self, answer: tuple[str, str | None, str] | None) -> None:
         if not answer:
             return
-        directory, name = answer
+        directory, name, password = answer
         try:
-            added = jobs.add_project(self.cfg, self.store, directory, name)
+            added = jobs.add_project(self.cfg, self.store, directory, name, password or None)
         except JobError as exc:
             self.notify(str(exc), severity="error", timeout=8)
             return
@@ -857,7 +943,71 @@ class ColidayApp(App[None]):
         if at_end:
             self.call_after_refresh(log.scroll_end, animate=False)
 
+    def _update_env_bar(self) -> None:
+        """선택한 작업의 .env 읽기 상태. 에이전트가 허용을 기다리거나 읽으려다 막혔으면 눈에 띄게 한다."""
+        bar = self.query_one("#env-access", EnvBar)
+        state: tuple[bool, bool] | None = None
+        if self.selected_id is not None:
+            try:
+                job = self.store.get_job(self.selected_id)
+            except KeyError:
+                job = None
+            if job is not None:
+                allowed = self.store.allow_env(job.id)
+                needed = not allowed and (
+                    guard.NEED_MARKER in (job.result or "")
+                    or any(e.kind == "error" and ".env 파일을 읽으려다 막혔습니다" in e.message for e in self.store.events(job.id))
+                )
+                state = (allowed, needed)
+        if state == self._env_state:
+            return
+        was_shown = self._env_state is not None
+        self._env_state = state
+        bar.set_class(state is not None, "-shown")
+        bar.set_class(bool(state and state[1]), "-needed")
+        bar.set_class(bool(state and state[0]), "-allowed")
+        if state is not None:
+            allowed, needed = state
+            if allowed:
+                text = "🔓 .env 읽기 허용됨 (이 작업에만)  ← 클릭하면 다시 차단 (Ctrl+L)"
+            elif needed:
+                text = "🔒 에이전트가 .env 를 읽어야 합니다  ← 클릭하면 이 작업에만 허용 (Ctrl+L)"
+            else:
+                text = "🔒 .env 읽기 차단 중  ← 클릭하면 이 작업에만 허용 (Ctrl+L)"
+            bar.update(Text(text))
+        if was_shown != (state is not None):
+            self.refresh_bindings()
+
+    def action_env_access(self) -> None:
+        if self.selected_id is None:
+            self.notify("선택된 작업이 없습니다.", severity="warning")
+            return
+        job_id = self.selected_id
+        allow = not self.store.allow_env(job_id)
+
+        def decided(yes: bool | None) -> None:
+            if not yes:
+                return
+            try:
+                message = jobs.set_env_access(self.cfg, self.store, job_id, allow)
+            except (JobError, KeyError) as exc:
+                self.notify(str(exc), severity="error", timeout=8)
+                return
+            self.notify(message, timeout=8)
+            self._update_env_bar()
+            self.refresh_jobs()
+
+        if not allow:
+            decided(True)  # 다시 막는 쪽은 묻지 않는다
+            return
+        self.push_screen(ConfirmScreen(
+            f"작업 #{job_id} 에서 에이전트가 .env 파일을 읽도록 허용할까요?\n"
+            "이 작업(세션)에만 적용됩니다. 읽은 내용은 에이전트의 모델(Claude·Codex)로 전달됩니다.\n"
+            "실행 중이면 지금 실행이 끝난 뒤 허용된 상태로 이어서 진행합니다."
+        ), decided)
+
     def _update_artifacts(self) -> None:
+        self._update_env_bar()
         bar = self.query_one("#artifacts", ArtifactBar)
         files = jobs.artifacts(self.cfg, self.selected_id) if self.selected_id is not None else []
         text = ""
@@ -943,13 +1093,28 @@ class ColidayApp(App[None]):
     def action_new_job(self) -> None:
         self.push_screen(NewJobScreen(self.project_dir or self.default_dir), self._start_job)
 
-    def _start_job(self, answer: tuple[str, str, bool] | None) -> bool:
-        """시작했으면 True."""
+    def _start_job(self, answer: tuple[str, str, bool] | tuple[str, str, bool, bool] | None) -> bool:
+        """시작했으면 True. 채팅 입력으로 시작한 작업은 .env 읽기를 허용하지 않는다 (허용은 새 작업 창에서만 켠다)."""
         if not answer:
             return False
-        prompt, directory, no_worktree = answer
+        prompt, directory, no_worktree, allow_env = (*answer, False)[:4]
         try:
-            launched = jobs.launch(self.cfg, self.store, prompt, directory, no_worktree=no_worktree)
+            launched = jobs.launch(
+                self.cfg, self.store, prompt, directory, no_worktree=no_worktree, allow_env=allow_env,
+            )
+        except NotARepoError:
+            # 배포 폴더처럼 git 저장소가 아닌 곳: 막지 않고, 직접 고치게 되는 것을 알린 뒤 물어본다.
+            def decided(yes: bool | None) -> None:
+                chat = self.query_one("#chat", Input)
+                if yes and self._start_job((prompt, directory, True, allow_env)) and chat.value.strip() == prompt.strip():
+                    chat.value = ""
+
+            self.push_screen(ConfirmScreen(
+                f"git 저장소가 아닙니다: {directory}\n"
+                "worktree 없이 이 폴더에서 직접 작업할까요?\n"
+                "에이전트가 이 폴더의 파일을 바로 고칩니다. 변경 내용(diff)을 볼 수 없고 되돌릴 수도 없습니다."
+            ), decided)
+            return False
         except (JobError, gitops.GitError) as exc:
             self.notify(str(exc), severity="error", timeout=8)
             return False
@@ -1035,6 +1200,8 @@ class ColidayApp(App[None]):
             return False
         if action == "open_artifacts" and not self._artifacts_text:
             return False  # 이 작업에 결과물이 없으면 단축키도 하단 안내도 없다
+        if action == "env_access" and self._env_state is None:
+            return False  # 선택한 작업이 없다
         return True
 
     def action_models(self) -> None:

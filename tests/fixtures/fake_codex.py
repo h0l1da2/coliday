@@ -5,6 +5,10 @@ FAKE_CODEX_DELEGATE=<역할> 이면 팀장으로 불렸을 때 지시문에 적�
 import json, os, re, subprocess, sys
 from pathlib import Path
 
+if sys.argv[1:] == ["--version"]:  # 버전 확인은 기록하지 않는다
+    print(os.environ.get("FAKE_CODEX_VERSION", "codex-cli 0.171.0"))
+    sys.exit(0)
+
 stdin = sys.stdin.read()
 record = os.environ.get("FAKE_CODEX_ARGS")
 if record:
@@ -35,6 +39,8 @@ if is_lead and role:
 command("ls -la")
 emit(type="item.completed", item={"type": "file_change", "changes": [{"path": "/repo/src/a.py", "kind": "update"}]})
 emit(type="item.completed", item={"type": "agent_message", "text": "코덱스 최종 보고\n둘째 줄" if is_lead else "코덱스 팀원 보고"})
+if "-o" in sys.argv:  # codex exec -o <파일>: 마지막 답을 파일에도 남긴다
+    Path(sys.argv[sys.argv.index("-o") + 1]).write_text("코덱스 팀원 보고\n")
 code = int(os.environ.get("FAKE_CODEX_EXIT", "0"))
 if code:
     emit(type="turn.failed", error={"message": "codex boom"})
