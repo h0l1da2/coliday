@@ -6,14 +6,18 @@
 
 - Claude (필수): `claude setup-token` 이 주는 토큰(sk-ant-oat…)은 `CLAUDE_CODE_OAUTH_TOKEN`,
   Anthropic API 키(sk-ant-api…)는 `ANTHROPIC_API_KEY` 로 넘긴다.
-- Codex (선택): OpenAI API 키를 `CODEX_API_KEY` 로 넘긴다 (`codex exec` 가 읽는다). 없으면 서버의 codex 로그인을 쓴다.
+- Codex: 기본은 이 컴퓨터의 Codex 로그인(`~/.codex/auth.json`)이다. Codex 에는 환경변수로 넘길 수 있는 구독 토큰이 없어
+  그 파일을 서버의 작업 폴더에 잠깐 복사해 쓰고 실행이 끝나면 지운다 (`codex_login`, `restore_codex_login`).
+  OpenAI API 키를 등록했으면 그 대신 `CODEX_API_KEY` 로 넘긴다 (`codex exec` 가 읽는다). 둘 다 없으면 서버의 codex 로그인을 쓴다.
 
 저장 파일은 `이름=값` 줄로 된 env 파일이고 이름이 `.env` 로 시작한다: .env 읽기 차단(`guard.py`)이 에이전트에게서 이 파일도 가린다.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 from coliday.config import Config
 
@@ -93,6 +97,59 @@ def describe(kind: str, secret: str) -> str:
     """값을 드러내지 않고 무엇이 등록됐는지 말한다."""
     label = "Anthropic API 키" if env_name(kind, secret) == API_KEY_ENV else LABEL[kind]
     return f"{label} (…{secret[-4:]})" if len(secret) >= 20 else label
+
+
+def codex_login_path() -> Path:
+    """이 컴퓨터의 Codex 로그인 파일."""
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+
+
+def codex_login() -> str | None:
+    """이 컴퓨터의 Codex 로그인 (파일 내용 그대로). 로그인돼 있지 않거나 읽을 수 없으면 None."""
+    try:
+        text = codex_login_path().read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text if _codex_tokens(text) else None
+
+
+def restore_codex_login(sent: str, returned: str) -> bool:
+    """서버에서 쓰는 동안 갱신된 Codex 로그인을 이 컴퓨터에 되돌려 놓는다. 바꿨으면 True.
+
+    Codex 는 로그인을 갱신할 때 이전 갱신 토큰을 못 쓰게 만든다. 서버 쪽이 갱신했는데 되돌려 놓지 않으면
+    이 컴퓨터의 codex 가 다시 로그인하라고 한다. 그 사이 이 컴퓨터의 파일이 바뀌었으면(여기서도 갱신했다) 건드리지 않는다.
+    """
+    fresh, before = _codex_tokens(returned), _codex_tokens(sent)
+    if not fresh or fresh == before:
+        return False
+    target = codex_login_path()
+    try:
+        if _codex_tokens(target.read_text(encoding="utf-8")) != before:
+            return False
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(returned)
+            os.replace(tmp, target)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+    except OSError:
+        return False
+    return True
+
+
+def _codex_tokens(text: str) -> dict | None:
+    """로그인 파일의 토큰 묶음. ChatGPT 로그인이 아니면(없거나 깨졌으면) None."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict) or not tokens.get("access_token") or not tokens.get("refresh_token"):
+        return None
+    return tokens
 
 
 def is_failure(text: str | None) -> bool:

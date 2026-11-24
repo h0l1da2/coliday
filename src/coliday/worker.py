@@ -113,6 +113,7 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     prompt = follow_up.message if follow_up else job.prompt
     resume = job.session_id if follow_up else None
 
+    codex_home, codex_login = "", None  # 서버에 잠깐 둔 Codex 로그인 (끝나면 지운다)
     server: members.Server | None = None
     translator: Translator | CodexTranslator
     if team.is_codex(job.model):
@@ -197,6 +198,28 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
                 return 1 if store.finish_or_continue(job_id, "failed", phase="인증 없음") else None
             receive = "".join(f"IFS= read -r {name} && export {name} && " for name in secrets)
             prompt = "".join(f"{value}\n" for value in secrets.values()) + prompt
+            if scripts and not auth.get(cfg, auth.CODEX):
+                # Codex 팀원: 등록한 API 키가 없으면 이 컴퓨터의 Codex 로그인을 쓴다. 넘길 토큰이 따로 없어 로그인 파일을
+                # 서버의 작업 폴더에 잠깐 두고(본인만 읽게) 실행이 끝나면 지운다.
+                codex_login = auth.codex_login()
+                if codex_login:
+                    codex_home = f"{remote_dir}/{jobs.REMOTE_CODEX_HOME}"
+                    try:
+                        remote.check(
+                            host,
+                            f"umask 077; mkdir -p {shlex.quote(codex_home)} && cat > {shlex.quote(codex_home + '/auth.json')}",
+                            stdin=codex_login,
+                        )
+                    except remote.RemoteError as exc:
+                        store.add_event(job_id, LEAD, "error", str(exc))
+                        return 1 if store.finish_or_continue(job_id, "failed", phase="서버 접속 실패") else None
+                    receive += f"export CODEX_HOME={shlex.quote(codex_home)} && "
+                    store.add_event(job_id, LEAD, "phase", f"Codex 팀원은 이 컴퓨터의 Codex 로그인으로 {host} 에서 실행합니다")
+                else:
+                    store.add_event(
+                        job_id, LEAD, "phase",
+                        f"이 컴퓨터에 Codex 로그인이 없어 Codex 팀원은 {host} 의 로그인으로 실행합니다 (없으면 실패합니다)",
+                    )
             # 프로세스 번호를 남겨 두고(취소할 때 쓴다) 그 프로세스가 그대로 에이전트가 된다.
             cmd = remote.command(
                 host,
@@ -245,6 +268,8 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
             returncode = proc.wait()
     except OSError as exc:  # 실행 파일 없음 등
         store.add_event(job_id, LEAD, "error", f"{cmd[0]} 실행 실패: {exc}")
+        if host is not None and codex_home and codex_login:
+            _return_codex_login(store, job_id, host, codex_home, codex_login)
         return 1 if store.finish_or_continue(job_id, "failed", phase="팀장 실행 실패") else None
     finally:
         if server:
@@ -257,6 +282,8 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     if translator.result:  # 상태를 끝으로 바꾸기 전에 남긴다 (끝난 작업을 본 쪽은 보고도 이미 볼 수 있게)
         store.add_event(job_id, LEAD, RESULT, translator.result)
     if host is not None:
+        if codex_home and codex_login:
+            _return_codex_login(store, job_id, host, codex_home, codex_login)
         if not ok and auth.is_failure(translator.result):
             store.add_event(job_id, LEAD, "error", _auth_hint(host))
         if returncode == 255 and not translator.result:  # ssh 가 끊겼다: 서버의 에이전트가 남아 돌지 않게 한다
@@ -285,6 +312,21 @@ def _auth_hint(host: str) -> str:
         f"{host} 의 claude 가 이 컴퓨터에 등록한 인증을 받아들이지 않았습니다 (만료됐거나 잘못된 값). "
         "`claude setup-token` 으로 새로 받아 다시 등록하세요 (프로젝트 추가 창의 토큰 칸, 또는 `coliday auth set`)."
     )
+
+
+def _return_codex_login(store: Store, job_id: int, host: str, codex_home: str, sent: str) -> None:
+    """서버에 둔 Codex 로그인을 지운다. 서버에서 쓰는 동안 갱신됐으면 이 컴퓨터의 로그인에 반영한다 (아니면 여기서 로그인이 풀린다)."""
+    login = shlex.quote(codex_home + "/auth.json")
+    try:
+        proc = remote.run(host, f"cat {login} 2>/dev/null; rm -rf {shlex.quote(codex_home)}")
+    except remote.RemoteError as exc:
+        store.add_event(
+            job_id, LEAD, "error",
+            f"{host} 에 둔 Codex 로그인 파일을 지우지 못했습니다 ({codex_home}). 작업을 삭제하면 함께 지워집니다: {exc}",
+        )
+        return
+    if auth.restore_codex_login(sent, proc.stdout):
+        store.add_event(job_id, LEAD, "phase", "서버에서 갱신된 Codex 로그인을 이 컴퓨터에 반영했습니다")
 
 
 def _fetch_artifacts(store: Store, job_id: int, host: str, source: str, target: Path) -> None:

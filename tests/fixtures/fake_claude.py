@@ -7,11 +7,18 @@ if sys.argv[1:] == ["--version"]:  # 버전 확인은 기록하지 않는다
     sys.exit(0)
 
 stdin_prompt = sys.stdin.read()
+codex_login = None
+if os.environ.get("FAKE_CLAUDE_CODEX_LOGIN") is not None and os.environ.get("CODEX_HOME"):
+    login_file = Path(os.environ["CODEX_HOME"]) / "auth.json"  # 넘겨받은 Codex 로그인. 값이 있으면 그걸로 갱신한 것처럼 바꾼다
+    codex_login = {"text": login_file.read_text(), "mode": oct(login_file.stat().st_mode & 0o777)}
+    if os.environ["FAKE_CLAUDE_CODEX_LOGIN"]:
+        login_file.write_text(os.environ["FAKE_CLAUDE_CODEX_LOGIN"])
 record = os.environ.get("FAKE_CLAUDE_ARGS")
 if record:
     Path(record).write_text(json.dumps(
         {"argv": sys.argv[1:], "stdin": stdin_prompt, "cwd": os.getcwd(), "pid": os.getpid(),
          "env": {k: os.environ.get(k) for k in os.environ.get("FAKE_CLAUDE_ENV", "").split(",") if k},
+         "codex_login": codex_login,
          "auth": {k: os.environ[k] for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") if k in os.environ}},
         ensure_ascii=False,
     ))

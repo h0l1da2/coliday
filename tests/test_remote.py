@@ -31,6 +31,7 @@ def env(tmp_path, monkeypatch):
         script.chmod(0o755)
     (tmp_path / "server-home").mkdir()
     monkeypatch.setenv("COLIDAY_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "local-codex"))  # 이 컴퓨터의 진짜 Codex 로그인을 건드리지 않는다
     monkeypatch.setenv("COLIDAY_CLAUDE_BIN", str(tmp_path / "no-local-claude"))  # 이 컴퓨터의 claude 는 쓰지 않는다
     monkeypatch.setenv("COLIDAY_REMOTE_CLAUDE_BIN", str(tmp_path / "claude"))
     monkeypatch.setenv("COLIDAY_REMOTE_CODEX_BIN", str(tmp_path / "codex"))
@@ -463,3 +464,54 @@ def test_project_add_token은_토큰을_물어_등록한다(env, app, monkeypatc
     assert cli.main(["project", "add", app, "--token"]) == 0
     assert auth.get(config.load(), auth.CLAUDE) == "sk-ant-oat01-from-project-add"
     assert "sk-ant-oat01" not in capsys.readouterr().out
+
+
+def _login(refresh: str) -> str:
+    return json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "acc-" + refresh, "refresh_token": refresh}})
+
+
+def test_codex_팀원은_이_컴퓨터의_codex_로그인으로_실행하고_끝나면_서버에서_지운다(env, app, monkeypatch, capsys):
+    local = env / "local-codex" / "auth.json"
+    local.parent.mkdir()
+    local.write_text(_login("r1"))
+    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_HOME,CODEX_API_KEY")
+    monkeypatch.setenv("FAKE_CLAUDE_CODEX_LOGIN", "")
+    assert cli.main(["run", "x", "-C", app]) == 0
+    recorded = json.loads((env / "args.json").read_text())
+    codex_home = env / "server-home" / ".coliday" / "jobs" / "1" / "codex-home"
+    assert recorded["env"] == {"CODEX_HOME": str(codex_home), "CODEX_API_KEY": None}
+    assert recorded["codex_login"] == {"text": _login("r1"), "mode": "0o600"}   # 실행하는 동안만, 본인만 읽게 둔다
+    assert not codex_home.exists() and local.read_text() == _login("r1")        # 끝나면 지우고, 갱신이 없었으면 그대로
+    assert "r1" not in (env / "ssh.jsonl").read_text()                          # 명령 인자에는 넣지 않는다
+    assert any("이 컴퓨터의 Codex 로그인으로" in e.message for e in _store().events(1))
+
+    monkeypatch.setenv("FAKE_CLAUDE_CODEX_LOGIN", _login("r2"))                 # 서버의 codex 가 로그인을 갱신했다
+    assert cli.main(["continue", "1", "한 번 더"]) == 0
+    assert local.read_text() == _login("r2") and local.stat().st_mode & 0o777 == 0o600   # 이 컴퓨터에 반영한다
+    assert not codex_home.exists()
+    assert any("갱신된 Codex 로그인" in e.message for e in _store().events(1))
+
+    # 그 사이 이 컴퓨터에서도 갱신됐으면 (보낸 것과 달라졌으면) 덮어쓰지 않는다
+    local.write_text(_login("r9"))
+    assert not auth.restore_codex_login(_login("r2"), _login("r3")) and local.read_text() == _login("r9")
+    assert not auth.restore_codex_login(_login("r9"), "") and local.read_text() == _login("r9")   # 서버에서 못 읽어 왔다
+
+
+def test_API_키가_있거나_로그인이_없으면_codex_로그인을_서버에_두지_않는다(env, app, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_HOME")
+    local_home = os.environ["CODEX_HOME"]
+    assert cli.main(["run", "x", "-C", app]) == 0                               # 이 컴퓨터에 Codex 로그인이 없다
+    assert json.loads((env / "args.json").read_text())["env"] == {"CODEX_HOME": local_home}   # 서버 쪽 값을 바꾸지 않는다
+    assert any("이 컴퓨터에 Codex 로그인이 없어" in e.message for e in _store().events(1))
+
+    local = env / "local-codex" / "auth.json"
+    local.parent.mkdir()
+    local.write_text(_login("r1"))
+    auth.save(config.load(), auth.CODEX, "sk-proj-codexkey1234567890")          # API 키를 등록했으면 그쪽을 쓴다
+    assert cli.main(["run", "x", "-C", app]) == 0
+    assert json.loads((env / "args.json").read_text())["env"] == {"CODEX_HOME": local_home}
+    assert not (env / "server-home" / ".coliday" / "jobs" / "2" / "codex-home").exists()
+
+    local.write_text("{broken")                                                 # 깨진 파일은 넘기지 않는다
+    assert auth.codex_login() is None
+    assert not auth.restore_codex_login(_login("r1"), "not json") and local.read_text() == "{broken"

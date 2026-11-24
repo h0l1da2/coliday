@@ -244,8 +244,13 @@ TUI 에서는 `ctrl+g` 창 맨 위에서 "이 컴퓨터의 폴더" 대신 "SSH �
   2. TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 **Claude 토큰** 칸에 넣는다. CLI 는 `coliday auth set` (값을 물어본다. 입력은 보이지 않는다),
      또는 `coliday project add dev@build-server:/srv/shop --token`.
   - 한 번 등록하면 모든 서버 프로젝트에 쓴다 (다음부터 토큰 칸은 비워 둬도 된다). `coliday auth` 로 상태를 보고 `coliday auth rm` 으로 지운다.
-  - Codex 팀원을 서버에서 쓰려면 **Codex API 키** 칸(또는 `coliday auth set codex`)에 OpenAI API 키를 넣는다. `CODEX_API_KEY` 로 넘긴다.
-    넣지 않으면 서버의 `codex` 는 그 서버의 로그인을 쓴다 (서버에 `codex` 가 없으면 Claude 로 대신 실행).
+  - Codex 팀원은 **이 컴퓨터의 Codex 로그인**(`~/.codex/auth.json`)으로 실행한다. Codex 에는 넘길 수 있는 토큰이 따로 없어, 그 파일을
+    서버의 `~/.coliday/jobs/<id>/codex-home` 에 본인만 읽게 복사해 쓰고 실행이 끝날 때마다 지운다 (취소·삭제할 때도 지운다).
+    서버의 codex 가 그동안 로그인을 갱신했으면 이 컴퓨터의 파일에 반영한다 (아니면 이 컴퓨터의 codex 가 다시 로그인하라고 한다).
+    연결이 끊겨 반영하지 못했거나, 같은 로그인으로 서버 작업과 이 컴퓨터의 codex 를 동시에 오래 돌리면 한쪽 로그인이 풀릴 수 있다:
+    그때는 `codex login` 을 다시 한다.
+  - 로그인 대신 OpenAI API 키를 쓰려면 **Codex API 키** 칸(또는 `coliday auth set codex`)에 넣는다. `CODEX_API_KEY` 로 넘기고 로그인 파일은 복사하지 않는다.
+    둘 다 없으면 서버의 `codex` 는 그 서버의 로그인을 쓴다 (서버에 `codex` 가 없으면 Claude 로 대신 실행).
   - 값은 이 컴퓨터의 `~/.coliday/.env.auth` 에만 저장한다 (본인만 읽는 파일). 서버에는 ssh 의 표준 입력으로 보내 `claude` 프로세스의
     환경변수(`CLAUDE_CODE_OAUTH_TOKEN`, Anthropic API 키면 `ANTHROPIC_API_KEY`)로만 두고, 명령 인자나 서버의 디스크에는 남기지 않는다.
   - 실행 중에는 서버의 그 프로세스 환경에 있으므로, 서버의 root 나 같은 계정을 쓰는 사람은 볼 수 있다. 믿는 서버에서만 쓴다.

@@ -142,7 +142,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     au.add_argument("action", nargs="?", choices=["set", "rm"], help="set: 등록 (값을 물어본다) / rm: 지우기. 생략하면 상태 보기")
     au.add_argument("kind", nargs="?", choices=list(auth.KINDS),
-                    help="claude(기본): claude setup-token 이 준 토큰 / codex: OpenAI API 키 (서버에서 Codex 팀원을 쓸 때만). rm 은 생략하면 전부")
+                    help="claude(기본): claude setup-token 이 준 토큰 / codex: OpenAI API 키 (이 컴퓨터의 Codex 로그인 대신 쓸 때만). rm 은 생략하면 전부")
     au.set_defaults(func=_cmd_auth)
 
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
@@ -451,7 +451,8 @@ def _cmd_auth(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
         elif kind == auth.CLAUDE:
             print(f"claude: 없음 — 서버의 프로젝트에서 작업할 수 없습니다. {auth.HOW_TO}.")
         else:
-            print("codex: 없음 — 서버의 codex 는 그 서버의 로그인을 씁니다 (등록: coliday auth set codex).")
+            source = "이 컴퓨터의 Codex 로그인" if auth.codex_login() else "그 서버의 로그인 (이 컴퓨터에 Codex 로그인이 없습니다)"
+            print(f"codex: API 키 없음 — 서버의 codex 는 {source}을 씁니다 (API 키 등록: coliday auth set codex).")
     return 0
 
 

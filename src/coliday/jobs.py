@@ -612,6 +612,7 @@ def cancel(store: Store, job: Job) -> bool:
     return True
 
 
+REMOTE_CODEX_HOME = "codex-home"  # 작업 폴더 아래, 이 컴퓨터의 Codex 로그인을 잠깐 두는 곳 (worker 가 실행이 끝나면 지운다)
 REMOTE_JOBS = '"$HOME"/.coliday/jobs'  # 서버 셸에서 풀리는 경로 (접속하지 않고도 명령을 만들 수 있게)
 
 
@@ -621,7 +622,7 @@ def stop_script(job_id: int) -> str:
     return (
         f'p=$(cat {pid_file} 2>/dev/null) && [ -n "$p" ] && '
         '{ pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; }; '
-        f"rm -f {pid_file}"
+        f"rm -rf {pid_file} {REMOTE_JOBS}/{job_id}/{REMOTE_CODEX_HOME}"  # 취소하면 worker 가 지울 틈이 없다
     )
 
 

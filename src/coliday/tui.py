@@ -169,12 +169,12 @@ class AddProjectScreen(ModalScreen[tuple[str, str, str, dict[str, str]] | None])
                     )
                     yield Input(
                         password=True, id="codex-key",
-                        placeholder=f"Codex API 키 ({kept if auth.CODEX in self._registered else '선택'})",
+                        placeholder=f"Codex API 키 ({kept if auth.CODEX in self._registered else '비우면 이 컴퓨터의 로그인'})",
                     )
             yield Input(value=self._name, placeholder="이름 (비우면 폴더 이름)", id="name")
             yield Label("에이전트가 그 서버에서 실행된다 (서버에 git 과 claude 설치 필요). 서버에서는 로그인하지 않는다: "
                         "이 컴퓨터의 터미널에서 `claude setup-token` 을 실행해 받은 토큰을 Claude 토큰 칸에 넣는다. "
-                        "Codex API 키는 서버에서 Codex 팀원을 쓸 때만 넣는다 (OpenAI API 키). "
+                        "Codex 팀원은 이 컴퓨터의 Codex 로그인으로 실행한다 (API 키 칸은 로그인 대신 OpenAI API 키를 쓸 때만). "
                         "비밀번호는 한 번만 써서 SSH 키를 서버에 등록하고 저장하지 않는다.",
                         classes="hint", id="ssh-hint")
             yield Label("Enter 로 저장, Tab 으로 칸 이동, Esc 로 닫기", classes="hint")
