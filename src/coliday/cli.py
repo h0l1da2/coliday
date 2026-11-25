@@ -12,7 +12,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import auth, config, gitops, jobs, members, projects, remote, team, worker
+from coliday import config, gitops, jobs, members, projects, remote, team, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="coliday",
         description="팀장 에이전트에게 일을 시키고 진행 상황을 본다. 인자 없이 실행하면 TUI 를 연다.",
     )
-    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,env,auth,project,model,team,prompt,ls,show,diff,open,cancel,rm,update}")
+    sub = p.add_subparsers(dest="cmd", metavar="{ui,run,continue,env,project,model,team,prompt,ls,show,diff,open,cancel,rm,update}")
 
     sub.add_parser("ui", help="TUI 열기 (인자 없이 실행한 것과 같다)")
 
@@ -84,8 +84,6 @@ def _parser() -> argparse.ArgumentParser:
     proj.add_argument("--port", help="add: 서버의 SSH 포트 (기본 22). user@host:2222:/경로 로 써도 된다")
     proj.add_argument("--password", action="store_true",
                       help="add: 서버 비밀번호를 물어 이 컴퓨터의 SSH 키를 서버에 등록한다 (키 인증이 안 돼 있을 때. 비밀번호는 저장하지 않는다)")
-    proj.add_argument("--token", action="store_true",
-                      help="add: 서버의 claude 에 넘겨 줄 토큰을 물어 등록한다 (`claude setup-token` 이 준 값. coliday auth set 과 같다)")
     proj.set_defaults(func=_cmd_project)
 
     model = sub.add_parser("model", help="기본 에이전트와 팀장·팀원의 에이전트·모델 보기/바꾸기 (다음 실행부터 적용)")
@@ -134,16 +132,6 @@ def _parser() -> argparse.ArgumentParser:
     envp.add_argument("id", type=int)
     envp.add_argument("action", nargs="?", choices=["allow", "deny"], help="생략하면 지금 상태 보기")
     envp.set_defaults(func=_cmd_env)
-
-    au = sub.add_parser(
-        "auth", help="서버의 claude·codex 에 넘겨 줄 인증 등록 (서버에서는 로그인하지 않는다)",
-        description="이 컴퓨터의 터미널에서 `claude setup-token` 으로 받은 토큰을 등록해 두면, 서버의 프로젝트에서 작업할 때 "
-                    "그 서버의 claude 에 넘긴다 (서버 작업에는 꼭 있어야 한다). 값은 이 컴퓨터에만 저장하고 서버의 디스크에는 쓰지 않는다.",
-    )
-    au.add_argument("action", nargs="?", choices=["set", "rm"], help="set: 등록 (값을 물어본다) / rm: 지우기. 생략하면 상태 보기")
-    au.add_argument("kind", nargs="?", choices=list(auth.KINDS),
-                    help="claude(기본): claude setup-token 이 준 토큰 / codex: OpenAI API 키 (이 컴퓨터의 Codex 로그인 대신 쓸 때만). rm 은 생략하면 전부")
-    au.set_defaults(func=_cmd_auth)
 
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
     cancel.add_argument("id", type=int)
@@ -265,12 +253,7 @@ def _cmd_project(cfg: config.Config, store: Store, args: argparse.Namespace) -> 
                 raise JobError(str(exc)) from exc
         if args.password and host is not None:
             password = getpass.getpass(f"{remote.split(directory)[0]} 의 비밀번호: ")
-        tokens = {}
-        if args.token and host is not None:
-            if sys.stdin.isatty():
-                print(f"{auth.SETUP}.")
-            tokens[auth.CLAUDE] = _ask_secret(auth.CLAUDE)
-        path = jobs.add_project(cfg, store, directory, args.name, password, tokens)
+        path = jobs.add_project(cfg, store, directory, args.name, password)
         print(f"연결했습니다: {jobs.project_names(cfg, store)[path]}  {path}")
         return 0
     if args.action == "rm":
@@ -412,47 +395,6 @@ def _cmd_env(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
         print(f"작업 #{job.id} 의 .env 읽기: {state}")
         return 0
     print(jobs.set_env_access(cfg, store, job.id, args.action == "allow"))
-    return 0
-
-
-def _ask_secret(kind: str) -> str:
-    """값은 명령 인자로 받지 않는다 (셸 기록과 `ps` 에 남는다). 터미널이면 보이지 않게 묻고, 아니면 표준 입력에서 한 줄 읽는다."""
-    if not sys.stdin.isatty():
-        return sys.stdin.readline()
-    source = "`claude setup-token` 이 준 값" if kind == auth.CLAUDE else "OpenAI API 키"
-    return getpass.getpass(f"{auth.LABEL[kind]} ({source}, 입력은 보이지 않습니다): ")
-
-
-def _save_secret(cfg: config.Config, kind: str, secret: str) -> None:
-    try:
-        auth.save(cfg, kind, secret)
-    except auth.AuthError as exc:
-        raise JobError(str(exc)) from exc
-    except OSError as exc:
-        raise JobError(f"인증을 저장하지 못했습니다: {exc}") from exc
-
-
-def _cmd_auth(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
-    if args.action == "set":
-        kind = args.kind or auth.CLAUDE
-        if kind == auth.CLAUDE and sys.stdin.isatty():
-            print(f"{auth.SETUP}.")
-        secret = _ask_secret(kind)
-        _save_secret(cfg, kind, secret)
-        print(f"등록했습니다: {auth.describe(kind, secret.strip())}. 서버의 프로젝트에서 작업할 때 그 서버의 {kind} 에 넘깁니다.")
-        return 0
-    if args.action == "rm":
-        print("등록한 인증을 지웠습니다." if auth.clear(cfg, args.kind) else "등록한 인증이 없습니다.")
-        return 0
-    for kind in auth.KINDS:
-        secret = auth.get(cfg, kind)
-        if secret:
-            print(f"{kind}: 등록됨 — {auth.describe(kind, secret)} → 서버에 {auth.env_name(kind, secret)} 로 넘깁니다.")
-        elif kind == auth.CLAUDE:
-            print(f"claude: 없음 — 서버의 프로젝트에서 작업할 수 없습니다. {auth.HOW_TO}.")
-        else:
-            source = "이 컴퓨터의 Codex 로그인" if auth.codex_login() else "그 서버의 로그인 (이 컴퓨터에 Codex 로그인이 없습니다)"
-            print(f"codex: API 키 없음 — 서버의 codex 는 {source}을 씁니다 (API 키 등록: coliday auth set codex).")
     return 0
 
 

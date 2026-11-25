@@ -110,7 +110,6 @@ coliday ls                            # 작업 목록 (텍스트)
 coliday show 3 -f                     # 작업 3 타임라인 따라보기
 coliday diff 3                        # 작업 3 이 만든 코드 변경
 coliday open 3                        # 작업 3 이 남긴 결과물(스크린샷·영상) 폴더 열기
-coliday auth set                      # 서버의 claude 에 넘겨 줄 인증 등록 (아래 "서버의 프로젝트")
 coliday cancel 3                      # 취소
 coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 worktree·브랜치 (변경이 남아 있으면 --force 필요)
 ```
@@ -133,7 +132,6 @@ coliday rm 3                          # 끝난 작업 삭제: 목록·기록과 
 | `COLIDAY_OPEN_BIN` | `open` (macOS) / `xdg-open` | 결과물 폴더를 여는 명령 |
 | `COLIDAY_NO_UPDATE_CHECK` | (없음) | 값을 주면 새 버전 확인과 알림을 끈다 |
 | `COLIDAY_SSH_BIN` | `ssh` | 서버의 프로젝트에 접속하는 명령 |
-| `COLIDAY_REMOTE_CLAUDE_BIN` / `COLIDAY_REMOTE_CODEX_BIN` | `claude` / `codex` | 서버에서 실행할 에이전트 CLI |
 | `COLIDAY_MAX_ATTEMPTS` | `5` | 실패한 작업을 처음 포함해 몇 번까지 시도할지 (1 이상의 정수) |
 
 어떤 작업(빌드, 테스트, 재작업 등)이 실패하면 팀원과 팀장은 같은 작업을 최대 `COLIDAY_MAX_ATTEMPTS` 번까지만 시도한다.
@@ -214,7 +212,7 @@ coliday env 12 allow      # 이 작업(세션)에만 허용. deny 로 다시 막
 - Codex 는 권한 프로필에서 `.env*` 를 읽지 못하게 둔다.
 - 막을 수 없는 환경이면 막지 않은 채 돌리지 않고 시작 전에 알린다: `claude` 2.1.325 미만, `codex` 0.171.0 미만(팀장일 때),
   리눅스에 `bubblewrap`·`socat` 이 없을 때. (Codex 팀원은 버전이 낮으면 Claude 로 돌린다.)
-- 이 컴퓨터(macOS)에서는 디스크 어디에 있든 막고, 서버에서는 작업 디렉토리와 원래 레포 아래만 막는다.
+- 이 컴퓨터의 파일만 막는다. 서버의 프로젝트(SSH)에서는 서버에 있는 `.env` 를 막지 못한다 (에이전트가 ssh 로 서버의 명령을 실행하기 때문).
 - 막는 것은 이름이 `.env` 로 시작하는 파일뿐이다. `application-prod.yml` 같은 다른 비밀 파일은 막지 않는다. `.env.example` 도 함께 막힌다.
 - 샌드박스 밖에서 이미 돌고 있던 프로세스(예: 먼저 떠 있던 Gradle 데몬)가 읽는 것까지는 막지 못한다.
 
@@ -230,30 +228,19 @@ coliday run "주문 취소 API 추가" -C dev@build-server:/srv/shop
 ```
 
 TUI 에서는 `ctrl+g` 창 맨 위에서 "이 컴퓨터의 폴더" 대신 "SSH 로 접속하는 서버의 폴더"를 고른다. 그러면 서버(`dev@build-server`),
-포트(비우면 22), 서버의 폴더, 비밀번호, Claude 토큰, Codex API 키 칸이 나온다.
+포트(비우면 22), 서버의 폴더, 비밀번호 칸이 나온다.
 
-에이전트가 **서버에서** 실행된다: 코드 수정·빌드·테스트가 모두 서버에서 돌고, 이 컴퓨터의 coliday 는 ssh 로 명령을 보내고
-진행 상황을 받아 온다. 작업 목록·타임라인·diff·이어서 시키기·취소·삭제는 로컬 프로젝트와 같다.
+에이전트(`claude`, `codex`)는 **이 컴퓨터에서** 실행되고, SSH 로 서버의 파일을 읽고 고치고 명령을 실행한다.
+빌드·테스트·서비스 확인은 서버에서 돈다. 작업 목록·타임라인·diff·이어서 시키기·취소·삭제는 로컬 프로젝트와 같다.
 
-- 서버에는 coliday 를 설치하지 않는다. `git` 과 `claude` 만 설치돼 있으면 된다 (로그인은 필요 없다: 아래처럼 이 컴퓨터에서 받은 토큰을 넘긴다).
-  `codex` 는 없어도 된다: 없으면 Codex 로 두었던 팀원(기본 팀의 codex-coder 포함)을 Claude 로 실행하고 타임라인에 알린다.
-  PATH 밖에 있으면 `COLIDAY_REMOTE_CLAUDE_BIN` / `COLIDAY_REMOTE_CODEX_BIN` 으로 경로를 준다.
-- 서버의 `claude` 에는 로그인하지 않는다. 이 컴퓨터에서 받은 토큰을 등록해 두면 서버의 작업을 시작할 때마다 그 서버의 `claude` 에 넘긴다.
-  토큰이 없으면 서버의 작업은 시작되지 않는다.
-  1. 이 컴퓨터의 터미널에서 `claude setup-token` 을 실행해 토큰을 받는다.
-  2. TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 **Claude 토큰** 칸에 넣는다. CLI 는 `coliday auth set` (값을 물어본다. 입력은 보이지 않는다),
-     또는 `coliday project add dev@build-server:/srv/shop --token`.
-  - 한 번 등록하면 모든 서버 프로젝트에 쓴다 (다음부터 토큰 칸은 비워 둬도 된다). `coliday auth` 로 상태를 보고 `coliday auth rm` 으로 지운다.
-  - Codex 팀원은 **이 컴퓨터의 Codex 로그인**(`~/.codex/auth.json`)으로 실행한다. Codex 에는 넘길 수 있는 토큰이 따로 없어, 그 파일을
-    서버의 `~/.coliday/jobs/<id>/codex-home` 에 본인만 읽게 복사해 쓰고 실행이 끝날 때마다 지운다 (취소·삭제할 때도 지운다).
-    서버의 codex 가 그동안 로그인을 갱신했으면 이 컴퓨터의 파일에 반영한다 (아니면 이 컴퓨터의 codex 가 다시 로그인하라고 한다).
-    연결이 끊겨 반영하지 못했거나, 같은 로그인으로 서버 작업과 이 컴퓨터의 codex 를 동시에 오래 돌리면 한쪽 로그인이 풀릴 수 있다:
-    그때는 `codex login` 을 다시 한다.
-  - 로그인 대신 OpenAI API 키를 쓰려면 **Codex API 키** 칸(또는 `coliday auth set codex`)에 넣는다. `CODEX_API_KEY` 로 넘기고 로그인 파일은 복사하지 않는다.
-    둘 다 없으면 서버의 `codex` 는 그 서버의 로그인을 쓴다 (서버에 `codex` 가 없으면 Claude 로 대신 실행).
-  - 값은 이 컴퓨터의 `~/.coliday/.env.auth` 에만 저장한다 (본인만 읽는 파일). 서버에는 ssh 의 표준 입력으로 보내 `claude` 프로세스의
-    환경변수(`CLAUDE_CODE_OAUTH_TOKEN`, Anthropic API 키면 `ANTHROPIC_API_KEY`)로만 두고, 명령 인자나 서버의 디스크에는 남기지 않는다.
-  - 실행 중에는 서버의 그 프로세스 환경에 있으므로, 서버의 root 나 같은 계정을 쓰는 사람은 볼 수 있다. 믿는 서버에서만 쓴다.
+- 서버에는 아무것도 설치하지 않는다 (`claude`·`codex`·coliday 모두 필요 없다. git 저장소면 `git` 만). 로그인도 이 컴퓨터의 것을 그대로 쓴다.
+- 에이전트는 작업마다 만들어 주는 실행 파일 세 개로 서버를 다룬다 (`~/.coliday/jobs/<id>/server/`):
+  `server '<명령>'`(서버의 프로젝트 폴더에서 실행), `server-pull <경로>`(파일을 이 컴퓨터의 작업 폴더 `jobs/<id>/work` 로 가져오기),
+  `server-push <경로>`(고친 파일을 서버에 올리기). 이 파일들만 권한 검사와 샌드박스를 거치지 않고 실행된다.
+- 팀장과 팀원 모두 Claude·Codex 어느 쪽으로든 둘 수 있다 (로컬 프로젝트와 같다).
+- **서버의 `.env` 는 막지 못한다**: 에이전트가 서버에서 명령을 실행할 수 있어서 서버의 어떤 파일이든 읽을 수 있다 (접속 계정의 권한 안에서).
+  이 컴퓨터의 `.env` 는 로컬 프로젝트와 똑같이 막는다.
+- 에이전트는 접속 계정의 권한으로 서버에서 무엇이든 실행할 수 있다. 권한이 좁은 계정으로 접속하는 편이 안전하다.
 - 키 인증으로 접속돼야 한다. 백그라운드에서 실행하므로 비밀번호나 호스트 키 확인을 물을 수 없다.
   먼저 터미널에서 `ssh dev@build-server` 가 아무것도 묻지 않고 되는지 확인한다. 포트·키·점프 호스트는 `~/.ssh/config` 를 따른다.
 - 키 인증이 안 돼 있으면 프로젝트를 추가할 때 서버 비밀번호를 준다: TUI 는 `ctrl+g` 창에서 SSH 를 고르면 나오는 비밀번호 칸, CLI 는
@@ -261,10 +248,10 @@ TUI 에서는 `ctrl+g` 창 맨 위에서 "이 컴퓨터의 폴더" 대신 "SSH �
   그 비밀번호로 **한 번만** 접속해 이 컴퓨터의 SSH 공개키를 서버의 `~/.ssh/authorized_keys` 에 등록하고, 그 뒤로는 키로 접속한다.
   비밀번호는 저장하지 않는다. 이 컴퓨터에 SSH 키가 없으면 `~/.ssh/id_ed25519` 를 새로 만든다 (암호 없음).
   이미 키로 접속되는 서버면 아무것도 바꾸지 않는다. 처음 접속하는 서버의 호스트 키는 이때 묻지 않고 받아들인다.
-- worktree 는 서버의 `~/.coliday/worktrees/<레포>-<id>` 에, 브랜치 `coliday/<id>` 로 만든다.
-  결과물(스크린샷·영상)은 서버의 `~/.coliday/jobs/<id>/artifacts` 에 쌓이고 실행이 끝날 때마다 이 컴퓨터로 가져온다.
-- 팀장은 Claude 여야 한다 (Codex 팀장은 팀원에게 맡기는 데 coliday 가 필요해 서버에서는 쓸 수 없다). 팀원은 Codex 로 둘 수 있다.
-- 실행 중에 이 컴퓨터가 잠들거나 연결이 끊기면 그 작업은 실패로 끝나고 서버의 에이전트를 멈춘다. 코드 변경은 서버의 worktree 에 남으니 이어서 시키면 된다.
+- worktree 는 서버의 `~/.coliday/worktrees/<레포>-<id>` 에, 브랜치 `coliday/<id>` 로 만든다. git 저장소가 아닌 폴더(배포 폴더 등)는
+  물어본 뒤 그 폴더에서 직접 작업한다. 결과물(스크린샷·영상)은 이 컴퓨터의 `~/.coliday/jobs/<id>/artifacts` 에 쌓인다.
+- 실행 중에 연결이 끊기면 에이전트의 서버 명령이 실패한다 (에이전트 자체는 이 컴퓨터에서 계속 돈다). 취소하면 이 컴퓨터의
+  에이전트는 바로 멈추지만, 그때 서버에서 돌던 명령은 끝날 때까지 남을 수 있다.
 - 여러 컴퓨터가 같은 서버의 같은 레포에 작업을 만들면 작업 번호(브랜치 이름)가 겹쳐 worktree 생성이 실패할 수 있다.
 
 ## 팀원과 프롬프트 바꾸기
@@ -330,7 +317,6 @@ TUI 에서는 `ctrl+p` 창에서 같은 일을 한다.
 
 - `~/.coliday/jobs.db`: 작업·이벤트 (SQLite)
 - `~/.coliday/projects.json`: 연결된 프로젝트 디렉토리, `models.json`: 모델 설정, `team.json`: 바꾼 팀원 구성·프롬프트
-- `~/.coliday/.env.auth`: 서버의 `claude`·`codex` 에 넘겨 줄 인증 (등록했을 때만)
 - `~/.coliday/jobs/<id>/stream.jsonl`: 팀장 원본 이벤트, `stderr.log`, `worker.log`, `artifacts/`(결과물)
 
 ## 개발

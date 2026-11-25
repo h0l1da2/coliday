@@ -9,8 +9,9 @@ import json, os, subprocess, sys
 args = sys.argv[1:]
 options = []
 while args and args[0].startswith("-"):
-    options += args[:2]
-    args = args[2:]  # 테스트 대상은 `-o 값` 꼴 옵션만 쓴다
+    width = 1 if args[0] == "-N" else 2  # -N(명령 없이 연결만 열어 둔다) 말고는 `-o 값` 꼴 옵션만 쓴다
+    options += args[:width]
+    args = args[width:]
 host, command = args[0], " ".join(args[1:])
 log = os.environ.get("FAKE_SSH_LOG")
 if log:

@@ -35,6 +35,12 @@ LEAD_RULE = (
     f"- 그 내용 없이는 더 진행할 수 없으면 거기서 멈추고, 보고 맨 위에 \"{NEED_MARKER}\" 라고 쓴 뒤 "
     "어떤 파일의 무엇이 왜 필요한지 적는다. 사람이 허용하면 이어서 진행하라는 요청이 온다.\n"
 )
+LOCAL_ONLY_RULE = (
+    "\n## .env 파일\n"
+    "이 컴퓨터에 있는 이름이 .env 로 시작하는 파일은 읽을 수 없다 (사람이 허용하지 않았다). 서버의 프로젝트와 상관없는 "
+    "이 컴퓨터의 파일이니 읽으려 하지 않는다. 서버의 .env 를 가져와(server-pull) 읽으려 해도 막히므로, "
+    "꼭 필요하면 서버에서 직접 본다.\n"
+)
 ALLOWED_NOTE = "사람이 이 작업에서 .env 파일 읽기를 허용했습니다. .env 를 읽지 못해 멈췄거나 건너뛴 일이 있으면 이어서 진행하세요."
 _BLOCKED_SIGNS = ("Operation not permitted", "denied by your permission settings", "Permission denied")
 
@@ -105,18 +111,30 @@ class EnvGuard:
             ensure_ascii=False,
         )
 
-    def codex_args(self, sandbox: str, writable: list[str] | tuple[str, ...] = ()) -> list[str]:
+    def codex_args(self, sandbox: str, writable: list[str] | tuple[str, ...] = (), *, network: bool = False) -> list[str]:
         """`codex exec` 에 줄 권한 프로필. `-s <샌드박스>` 와 쓰기 폴더 옵션을 대신한다."""
-        filesystem: dict = {
-            ":root": "read",
-            ":tmpdir": "write",
-            ":project_roots": {".": "write" if sandbox == "workspace-write" else "read", f"**/{PATTERN}": "none"},
-        }
-        if sandbox == "workspace-write":
-            filesystem.update({path: "write" for path in writable})
-        filesystem.update({glob: "none" for glob in self.globs})
+        return codex_profile(sandbox, writable, deny=self.globs, network=network)
+
+
+def codex_profile(
+    sandbox: str, writable: list[str] | tuple[str, ...] = (), *, deny: list[str] | tuple[str, ...] = (),
+    network: bool = False,
+) -> list[str]:
+    """Codex 권한 프로필 옵션. deny 는 읽지 못하게 할 경로(glob), network 는 명령이 네트워크를 쓸 수 있게 한다
+    (서버의 프로젝트를 ssh 로 다룰 때: `-s workspace-write` 로는 읽기 전용 역할에 네트워크만 열 수 없다)."""
+    roots: dict = {".": "write" if sandbox == "workspace-write" else "read"}
+    if deny:
+        roots[f"**/{PATTERN}"] = "none"
+    filesystem: dict = {":root": "read", ":tmpdir": "write", ":project_roots": roots}
+    if sandbox == "workspace-write":
+        filesystem.update({path: "write" for path in writable})
+    filesystem.update({glob: "none" for glob in deny})
+    if deny:
         filesystem["glob_scan_max_depth"] = _GLOB_DEPTH
-        return ["-c", f'default_permissions="{_PROFILE}"', "-c", f"permissions.{_PROFILE}.filesystem={_toml(filesystem)}"]
+    args = ["-c", f'default_permissions="{_PROFILE}"', "-c", f"permissions.{_PROFILE}.filesystem={_toml(filesystem)}"]
+    if network:
+        args += ["-c", f"permissions.{_PROFILE}.network={_toml({'enabled': True})}"]
+    return args
 
 
 def for_job(workdir: str, repo: str, home: str | None, *, local: bool) -> EnvGuard:

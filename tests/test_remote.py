@@ -1,4 +1,7 @@
-"""SSH 프로젝트. 가짜 ssh 가 받은 명령을 이 컴퓨터에서 실행한다 (서버의 홈은 따로 둔 폴더)."""
+"""SSH 프로젝트. 가짜 ssh 가 받은 명령을 이 컴퓨터에서 실행한다 (서버의 홈은 따로 둔 폴더).
+
+에이전트(가짜 claude·codex)는 이 컴퓨터에서 돌고, 서버는 작업마다 만들어 주는 실행 파일로 다룬다.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from coliday import auth, cli, config, gitops, jobs, remote
+from coliday import cli, config, gitops, jobs, remote, team
 from coliday.store import Store
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SRC = Path(__file__).parents[1] / "src"
 HOST = "dev@server"
-TOKEN = "sk-ant-oat01-" + "t0ken" * 8
 
 
 @pytest.fixture
@@ -31,17 +33,14 @@ def env(tmp_path, monkeypatch):
         script.chmod(0o755)
     (tmp_path / "server-home").mkdir()
     monkeypatch.setenv("COLIDAY_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "local-codex"))  # 이 컴퓨터의 진짜 Codex 로그인을 건드리지 않는다
-    monkeypatch.setenv("COLIDAY_CLAUDE_BIN", str(tmp_path / "no-local-claude"))  # 이 컴퓨터의 claude 는 쓰지 않는다
-    monkeypatch.setenv("COLIDAY_REMOTE_CLAUDE_BIN", str(tmp_path / "claude"))
-    monkeypatch.setenv("COLIDAY_REMOTE_CODEX_BIN", str(tmp_path / "codex"))
+    monkeypatch.setenv("COLIDAY_CLAUDE_BIN", str(tmp_path / "claude"))   # 에이전트는 이 컴퓨터의 claude·codex 다
+    monkeypatch.setenv("COLIDAY_CODEX_BIN", str(tmp_path / "codex"))
     monkeypatch.setenv("COLIDAY_SSH_BIN", str(tmp_path / "ssh"))
     monkeypatch.setenv("FAKE_SSH_HOME", str(tmp_path / "server-home"))
     monkeypatch.setenv("FAKE_SSH_LOG", str(tmp_path / "ssh.jsonl"))
     monkeypatch.setenv("FAKE_CLAUDE_ARGS", str(tmp_path / "args.json"))
     monkeypatch.setenv("PYTHONPATH", str(SRC) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     remote.home.cache_clear()
-    auth.save(config.load(), auth.CLAUDE, TOKEN)  # 서버 작업에는 넘겨 줄 토큰이 있어야 한다
     return tmp_path
 
 
@@ -88,61 +87,6 @@ def test_위치_문자열로_로컬과_서버를_구분한다():
         remote.normalize("server:relative/path")
 
 
-def test_서버의_프로젝트에서_실행하면_에이전트가_서버에서_돈다(env, app, monkeypatch, capsys):
-    monkeypatch.setenv("FAKE_CLAUDE_ARTIFACT", "login.png,notes/run.log")
-    monkeypatch.setenv("FAKE_CLAUDE_TOUCH", "created.txt")
-    assert cli.main(["run", "로그인 고쳐줘", "-C", app + "/sub"]) == 0
-
-    home = env / "server-home"
-    job = _store().get_job(1)
-    assert job.status == "succeeded" and job.repo == app
-    assert job.workdir == f"{HOST}:{home}/.coliday/worktrees/app-1/sub" and job.branch == "coliday/1"
-    worktree = home / ".coliday" / "worktrees" / "app-1"
-    assert (worktree / "sub" / "a.txt").is_file()                      # worktree 는 서버에 만든다
-    assert not (config.load().worktrees_dir / "app-1").exists()
-
-    recorded = json.loads((env / "args.json").read_text())
-    argv = recorded["argv"]
-    assert recorded["cwd"] == str(worktree / "sub") and recorded["stdin"] == "로그인 고쳐줘"
-    remote_job = home / ".coliday" / "jobs" / "1"
-    assert argv[argv.index("--agents") + 1] == str(remote_job / "agents.json")
-    assert "coder" in json.loads((remote_job / "agents.json").read_text())
-    assert argv[argv.index("--add-dir") + 1] == str(remote_job / "artifacts")
-    assert f"- 결과물 폴더: {remote_job / 'artifacts'}" in argv[argv.index("--append-system-prompt") + 1]
-    assert (remote_job / "pid").read_text().strip().isdigit()           # 취소할 때 쓸 프로세스 번호
-
-    calls = _ssh_calls(env)
-    assert calls and all(c["host"] == HOST for c in calls)
-    assert all("BatchMode=yes" in c["options"] for c in calls)           # 비밀번호를 묻느라 멈추지 않는다
-
-    # 결과물은 서버에서 가져와 이 컴퓨터의 폴더에서 본다 (정리까지 된다)
-    local = config.load().artifacts_dir(1)
-    assert (local / "login.png").read_bytes() == b"fake" and (local / "_other" / "notes" / "run.log").is_file()
-
-    capsys.readouterr()
-    assert cli.main(["diff", "1"]) == 0                                   # diff 도 서버에서 계산한다
-    assert "created.txt" in capsys.readouterr().out
-    cli.main(["ls"])
-    assert "app" in capsys.readouterr().out
-    assert jobs.list_projects(config.load(), _store()) == [app + "/sub"]  # 시작한 위치가 연결된다
-
-
-def test_서버_작업을_이어서_시키고_삭제하면_서버의_worktree도_지운다(env, app, monkeypatch, capsys):
-    cli.main(["run", "x", "-C", app])
-    monkeypatch.setenv("FAKE_CLAUDE_ARTIFACT", "second.png")
-    assert cli.main(["continue", "1", "더 해줘"]) == 0
-    argv = json.loads((env / "args.json").read_text())["argv"]
-    assert "--resume" in argv and _store().get_job(1).status == "succeeded"
-    assert (config.load().artifacts_dir(1) / "second.png").is_file()
-
-    home = env / "server-home"
-    assert cli.main(["rm", "1", "--force"]) == 0
-    assert not (home / ".coliday" / "worktrees" / "app-1").exists()
-    branches = subprocess.run(["git", "-C", remote.split(app)[1], "branch"], capture_output=True, text=True).stdout
-    assert "coliday/1" not in branches
-    _wait(lambda: not (home / ".coliday" / "jobs" / "1").exists())      # 서버에 둔 정의·결과물 원본도 치운다
-
-
 def test_프로젝트를_서버_위치로_연결한다(env, app, capsys):
     assert cli.main(["project", "add", app, "--name", "운영 서버"]) == 0
     link = env / "server-home" / "app"
@@ -175,97 +119,6 @@ def test_서버에_접속하지_못하면_이유를_알리고_작업을_만들�
     assert cli.main(["project", "rm", app]) == 0                          # 목록에서 빼는 것도 된다
     with pytest.raises(gitops.GitError):
         gitops.diff(app, None)
-
-
-def test_서버에서는_codex_팀장을_막고_claude가_없으면_알린다(env, app, monkeypatch, capsys):
-    assert cli.main(["run", "x", "-C", app, "--model", "codex"]) == 2
-    assert "SSH 프로젝트에서는 Codex 팀장을 쓸 수 없습니다" in capsys.readouterr().err
-    monkeypatch.setenv("COLIDAY_REMOTE_CLAUDE_BIN", "no-such-claude")
-    assert cli.main(["run", "x", "-C", app]) == 2
-    assert "no-such-claude 을(를) 찾을 수 없습니다" in capsys.readouterr().err
-    assert _store().list_jobs() == []
-
-    monkeypatch.setenv("COLIDAY_REMOTE_CLAUDE_BIN", str(env / "claude"))
-    cli.main(["model", "coder", "codex"])                                 # 팀원은 Codex 로 둘 수 있다: 서버의 codex 를 부른다
-    assert cli.main(["run", "x", "-C", app]) == 0
-    assert not any("codex 가 없어" in e.message for e in _store().events(1))
-    agents = json.loads((env / "server-home" / ".coliday" / "jobs" / "1" / "agents.json").read_text())
-    runner = env / "server-home" / ".coliday" / "jobs" / "1" / "codex" / "1-coder"   # 실행 파일도 서버에 둔다
-    assert f"{shlex.quote(str(runner))} <1에서 쓴 파일의 경로>" in agents["coder"]["prompt"] and os.access(runner, os.X_OK)
-    assert f"{shlex.quote(str(env / 'codex'))} exec -C" in runner.read_text()
-    assert str(env / "server-home" / ".coliday" / "jobs" / "1" / "artifacts") in runner.read_text()
-    argv = json.loads((env / "args.json").read_text())["argv"]
-    assert argv[argv.index("--allowedTools") + 1] == f"Bash({shlex.quote(str(runner))}:*)"
-    tasks = runner.parent.parent / "codex-tasks"                          # 명세를 쓸 폴더도 서버에 만들고 열어 둔다
-    assert tasks.is_dir() and str(tasks) in [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
-
-
-def test_취소하면_서버의_에이전트도_끝낸다(env, app):
-    job_dir = env / "server-home" / ".coliday" / "jobs" / "7"
-    job_dir.mkdir(parents=True)
-    agent = subprocess.Popen(["sleep", "60"])
-    try:
-        (job_dir / "pid").write_text(f"{agent.pid}\n")
-        remote.spawn(HOST, jobs.stop_script(7))
-        assert agent.wait(timeout=10) != 0
-        _wait(lambda: not (job_dir / "pid").exists())
-    finally:
-        agent.kill()
-
-
-def test_실행_중인_서버_작업을_취소한다(env, app, monkeypatch):
-    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
-    assert cli.main(["run", "x", "-C", app, "-d"]) == 0
-    _wait(lambda: (env / "args.json").exists())
-    pid = json.loads((env / "args.json").read_text())["pid"]
-    assert cli.main(["cancel", "1"]) == 0
-    _wait(lambda: not jobs.alive(pid))
-    assert _store().get_job(1).status == "cancelled"
-    _wait(lambda: any("kill -TERM" in c["command"] for c in _ssh_calls(env)))   # 서버의 프로세스도 직접 끝낸다
-
-
-def test_결과물을_가져올_때_링크는_따라가지_않는다(env, tmp_path):
-    source = env / "server-home" / "art"
-    source.mkdir()
-    (source / "ok.png").write_bytes(b"img")
-    (source / "secret").symlink_to("/etc/passwd")
-    target = tmp_path / "fetched"
-    target.mkdir()
-    assert remote.fetch_dir(HOST, str(source), target) == 1
-    assert sorted(p.name for p in target.iterdir()) == ["ok.png"]
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    assert remote.fetch_dir(HOST, "/no/such/dir", empty) == 0 and list(empty.iterdir()) == []
-
-
-def test_서버의_결과물_경로는_이_컴퓨터에서_풀지_않는다(tmp_path):
-    from coliday import team
-    link = tmp_path / "link"
-    link.symlink_to(tmp_path)   # 이 컴퓨터에서는 링크인 경로가 서버에서는 진짜 폴더일 수 있다 (macOS 의 /var 처럼)
-    path = f"{link}/jobs/1/artifacts"
-
-    def roots(**kw):
-        return json.loads(team.codex_writable_roots(path, **kw)[1].split("=", 1)[1])
-
-    assert roots(local=False) == [path]
-    assert roots() == [str(tmp_path.resolve() / "jobs" / "1" / "artifacts")]
-    resolved = team.resolve_agents(team.DEFAULT_AGENTS, team.Models(agents={"coder": "codex"}))
-    _, script = team.codex_runners(resolved, "codex", path, local=False)["coder"]
-    assert shlex.quote(team.codex_writable_roots(path, local=False)[1]) in script
-
-
-def test_서버에_codex가_없으면_codex_팀원을_claude로_돌린다(env, app, monkeypatch, capsys):
-    monkeypatch.setenv("COLIDAY_REMOTE_CODEX_BIN", "no-such-codex")
-    cli.main(["model", "reviewer", "codex:gpt-x"])
-    assert cli.main(["run", "x", "-C", app]) == 0                         # codex 가 없어도 시작되고 끝난다
-    agents = json.loads((env / "server-home" / ".coliday" / "jobs" / "1" / "agents.json").read_text())
-    for name in ("codex-coder", "reviewer"):                              # 기본 Codex 팀원과 직접 고른 팀원 모두
-        assert "model" not in agents[name] and "Codex CLI" not in agents[name]["prompt"], name
-    assert agents["codex-coder"]["prompt"].startswith("너는 시니어 개발자다")   # 역할 지침과 도구는 그대로
-    assert agents["codex-coder"]["tools"] == ["Read", "Grep", "Glob", "Edit", "Write", "Bash"]
-    assert agents["architect"]["model"] == "opus"                         # Claude 팀원은 건드리지 않는다
-    notes = [e.message for e in _store().events(1) if "codex 가 없어" in e.message]
-    assert notes == [f"{HOST} 에 codex 가 없어 codex-coder, reviewer 은(는) Claude 로 실행합니다"]
 
 
 @pytest.fixture
@@ -364,154 +217,140 @@ def test_포트가_있는_서버에도_비밀번호로_키를_등록한다(env, 
     assert any("PubkeyAuthentication=no" in c["options"] and c["options"][-2:] == ["-p", "2222"] for c in first)
 
 
-def test_서버에서도_기본으로_env_읽기를_막고_막을_수_없으면_알린다(env, app, monkeypatch, capsys):
-    monkeypatch.setattr(jobs, "_remote_is_linux", lambda host: False)     # 테스트의 "서버"는 이 컴퓨터다
+def _helper(job_id: int, name: str, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+    """에이전트가 하듯이 그 작업의 서버용 실행 파일을 실행한다."""
+    path = config.load().job_dir(job_id) / "server" / name
+    return subprocess.run([str(path), *args], input=stdin, capture_output=True, text=True, timeout=30)
+
+
+def test_서버의_프로젝트도_에이전트는_이_컴퓨터에서_돌고_실행_파일로_서버를_다룬다(env, app, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_ARTIFACT", "login.png,notes/run.log")
+    assert cli.main(["run", "로그인 고쳐줘", "-C", app + "/sub"]) == 0
+
+    home = env / "server-home"
+    cfg = config.load()
+    job = _store().get_job(1)
+    assert job.status == "succeeded" and job.repo == app
+    assert job.workdir == f"{HOST}:{home}/.coliday/worktrees/app-1/sub" and job.branch == "coliday/1"
+    worktree = home / ".coliday" / "worktrees" / "app-1"
+    assert (worktree / "sub" / "a.txt").is_file()                      # worktree 는 서버에 만든다
+    assert not (cfg.worktrees_dir / "app-1").exists()
+    assert not (home / ".coliday" / "jobs").exists()                    # 서버에 에이전트용 파일을 두지 않는다
+
+    work = cfg.job_dir(1) / "work"
+    recorded = json.loads((env / "args.json").read_text())
+    argv = recorded["argv"]
+    assert recorded["cwd"] == str(work) and recorded["stdin"] == "로그인 고쳐줘"    # 이 컴퓨터의 작업 폴더에서 돈다
+    paths = {name: str(cfg.job_dir(1) / "server" / name) for name in ("server", "server-pull", "server-push")}
+    allowed = argv[argv.index("--allowedTools") + 1:]
+    for path in paths.values():                                         # 그 실행 파일만 권한 검사·샌드박스 없이 실행된다
+        assert os.access(path, os.X_OK) and f"Bash({shlex.quote(path)}:*)" in allowed
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert {f"{shlex.quote(p)} *" for p in paths.values()} <= set(settings["sandbox"]["excludedCommands"])
+    lead = argv[argv.index("--append-system-prompt") + 1]
+    assert "## 서버의 프로젝트" in lead and f"서버 {HOST} 의 `{worktree / 'sub'}`" in lead and paths["server-pull"] in lead
+    assert "이 컴퓨터에 있는 이름이 .env 로 시작하는 파일" in lead         # 서버의 .env 는 막는다고 말하지 않는다
+    agents = json.loads((cfg.job_dir(1) / "agents.json").read_text())
+    # 팀원도 같은 방법을 안다 (Codex 팀원은 그 실행 파일 안의 역할 지침에 들어 있다)
+    assert "## 서버의 프로젝트" in agents["coder"]["prompt"] and "## 서버의 프로젝트" in agents["reviewer"]["prompt"]
+    assert "## 서버의 프로젝트" in (cfg.job_dir(1) / "codex" / "1-codex-coder").read_text()
+    events = [e.message for e in _store().events(1)]
+    assert any("이 컴퓨터의 에이전트가 SSH 로" in m for m in events) and any("서버의 파일은 막지 못합니다" in m for m in events)
+
+    # 실행 파일: 서버의 프로젝트 폴더에서 명령을 돌리고, 파일을 가져와 고쳐서 올린다
+    done = _helper(1, "server", "pwd; cat a.txt; echo \"it's $HOME\"")
+    assert done.returncode == 0 and done.stdout == f"{worktree / 'sub'}\na\nit's {home}\n"
+    assert _helper(1, "server", "exit 7").returncode == 7                # 서버 명령의 종료 코드가 그대로 온다
+    assert _helper(1, "server", "cat", stdin="표준 입력\n").stdout == "표준 입력\n"
+    assert _helper(1, "server-pull", "a.txt").returncode == 0 and (work / "a.txt").read_text() == "a\n"
+    (work / "a.txt").write_text("고쳤다\n")
+    (work / "새 폴더").mkdir()
+    (work / "새 폴더" / "it's new.txt").write_text("new\n")
+    assert _helper(1, "server-push", "a.txt", "새 폴더").returncode == 0
+    assert (worktree / "sub" / "a.txt").read_text() == "고쳤다\n"
+    assert (worktree / "sub" / "새 폴더" / "it's new.txt").read_text() == "new\n"
+    assert _helper(1, "server-pull", "새 폴더/it's new.txt").returncode == 0
+    for bad in ("/etc/passwd", "../x", "a/../../x", "-rf"):               # 프로젝트 폴더 밖은 받지 않는다
+        assert _helper(1, "server-pull", bad).returncode == 2 and _helper(1, "server-push", bad).returncode == 2
+    missing = _helper(1, "server-pull", "없는파일")
+    assert missing.returncode == 1 and "가져오지 못했습니다" in missing.stderr
+    assert _helper(1, "server").returncode == 2
+
+    calls = _ssh_calls(env)
+    assert calls and all(c["host"] == HOST for c in calls)
+    assert all("BatchMode=yes" in c["options"] for c in calls)           # 비밀번호를 묻느라 멈추지 않는다
+    assert any("-N" in c["options"] for c in calls)                      # 작업이 도는 동안 연결을 열어 둔다
+    assert (cfg.artifacts_dir(1) / "login.png").read_bytes() == b"fake"   # 결과물은 이 컴퓨터에 바로 쌓인다
+
+    capsys.readouterr()
+    assert cli.main(["diff", "1"]) == 0                                   # diff 는 서버에서 계산한다
+    assert "고쳤다" in capsys.readouterr().out
+    assert jobs.list_projects(cfg, _store()) == [app + "/sub"]           # 시작한 위치가 연결된다
+
+
+def test_서버_작업을_이어서_시키고_삭제하면_서버의_worktree도_지운다(env, app, monkeypatch, capsys):
+    cli.main(["run", "x", "-C", app])
+    assert cli.main(["continue", "1", "더 해줘"]) == 0
+    recorded = json.loads((env / "args.json").read_text())
+    assert "--resume" in recorded["argv"] and recorded["cwd"] == str(config.load().job_dir(1) / "work")
+    assert _store().get_job(1).status == "succeeded"
+
+    home = env / "server-home"
+    assert cli.main(["rm", "1", "--force"]) == 0
+    assert not (home / ".coliday" / "worktrees" / "app-1").exists()
+    branches = subprocess.run(["git", "-C", remote.split(app)[1], "branch"], capture_output=True, text=True).stdout
+    assert "coliday/1" not in branches
+
+
+def test_서버의_프로젝트에서도_codex_팀장과_팀원이_네트워크를_열고_이_컴퓨터에서_돈다(env, app, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CODEX_ARGS", str(env / "codex.jsonl"))
+    cli.main(["model", "coder", "codex"])
+    assert cli.main(["run", "x", "-C", app]) == 0                         # Claude 팀장 + Codex 팀원
+    cfg = config.load()
+    runner = (cfg.job_dir(1) / "codex" / "1-coder").read_text()
+    assert 'permissions.coliday.network={"enabled"=true}' in runner       # ssh 로 서버에 닿아야 한다
+    assert "## 서버의 프로젝트" in runner
+    argv = json.loads((env / "args.json").read_text())["argv"]
+    assert f"Bash({shlex.quote(str(cfg.job_dir(1) / 'codex' / '1-coder'))}:*)" in argv
+
+    assert cli.main(["run", "y", "-C", app, "--model", "codex"]) == 0     # Codex 팀장도 된다 (전부 이 컴퓨터에서 돈다)
+    lead = json.loads((env / "codex.jsonl").read_text().splitlines()[-1])
+    assert lead["cwd"] == str(cfg.job_dir(2) / "work")
+    assert 'permissions.coliday.network={"enabled"=true}' in lead["argv"]
+    assert "## 서버의 프로젝트" in lead["stdin"] and str(cfg.job_dir(2) / "server" / "server") in lead["stdin"]
+    assert _store().get_job(2).status == "succeeded"
+
+    # 읽기 전용 역할도 서버 작업에서는 작업 폴더(서버 파일을 가져다 보는 곳)에 쓸 수 있고, Bash 가 없던 역할은 Bash 를 받는다
+    resolved = team.for_server({"viewer": {"prompt": "본다", "tools": ["Read"]}, "any": {"prompt": "한다"}}, "\n## 서버의 프로젝트\n")
+    assert resolved["viewer"]["tools"] == ["Read", "Bash"] and "tools" not in resolved["any"]
+    assert team.codex_sandbox(resolved["viewer"]) == "read-only" and team.codex_sandbox(resolved["viewer"], True) == "workspace-write"
+    plain = team.codex_access("read-only", network=True)                  # .env 를 막지 않는 작업도 네트워크는 연다
+    assert 'permissions.coliday.network={"enabled"=true}' in plain and not any(".env" in part for part in plain)
+    assert team.codex_access("read-only") == ["-c", 'sandbox_mode="read-only"']
+
+
+def test_실행_중인_서버_작업을_취소한다(env, app, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+    assert cli.main(["run", "x", "-C", app, "-d"]) == 0
+    _wait(lambda: (env / "args.json").exists())
+    pid = json.loads((env / "args.json").read_text())["pid"]
+    assert cli.main(["cancel", "1"]) == 0
+    _wait(lambda: not jobs.alive(pid))
+    assert _store().get_job(1).status == "cancelled"
+
+
+def test_서버_작업도_이_컴퓨터의_env는_막고_허용하면_푼다(env, app, monkeypatch, capsys):
     assert cli.main(["run", "x", "-C", app]) == 0
     argv = json.loads((env / "args.json").read_text())["argv"]
     settings = json.loads(argv[argv.index("--settings") + 1])
-    workdir = remote.split(_store().get_job(1).workdir)[1]
-    # 서버에서는 디스크 전체가 아니라 작업 디렉토리와 원래 레포 아래만 막는다. 이 컴퓨터의 DB 경로는 넘기지 않는다
-    assert settings["sandbox"]["filesystem"]["denyRead"] == [f"{workdir}/**/.env*", f"{env / 'srv' / 'app'}/**/.env*"]
-    assert settings["sandbox"]["filesystem"]["denyWrite"] == [] and settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["enabled"] and settings["sandbox"]["filesystem"]["denyRead"]   # 이 컴퓨터의 .env
+    assert settings["sandbox"]["filesystem"]["denyWrite"] == config.load().protected_paths
 
-    monkeypatch.setenv("FAKE_CLAUDE_VERSION", "1.0.58 (Claude Code)")     # 서버의 claude 가 낮다
+    monkeypatch.setenv("FAKE_CLAUDE_VERSION", "1.0.58 (Claude Code)")     # 이 컴퓨터의 claude 가 낮다
     assert cli.main(["run", "y", "-C", app]) == 2
-    assert f"{HOST} 의 claude(1.0.58)는 .env 읽기를 막지 못합니다" in capsys.readouterr().err
+    assert "이 컴퓨터의 claude(1.0.58)는 .env 읽기를 막지 못합니다" in capsys.readouterr().err
     assert cli.main(["run", "y", "-C", app, "--allow-env"]) == 0
     argv = json.loads((env / "args.json").read_text())["argv"]
-    assert "--settings" not in argv
+    assert "--settings" not in argv and "Bash(" in " ".join(argv)         # 허용해도 서버용 실행 파일은 열려 있다
+    assert ".env 로 시작하는 파일" not in argv[argv.index("--append-system-prompt") + 1]
 
-    monkeypatch.delenv("FAKE_CLAUDE_VERSION")
-    monkeypatch.setattr(jobs, "_remote_is_linux", lambda host: True)      # 리눅스 서버에 bubblewrap 이 없다
-    monkeypatch.setattr(remote, "missing_commands", lambda host, *names: [n for n in names if n == "bwrap"])
-    assert cli.main(["run", "z", "-C", app]) == 2
-    assert "bwrap 이(가) 없어 .env 읽기를 막을 수 없습니다" in capsys.readouterr().err
-
-
-def test_등록한_인증을_서버의_claude에_넘기되_명령에는_드러내지_않는다(env, app, monkeypatch, capsys):
-    saved = config.load().auth_path
-    assert cli.main(["auth", "rm"]) == 0 and not saved.exists()
-    assert cli.main(["run", "로그인 고쳐줘", "-C", app]) == 2                  # 토큰이 없으면 서버 작업을 만들지 않는다
-    err = capsys.readouterr().err
-    assert "Claude 토큰이 등록돼 있지 않습니다" in err and "claude setup-token" in err and _store().list_jobs() == []
-
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(TOKEN + "\n"))
-    assert cli.main(["auth", "set"]) == 0
-    out = capsys.readouterr().out
-    assert TOKEN not in out and "Claude 토큰" in out                       # 값은 화면에 다시 보여 주지 않는다
-    assert saved.read_text() == f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\n" and saved.stat().st_mode & 0o777 == 0o600
-
-    assert cli.main(["run", "로그인 고쳐줘", "-C", app]) == 0
-    recorded = json.loads((env / "args.json").read_text())
-    assert recorded["auth"] == {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN}           # 서버의 claude 가 환경변수로 받는다
-    assert recorded["stdin"] == "로그인 고쳐줘"                              # 요청에는 섞이지 않는다
-    assert TOKEN not in (env / "ssh.jsonl").read_text()                     # ssh 명령 인자에는 없다 (ps 에 보인다)
-    home = env / "server-home"
-    leaked = [p for p in home.rglob("*") if p.is_file() and TOKEN in p.read_text(errors="replace")]
-    assert leaked == []                                                     # 서버의 디스크에도 쓰지 않는다
-    job_dir = config.load().job_dir(1)
-    assert all(TOKEN not in f.read_text(errors="replace") for f in job_dir.rglob("*") if f.is_file())
-
-    assert cli.main(["continue", "1", "테스트도 돌려줘"]) == 0                # 이어서 시킬 때도 넘긴다
-    recorded = json.loads((env / "args.json").read_text())
-    assert recorded["auth"] == {"CLAUDE_CODE_OAUTH_TOKEN": TOKEN} and recorded["stdin"] == "테스트도 돌려줘"
-
-    assert cli.main(["auth", "rm", "claude"]) == 0
-    assert cli.main(["continue", "1", "한 번 더"]) == 2                       # 지운 뒤에는 이어서 시키지도 못한다
-    assert "Claude 토큰이 등록돼 있지 않습니다" in capsys.readouterr().err
-
-
-def test_codex_키와_API_키도_넘기고_이상한_값은_등록하지_않는다(env, app, monkeypatch, capsys):
-    cfg = config.load()
-    auth.save(cfg, auth.CLAUDE, "  sk-ant-api03-abcdefghijklmnop  ")       # API 키는 다른 환경변수로 넘긴다
-    auth.save(cfg, auth.CODEX, "sk-proj-codexkey1234567890")
-    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_API_KEY")
-    assert cli.main(["run", "x", "-C", app]) == 0
-    recorded = json.loads((env / "args.json").read_text())
-    assert recorded["auth"] == {"ANTHROPIC_API_KEY": "sk-ant-api03-abcdefghijklmnop"} and recorded["stdin"] == "x"
-    assert recorded["env"] == {"CODEX_API_KEY": "sk-proj-codexkey1234567890"}   # codex 팀원은 claude 의 환경을 물려받는다
-    assert "codexkey" not in (env / "ssh.jsonl").read_text()
-    assert cli.main(["auth"]) == 0
-    out = capsys.readouterr().out
-    assert "Anthropic API 키" in out and "abcdefghijkl" not in out and "ANTHROPIC_API_KEY" in out
-    assert "codex: 등록됨" in out and "codexkey" not in out
-
-    for bad in ("", "two words", "line1\nline2"):                          # 줄이 나뉘면 뒤쪽이 요청으로 흘러 들어간다
-        with pytest.raises(auth.AuthError):
-            auth.save(cfg, auth.CLAUDE, bad)
-    assert auth.get(cfg, auth.CLAUDE) == "sk-ant-api03-abcdefghijklmnop"    # 실패한 등록은 기존 값을 건드리지 않는다
-    assert auth.clear(cfg, auth.CODEX) and auth.get(cfg, auth.CODEX) is None and auth.get(cfg, auth.CLAUDE)
-    cfg.auth_path.write_text("CLAUDE_CODE_OAUTH_TOKEN=broken value\nEVIL=1\n")
-    assert auth.load(cfg) == {}                                             # 손으로 망가뜨린 줄·모르는 이름은 쓰지 않는다
-
-
-def test_서버의_claude가_인증을_거부하면_어떻게_할지_알린다(env, app, monkeypatch, capsys):
-    script = env / "claude"
-    script.write_text(
-        "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.331 (Claude Code)'; exit 0; }\ncat > /dev/null\n"
-        "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,"
-        "\"result\":\"Failed to authenticate. API Error: 401 OAuth access token is invalid.\"}'\nexit 1\n"
-    )
-    assert cli.main(["run", "x", "-C", app]) == 1
-    messages = [e.message for e in _store().events(1)]
-    assert any("받아들이지 않았습니다" in m and "claude setup-token" in m for m in messages)
-    assert all("sk-ant-oat01" not in m for m in messages)
-
-
-def test_project_add_token은_토큰을_물어_등록한다(env, app, monkeypatch, capsys):
-    auth.clear(config.load())
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO("sk-ant-oat01-from-project-add\n"))
-    assert cli.main(["project", "add", app, "--token"]) == 0
-    assert auth.get(config.load(), auth.CLAUDE) == "sk-ant-oat01-from-project-add"
-    assert "sk-ant-oat01" not in capsys.readouterr().out
-
-
-def _login(refresh: str) -> str:
-    return json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "acc-" + refresh, "refresh_token": refresh}})
-
-
-def test_codex_팀원은_이_컴퓨터의_codex_로그인으로_실행하고_끝나면_서버에서_지운다(env, app, monkeypatch, capsys):
-    local = env / "local-codex" / "auth.json"
-    local.parent.mkdir()
-    local.write_text(_login("r1"))
-    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_HOME,CODEX_API_KEY")
-    monkeypatch.setenv("FAKE_CLAUDE_CODEX_LOGIN", "")
-    assert cli.main(["run", "x", "-C", app]) == 0
-    recorded = json.loads((env / "args.json").read_text())
-    codex_home = env / "server-home" / ".coliday" / "jobs" / "1" / "codex-home"
-    assert recorded["env"] == {"CODEX_HOME": str(codex_home), "CODEX_API_KEY": None}
-    assert recorded["codex_login"] == {"text": _login("r1"), "mode": "0o600"}   # 실행하는 동안만, 본인만 읽게 둔다
-    assert not codex_home.exists() and local.read_text() == _login("r1")        # 끝나면 지우고, 갱신이 없었으면 그대로
-    assert "r1" not in (env / "ssh.jsonl").read_text()                          # 명령 인자에는 넣지 않는다
-    assert any("이 컴퓨터의 Codex 로그인으로" in e.message for e in _store().events(1))
-
-    monkeypatch.setenv("FAKE_CLAUDE_CODEX_LOGIN", _login("r2"))                 # 서버의 codex 가 로그인을 갱신했다
-    assert cli.main(["continue", "1", "한 번 더"]) == 0
-    assert local.read_text() == _login("r2") and local.stat().st_mode & 0o777 == 0o600   # 이 컴퓨터에 반영한다
-    assert not codex_home.exists()
-    assert any("갱신된 Codex 로그인" in e.message for e in _store().events(1))
-
-    # 그 사이 이 컴퓨터에서도 갱신됐으면 (보낸 것과 달라졌으면) 덮어쓰지 않는다
-    local.write_text(_login("r9"))
-    assert not auth.restore_codex_login(_login("r2"), _login("r3")) and local.read_text() == _login("r9")
-    assert not auth.restore_codex_login(_login("r9"), "") and local.read_text() == _login("r9")   # 서버에서 못 읽어 왔다
-
-
-def test_API_키가_있거나_로그인이_없으면_codex_로그인을_서버에_두지_않는다(env, app, monkeypatch, capsys):
-    monkeypatch.setenv("FAKE_CLAUDE_ENV", "CODEX_HOME")
-    local_home = os.environ["CODEX_HOME"]
-    assert cli.main(["run", "x", "-C", app]) == 0                               # 이 컴퓨터에 Codex 로그인이 없다
-    assert json.loads((env / "args.json").read_text())["env"] == {"CODEX_HOME": local_home}   # 서버 쪽 값을 바꾸지 않는다
-    assert any("이 컴퓨터에 Codex 로그인이 없어" in e.message for e in _store().events(1))
-
-    local = env / "local-codex" / "auth.json"
-    local.parent.mkdir()
-    local.write_text(_login("r1"))
-    auth.save(config.load(), auth.CODEX, "sk-proj-codexkey1234567890")          # API 키를 등록했으면 그쪽을 쓴다
-    assert cli.main(["run", "x", "-C", app]) == 0
-    assert json.loads((env / "args.json").read_text())["env"] == {"CODEX_HOME": local_home}
-    assert not (env / "server-home" / ".coliday" / "jobs" / "2" / "codex-home").exists()
-
-    local.write_text("{broken")                                                 # 깨진 파일은 넘기지 않는다
-    assert auth.codex_login() is None
-    assert not auth.restore_codex_login(_login("r1"), "not json") and local.read_text() == "{broken"

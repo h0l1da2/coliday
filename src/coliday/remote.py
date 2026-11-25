@@ -4,8 +4,9 @@
 포트가 22 가 아니면 호스트 뒤에 붙인다: `user@host:2222:/srv/app`. 이때 "호스트"는 `user@host:2222` 전체다.
 로컬 경로는 항상 `/` 로 시작하므로 저장된 값만 보고 구분할 수 있다.
 
-서버에는 coliday 를 설치하지 않는다: git 과 에이전트 CLI(claude, codex)만 있으면 되고, 이 컴퓨터의 coliday 가
-ssh 로 명령을 실행하고 출력을 받아 온다. 접속 설정(포트·키·점프 호스트)은 `~/.ssh/config` 를 그대로 따른다.
+서버에는 아무것도 설치하지 않는다 (git 저장소면 git 만). 에이전트(claude, codex)는 **이 컴퓨터에서** 실행되고,
+작업마다 만들어 주는 실행 파일(`helper_scripts`)로 ssh 를 거쳐 서버의 파일을 읽고 고치고 명령을 실행한다.
+접속 설정(포트·키·점프 호스트)은 `~/.ssh/config` 를 그대로 따른다.
 백그라운드에서 실행하므로 비밀번호를 물을 수 없다 (키 인증이어야 한다). 키 인증이 안 돼 있으면
 프로젝트를 추가할 때 비밀번호를 한 번 받아 이 컴퓨터의 공개키를 서버에 등록한다 (`install_key`). 비밀번호는 저장하지 않는다.
 """
@@ -19,7 +20,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import tarfile
 import tempfile
 from pathlib import Path
 
@@ -92,7 +92,9 @@ def ssh_bin() -> str:
     return os.environ.get("COLIDAY_SSH_BIN") or "ssh"
 
 
-def _options() -> list[str]:
+def _options(*, master: bool = True) -> list[str]:
+    """master=False 는 에이전트가 쓰는 실행 파일용이다: 이미 열린 연결은 재사용하지만 새 연결 소켓은 만들지 않는다
+    (샌드박스 안에서는 ~/.ssh 에 소켓을 만들 수 없어 ssh 가 실패한다). 열린 연결이 없으면 그냥 새로 접속한다."""
     control = Path.home() / ".ssh"
     try:
         control.mkdir(mode=0o700, exist_ok=True)
@@ -103,7 +105,8 @@ def _options() -> list[str]:
         "-o", f"ConnectTimeout={_CONNECT_TIMEOUT}",
         "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
         # 연결을 재사용한다: diff 갱신처럼 자주 실행하는 명령이 매번 새로 접속하지 않게.
-        "-o", "ControlMaster=auto", "-o", f"ControlPath={control}/coliday-%C", "-o", "ControlPersist=120",
+        "-o", f"ControlMaster={'auto' if master else 'no'}", "-o", f"ControlPath={control}/coliday-%C",
+        *(["-o", "ControlPersist=120"] if master else []),
     ]
 
 
@@ -258,46 +261,6 @@ def is_dir(location: str) -> bool:
     return run(host, f"test -d {shlex.quote(path)}").returncode == 0
 
 
-def missing_commands(host: str, *names: str) -> list[str]:
-    """서버의 PATH 에서 찾지 못한 명령."""
-    script = "; ".join(f"command -v {shlex.quote(n)} >/dev/null 2>&1 || echo {shlex.quote(n)}" for n in names)
-    return check(host, script).split()
-
-
-def fetch_dir(host: str, path: str, target: Path, *, timeout: float = 300) -> int:
-    """서버의 폴더 내용을 target 으로 가져온다 (target 은 비어 있어야 한다). 가져온 파일 수를 돌려준다.
-
-    서버가 보낸 묶음을 그대로 풀지 않는다: 폴더 밖으로 나가는 경로·링크는 거부한다.
-    """
-    # COPYFILE_DISABLE: macOS 서버의 tar 가 확장 속성을 `._이름` 파일로 끼워 넣지 않게 한다.
-    script = f"cd {shlex.quote(path)} 2>/dev/null && COPYFILE_DISABLE=1 tar -cf - . || true"
-    try:
-        proc = subprocess.Popen(
-            command(host, script), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-    except OSError as exc:
-        raise RemoteError(f"ssh 를 실행할 수 없습니다 ({ssh_bin()}): {exc}") from exc
-    count = 0
-    try:
-        assert proc.stdout is not None
-        with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
-            for member in archive:
-                if not (member.isfile() or member.isdir()):
-                    continue  # 링크·장치 파일은 가져오지 않는다
-                archive.extract(member, target, filter="data")
-                count += member.isfile()
-    except tarfile.ReadError:
-        pass  # 폴더가 없거나 비어 있다
-    except (tarfile.TarError, OSError) as exc:
-        raise RemoteError(f"{host}: 결과물을 가져오지 못했습니다: {exc}") from exc
-    finally:
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    return count
-
-
 def spawn(host: str, script: str) -> None:
     """결과를 기다리지 않고 실행한다 (취소·정리처럼 화면을 멈추면 안 되는 일)."""
     try:
@@ -307,3 +270,103 @@ def spawn(host: str, script: str) -> None:
         )
     except (OSError, RemoteError):
         pass
+
+
+# ── 이 컴퓨터의 에이전트가 서버의 프로젝트를 다루는 실행 파일 ─────────────────────────────
+SERVER, PULL, PUSH = "server", "server-pull", "server-push"
+_HELPER_HEAD = """\
+#!/bin/sh
+# coliday 가 만든 파일. {purpose}
+PREFIX={prefix}
+on_server() {{  # 서버의 프로젝트 폴더에서 셸 명령 하나를 실행한다 (서버의 로그인 셸로: 프로필이 넣는 PATH 가 있어야 한다)
+  inner=$(printf '%s' "$PREFIX$1" | sed "s/'/'\\\\\\\\''/g")
+  {ssh} "case \\"\\$SHELL\\" in */bash|*/zsh) exec \\"\\$SHELL\\" -lc '$inner';; *) exec /bin/sh -c '$inner';; esac"
+}}
+quoted() {{  # 인자들을 서버의 셸에 그대로 넘길 수 있게 따옴표로 감싼다
+  out=""
+  for item in "$@"; do out="$out '$(printf '%s' "$item" | sed "s/'/'\\\\\\\\''/g")'"; done
+  printf '%s' "$out"
+}}
+relative() {{  # 프로젝트 폴더 안의 상대 경로만 받는다
+  for item in "$@"; do
+    case "$item" in /*|..|../*|*/..|*/../*|-*) echo "프로젝트 폴더 안의 상대 경로만 줄 수 있습니다: $item" >&2; exit 2;; esac
+  done
+}}
+"""
+_HELPER_BODY = {
+    SERVER: """\
+if [ "$#" -eq 0 ]; then echo "사용법: {name} '<서버에서 실행할 명령>'" >&2; exit 2; fi
+on_server "$*"
+""",
+    PULL: """\
+if [ "$#" -eq 0 ]; then echo "사용법: {name} <경로>..." >&2; exit 2; fi
+relative "$@"
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+on_server "tar -cf - --$(quoted "$@")" < /dev/null > "$TMP" || {{ echo "서버에서 가져오지 못했습니다" >&2; exit 1; }}
+tar -xf "$TMP" -C {local} && echo "가져왔습니다 → {local}: $*"
+""",
+    PUSH: """\
+if [ "$#" -eq 0 ]; then echo "사용법: {name} <경로>..." >&2; exit 2; fi
+relative "$@"
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+# ustar: macOS 의 확장 속성을 넣지 않는다. 소유자는 서버의 접속 계정으로 둔다.
+(cd {local} && COPYFILE_DISABLE=1 tar --format ustar -cf "$TMP" -- "$@") || {{ echo "이 폴더에 그 파일이 없습니다" >&2; exit 1; }}
+on_server "tar --no-same-owner -xf -" < "$TMP" && echo "서버에 올렸습니다: $*"
+""",
+}
+_HELPER_PURPOSE = {
+    SERVER: "서버의 프로젝트 폴더에서 명령을 실행한다.",
+    PULL: "서버의 프로젝트 파일·폴더를 이 컴퓨터의 작업 폴더로 가져온다 (같은 상대 경로로).",
+    PUSH: "이 컴퓨터의 작업 폴더에서 고친 파일·폴더를 서버의 프로젝트에 올린다 (같은 상대 경로로).",
+}
+
+
+def helper_scripts(host: str, workdir: str, local_dir: str) -> dict[str, str]:
+    """{파일 이름: sh 스크립트}. 이 컴퓨터에서 도는 에이전트가 서버(host)의 workdir 를 다룰 때 쓴다.
+
+    에이전트가 ssh 를 직접 부르면 auto 권한 모드의 분류기가 막고 샌드박스도 막는다. 그래서 실행 파일로 묶어 두고
+    그 파일만 허용한다 (Codex 팀원 실행 파일과 같은 방식).
+    """
+    ssh = shlex.join([ssh_bin(), *_options(master=False), *target(host)])
+    prefix = shlex.quote(f"{_PATH}cd {shlex.quote(workdir)} && ")
+    head = _HELPER_HEAD
+    return {
+        name: head.format(purpose=_HELPER_PURPOSE[name], prefix=prefix, ssh=ssh)
+        + body.format(name=name, local=shlex.quote(local_dir))
+        for name, body in _HELPER_BODY.items()
+    }
+
+
+def agent_note(host: str, workdir: str, local_dir: str, paths: dict[str, str]) -> str:
+    """에이전트 지침에 덧붙이는 말: 프로젝트가 서버에 있고 무엇으로 다루는지."""
+    run, pull, push = (shlex.quote(paths[name]) for name in (SERVER, PULL, PUSH))
+    return (
+        "\n## 서버의 프로젝트\n"
+        f"이 작업의 프로젝트는 이 컴퓨터가 아니라 서버 {host} 의 `{workdir}` 에 있다. 지금 있는 폴더(`{local_dir}`)는 "
+        "서버의 파일을 가져와 고치는 작업 폴더일 뿐이다 (처음에는 비어 있다). 이 컴퓨터의 다른 폴더에서 프로젝트를 찾지 않는다.\n"
+        f"- 서버에서 명령 실행: `{run} '<명령>'`. 서버의 프로젝트 폴더에서 실행된다. "
+        f"예: `{run} 'ls -la'`, `{run} 'git status'`, `{run} 'grep -rn TODO src | head'`. "
+        "빌드·테스트·서비스 확인도 모두 이렇게 서버에서 한다.\n"
+        f"- 파일 읽기: `{run} 'cat <경로>'` 로 보거나, `{pull} <경로>...` 로 이 폴더에 가져와서 읽는다 "
+        "(폴더째 가져올 수 있다. 큰 폴더를 통째로 가져오지 않는다).\n"
+        f"- 파일 고치기: `{pull} <경로>` 로 가져온다 → 이 폴더에서 고친다 → `{push} <경로>...` 로 서버에 올린다. "
+        "올리지 않은 변경은 서버에 반영되지 않는다. 새 파일도 이 폴더에 같은 상대 경로로 만든 뒤 올린다. "
+        "일을 마치기 전에 고친 파일을 모두 올렸는지 확인한다.\n"
+        "- 경로는 모두 서버의 프로젝트 폴더 기준 상대 경로다.\n"
+        "- 이 세 명령은 다른 명령과 `&&`·`;`·`|` 로 묶지 않고 하나씩 단독으로 실행한다 (묶으면 권한 검사에 걸린다). "
+        "파이프나 여러 명령이 필요하면 따옴표 안에 넣어 서버에서 돌린다.\n"
+        "- `ssh`·`scp` 를 직접 실행하지 않는다.\n"
+    )
+
+
+def keep_alive(host: str) -> subprocess.Popen | None:
+    """작업이 도는 동안 서버와의 연결 하나를 열어 둔다: 에이전트의 명령이 매번 새로 접속하지 않게. 끝나면 terminate 한다."""
+    try:
+        return subprocess.Popen(
+            [ssh_bin(), *_options(), "-N", *target(host)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except (OSError, RemoteError):
+        return None

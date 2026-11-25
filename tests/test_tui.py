@@ -13,7 +13,7 @@ pytest.importorskip("textual")
 
 from textual.widgets import DataTable, Input, Label, Markdown, Static, TextArea  # noqa: E402
 
-from coliday import auth, config, jobs, team  # noqa: E402
+from coliday import config, jobs, team  # noqa: E402
 from coliday.store import Store  # noqa: E402
 from coliday.tui import (  # noqa: E402
     AddProjectScreen, ConfirmScreen, ColidayApp, ModelScreen, NewJobScreen, RoleEditScreen, TeamScreen,
@@ -959,10 +959,8 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
     calls = []
     real = jobs.add_project
 
-    def add_project(cfg, store, directory, name=None, password=None, tokens=None):
-        calls.append((str(directory), name, password, tokens))
-        for kind, secret in (tokens or {}).items():
-            auth.save(cfg, kind, secret)
+    def add_project(cfg, store, directory, name=None, password=None):
+        calls.append((str(directory), name, password))
         return str(directory) if "@" in str(directory) else real(cfg, store, directory, name, password)
 
     monkeypatch.setattr(jobs, "add_project", add_project)
@@ -978,12 +976,10 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
 
             screen.query_one("#kind", Select).value = "ssh"
             await pilot.pause()
-            assert shown() == {"host", "port", "remote-dir", "password", "claude-token", "codex-key", "name"}
-            assert screen.query_one("#ssh-hint").display
-            assert all(screen.query_one(i, Input).password for i in ("#password", "#claude-token", "#codex-key"))
+            assert shown() == {"host", "port", "remote-dir", "password", "name"} and screen.query_one("#ssh-hint").display
+            assert screen.query_one("#password", Input).password
             hint = str(screen.query_one("#ssh-hint").render())
-            assert "저장하지 않는다" in hint and "claude setup-token" in hint   # 토큰을 어디서 받는지 알려 준다
-            assert "claude setup-token" in screen.query_one("#claude-token", Input).placeholder
+            assert "저장하지 않는다" in hint and "이 컴퓨터에서 실행" in hint   # 에이전트가 어디서 도는지 알려 준다
             dialog = screen.query_one("#dialog")
             assert dialog.region.bottom <= 40 and dialog.max_scroll_y == 0   # 칸이 늘어도 창이 화면에 다 들어온다
 
@@ -1000,34 +996,25 @@ def test_프로젝트_추가_창은_SSH를_골랐을_때만_서버_칸을_보여
 
             screen.query_one("#port", Input).value = "2222"
             screen.query_one("#password", Input).value = " s3cret "   # 비밀번호는 앞뒤 공백도 그대로
-            await pilot.press("enter")                        # Claude 토큰이 없으면 서버 프로젝트를 추가하지 않는다
-            await pilot.pause()
-            assert app.screen is screen and calls == []
-            assert any("Claude 토큰을 넣으세요" in n.message for n in app._notifications)
-            assert app.focused is screen.query_one("#claude-token", Input)
-            screen.query_one("#claude-token", Input).value = " sk-ant-oat01-fromdialog "
             await pilot.press("enter")
             await pilot.pause()
-            assert calls == [("dev@server:2222:/srv/app", None, " s3cret ", {"claude": "sk-ant-oat01-fromdialog"})]
-            assert auth.get(cfg, auth.CLAUDE) == "sk-ant-oat01-fromdialog"
+            assert calls == [("dev@server:2222:/srv/app", None, " s3cret ")]
 
             await pilot.press("ctrl+g")                       # 포트와 비밀번호를 비우면 붙이지 않는다
             app.screen.query_one("#kind", Select).value = "ssh"
             await pilot.pause()
-            assert "등록됨" in app.screen.query_one("#claude-token", Input).placeholder   # 이미 등록했으면 비워도 된다
             app.screen.query_one("#host", Input).value = "dev@server"
             app.screen.query_one("#remote-dir", Input).value = "~/app"
-            app.screen.query_one("#codex-key", Input).value = "sk-proj-codex"
             app.screen.query_one("#host", Input).focus()
             await pilot.press("enter")
             await pilot.pause()
-            assert calls[-1] == ("dev@server:~/app", None, None, {"codex": "sk-proj-codex"})
+            assert calls[-1] == ("dev@server:~/app", None, None)
 
             await pilot.press("ctrl+g")                       # 이 컴퓨터의 폴더
             app.screen.query_one("#dir", Input).value = str(repo)
             await pilot.press("enter")
             await pilot.pause()
-            assert calls[-1] == (str(repo), None, None, {})
+            assert calls[-1] == (str(repo), None, None)
 
             await pilot.press("ctrl+o")
             await pilot.press("ctrl+e")                       # 이름 바꾸기에는 위치 선택도 서버 칸도 없다

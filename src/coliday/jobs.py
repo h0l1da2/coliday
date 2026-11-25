@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import signal
 import subprocess
@@ -12,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from coliday import auth, gitops, guard, projects, remote, team
+from coliday import gitops, guard, projects, remote, team
 from coliday.config import Config
 from coliday.store import RESULT, USER, Job, Store
 
@@ -56,11 +55,8 @@ def launch(
     model = team.canonical(model or lead_model(cfg))
     check_team(cfg)
     try:
-        if host is not None:
-            check_remote(cfg, host, model)
-        else:
-            check_codex(cfg, model)
-        check_env_guard(cfg, host, model, allow_env)
+        check_codex(cfg, model)  # 서버의 프로젝트도 에이전트는 이 컴퓨터에서 돈다
+        check_env_guard(cfg, model, allow_env)
         root = gitops.repo_root(target)
     except remote.RemoteError as exc:
         raise JobError(str(exc)) from exc
@@ -128,12 +124,8 @@ def continue_job(
     # 고른 값이 Claude 기본 모델(claude)이면 이전 실행이 Claude 였을 때 그 모델을 그대로 쓴다.
     model = team.canonical(model or lead_model(cfg))
     switched = team.is_codex(model) != team.is_codex(job.model)
-    host = remote.split(job.workdir)[0]
-    if host is not None:
-        _remote(check_remote, cfg, host, model)
-    else:
-        check_codex(cfg, model)
-    _remote(check_env_guard, cfg, host, model, store.allow_env(job.id) if allow_env is None else allow_env)
+    check_codex(cfg, model)
+    check_env_guard(cfg, model, store.allow_env(job.id) if allow_env is None else allow_env)
     check_team(cfg)
     if switched and job.session_id:
         # Claude 세션과 Codex 세션은 서로 이어받을 수 없다. 작업 디렉토리(코드 변경)는 그대로 쓴다.
@@ -171,25 +163,6 @@ def check_codex(cfg: Config, model: str | None) -> None:
         raise JobError(f"Codex CLI 를 찾을 수 없습니다: {cfg.codex_bin}. 설치하거나 COLIDAY_CODEX_BIN 으로 경로를 지정하세요.")
 
 
-def check_remote(cfg: Config, host: str, model: str | None) -> None:
-    """서버에서 실행할 수 있는지 작업을 만들기 전에 확인한다 (넘겨 줄 인증, 접속, git, 에이전트 CLI)."""
-    if not auth.get(cfg, auth.CLAUDE):
-        raise JobError(f"서버에서 쓸 Claude 토큰이 등록돼 있지 않습니다 (서버에서는 로그인하지 않습니다). {auth.HOW_TO}.")
-    if problem := team.mismatch(model):
-        raise JobError(f"{problem} (바꾸기: coliday model)")
-    if team.is_codex(model):
-        raise JobError(
-            "SSH 프로젝트에서는 Codex 팀장을 쓸 수 없습니다. 팀장을 Claude 로 두세요 (팀원은 Codex 로 둘 수 있습니다). "
-            "예: coliday model lead claude"
-        )
-    missing = remote.missing_commands(host, "git", remote_claude_bin())
-    if missing:
-        raise JobError(
-            f"{host} 에서 {', '.join(missing)} 을(를) 찾을 수 없습니다. 서버에 설치해 두세요 "
-            "(경로가 PATH 밖이면 COLIDAY_REMOTE_CLAUDE_BIN 으로 지정)."
-        )
-
-
 def set_env_access(cfg: Config, store: Store, job_id: int, allow: bool) -> str:
     """사람이 작업 도중이나 끝난 뒤에 그 작업의 .env 읽기를 허용하거나 다시 막는다. 한 일을 설명하는 문장을 돌려준다.
 
@@ -218,58 +191,28 @@ def set_env_access(cfg: Config, store: Store, job_id: int, allow: bool) -> str:
     return f"작업 #{job.id}: .env 읽기를 허용했습니다. 다음에 이어서 시킬 때부터 적용됩니다."
 
 
-def cli_version(host: str | None, binary: str) -> tuple[int, ...] | None:
-    """이 컴퓨터(host=None)나 서버에 있는 CLI 의 버전. 알 수 없으면 None."""
-    if host is None:
-        return guard.local_version(binary)
-    proc = remote.run(host, f"{shlex.quote(binary)} --version")
-    return guard.parse_version(proc.stdout) if proc.returncode == 0 else None
-
-
-def check_env_guard(cfg: Config, host: str | None, model: str | None, allow_env: bool) -> None:
+def check_env_guard(cfg: Config, model: str | None, allow_env: bool) -> None:
     """.env 읽기를 막을 수 있는 환경인지 작업을 만들기 전에 확인한다. 막을 수 없으면 막지 않은 채 돌리지 않고 알린다."""
     if allow_env:
         return
     codex_lead = team.is_codex(model)
-    binary = cfg.codex_bin if codex_lead else (remote_claude_bin() if host is not None else cfg.claude_bin)
+    binary = cfg.codex_bin if codex_lead else cfg.claude_bin
     name, minimum = ("codex", guard.MIN_CODEX) if codex_lead else ("claude", guard.MIN_CLAUDE)
-    where = f"{host} 의" if host is not None else "이 컴퓨터의"
-    version = cli_version(host, binary)
+    version = guard.local_version(binary)
     if version is None or version < minimum:
         raise JobError(
-            f"{where} {name}({guard.show(version)})는 .env 읽기를 막지 못합니다. {guard.show(minimum)} 이상으로 올리세요 "
+            f"이 컴퓨터의 {name}({guard.show(version)})는 .env 읽기를 막지 못합니다. {guard.show(minimum)} 이상으로 올리세요 "
             f"(예: {name} update). {guard.HOW_TO_ALLOW}."
         )
     if codex_lead:
         return
     # Claude 의 샌드박스: macOS 는 기본으로 있고, 리눅스는 bubblewrap 과 socat 이 있어야 한다.
-    tools = ("bwrap", "socat")
-    if host is not None:
-        missing = remote.missing_commands(host, *tools) if _remote_is_linux(host) else []
-    else:
-        missing = [t for t in tools if shutil.which(t) is None] if sys.platform.startswith("linux") else []
+    missing = [t for t in ("bwrap", "socat") if shutil.which(t) is None] if sys.platform.startswith("linux") else []
     if missing:
         raise JobError(
-            f"{where} {', '.join(missing)} 이(가) 없어 .env 읽기를 막을 수 없습니다. 설치하세요 "
+            f"이 컴퓨터에 {', '.join(missing)} 이(가) 없어 .env 읽기를 막을 수 없습니다. 설치하세요 "
             f"(예: sudo apt install bubblewrap socat). {guard.HOW_TO_ALLOW}."
         )
-
-
-def _remote_is_linux(host: str) -> bool:
-    return remote.check(host, "uname -s").strip() == "Linux"
-
-
-def remote_claude_bin() -> str:
-    return os.environ.get("COLIDAY_REMOTE_CLAUDE_BIN") or "claude"
-
-
-def remote_codex_bin() -> str:
-    return os.environ.get("COLIDAY_REMOTE_CODEX_BIN") or "codex"
-
-
-def remote_job_dir(host: str, job_id: int) -> str:
-    """서버에 두는 작업별 폴더 (에이전트 정의, 실행 중인 프로세스 번호, 결과물)."""
-    return f"{remote.home(host)}/.coliday/jobs/{job_id}"
 
 
 def _remote(func, *args):
@@ -346,24 +289,13 @@ def project_names(cfg: Config, store: Store) -> dict[str, str]:
 
 def add_project(
     cfg: Config, store: Store, directory: str | Path, name: str | None = None, password: str | None = None,
-    tokens: dict[str, str] | None = None,
 ) -> str:
     """목록에 추가하고 정규화한 경로를 돌려준다.
 
     name 이 None 이면 이름을 건드리지 않고(이미 있으면 그대로), 빈 문자열이면 폴더 이름으로 되돌린다.
     password 는 서버의 프로젝트에만 쓴다: 키로 접속되지 않으면 이 비밀번호로 한 번 접속해 SSH 키를 등록한다 (저장하지 않는다).
-    tokens 도 서버의 프로젝트에만 쓴다: {"claude"|"codex": 값} 을 이 컴퓨터에 등록해 둔다 (`auth.py`. 빈 값은 그대로 둔다).
     """
     host = remote.split(str(directory).strip())[0]
-    if host is not None:
-        try:
-            for kind, secret in (tokens or {}).items():
-                if secret and secret.strip():
-                    auth.save(cfg, kind, secret)
-        except auth.AuthError as exc:
-            raise JobError(str(exc)) from exc
-        except OSError as exc:
-            raise JobError(f"인증을 저장하지 못했습니다: {exc}") from exc
     if password and host is not None:
         try:
             if not remote.key_works(host):  # 이미 키로 접속되면 서버를 건드리지 않는다
@@ -605,25 +537,10 @@ def cancel(store: Store, job: Job) -> bool:
             os.killpg(job.pid, signal.SIGTERM)  # worker 는 자기 세션의 리더라 pgid == pid
         except ProcessLookupError:
             pass
-    host = remote.split(job.workdir)[0]
-    if host is not None:
-        # ssh 연결을 끊는 것만으로는 서버의 에이전트가 멈추지 않을 수 있다. 기록해 둔 프로세스를 직접 끝낸다.
-        remote.spawn(host, stop_script(job.id))
     return True
 
 
-REMOTE_CODEX_HOME = "codex-home"  # 작업 폴더 아래, 이 컴퓨터의 Codex 로그인을 잠깐 두는 곳 (worker 가 실행이 끝나면 지운다)
-REMOTE_JOBS = '"$HOME"/.coliday/jobs'  # 서버 셸에서 풀리는 경로 (접속하지 않고도 명령을 만들 수 있게)
-
-
-def stop_script(job_id: int) -> str:
-    """서버에서 이 작업의 에이전트(와 그 자식)를 끝내는 셸 스크립트."""
-    pid_file = f"{REMOTE_JOBS}/{job_id}/pid"
-    return (
-        f'p=$(cat {pid_file} 2>/dev/null) && [ -n "$p" ] && '
-        '{ pkill -TERM -P "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; }; '
-        f"rm -rf {pid_file} {REMOTE_JOBS}/{job_id}/{REMOTE_CODEX_HOME}"  # 취소하면 worker 가 지울 틈이 없다
-    )
+REMOTE_JOBS = '"$HOME"/.coliday/jobs'  # 예전 버전이 서버에 두던 작업 폴더 (에이전트를 서버에서 돌리던 때). 지울 때만 쓴다
 
 
 def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
@@ -649,7 +566,7 @@ def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
         raise JobError(f"작업 #{job.id} 은(는) 다시 실행 중이라 삭제하지 않았습니다.")
     shutil.rmtree(cfg.job_dir(job.id), ignore_errors=True)
     if host is not None:
-        remote.spawn(host, f"rm -rf {REMOTE_JOBS}/{job.id}")  # 서버에 둔 에이전트 정의·결과물 원본
+        remote.spawn(host, f"rm -rf {REMOTE_JOBS}/{job.id}")  # 예전 버전이 서버에 남긴 것
     return f"작업 #{job.id} 을(를) 삭제했습니다" + (f" (worktree 와 브랜치 {job.branch} 포함)." if removed_worktree else ".") + note
 
 

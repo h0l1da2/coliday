@@ -64,11 +64,16 @@ def request(directory: Path, role: str, task: str) -> int:
 class Server:
     """요청 폴더를 지켜보다가 요청마다 스레드를 띄워 팀원을 실행한다."""
 
-    def __init__(self, cfg: Config, job: Job, resolved: dict[str, dict], guard: EnvGuard | None = None) -> None:
+    def __init__(
+        self, cfg: Config, job: Job, resolved: dict[str, dict], guard: EnvGuard | None = None,
+        *, cwd: str | None = None, helpers: list[str] | tuple[str, ...] = (),
+    ) -> None:
         self.cfg = cfg
         self.job = job
         self.resolved = resolved
         self.guard = guard  # 있으면 팀원도 .env 를 읽지 못한다
+        self.cwd = cwd or job.workdir  # 팀원이 실행되는 폴더 (서버의 프로젝트면 이 컴퓨터의 작업 폴더)
+        self.helpers = list(helpers)  # 서버의 프로젝트를 다루는 실행 파일 (있으면 서버 작업이다)
         self.directory = rpc_dir(job.id)
         self.cost_usd = 0.0
         self._lock = threading.Lock()
@@ -115,7 +120,9 @@ class Server:
         first_line = " ".join(task.strip().splitlines()[0].split())[:120]
         store.add_event(job_id, LEAD, "dispatch", f"{role}에게 분배: {first_line}")
         store.update_job(job_id, phase=f"{LEAD}: {role}에게 분배")
-        ok, text, cost = run_member(self.cfg, store, self.job, role, self.resolved[role], task, self.guard)
+        ok, text, cost = run_member(
+            self.cfg, store, self.job, role, self.resolved[role], task, self.guard, cwd=self.cwd, helpers=self.helpers,
+        )
         with self._lock:
             self.cost_usd += cost or 0.0
         store.add_event(job_id, role, "done", "종료 (completed)" if ok else "종료 (failed)")
@@ -126,14 +133,21 @@ class Server:
 
 def run_member(
     cfg: Config, store: Store, job: Job, role: str, spec: dict, task: str, guard: EnvGuard | None = None,
+    *, cwd: str | None = None, helpers: list[str] | tuple[str, ...] = (),
 ) -> tuple[bool, str, float | None]:
-    """팀원 하나를 실행하고 (성공 여부, 보고, 비용)을 돌려준다. 진행 과정은 타임라인에 남긴다."""
+    """팀원 하나를 실행하고 (성공 여부, 보고, 비용)을 돌려준다. 진행 과정은 타임라인에 남긴다.
+
+    helpers 는 서버의 프로젝트를 다루는 실행 파일이다: 있으면 그 파일을 권한 검사·샌드박스 없이 실행하게 열고 네트워크를 쓴다.
+    """
+    remote_job = bool(helpers)
     prompt = str(spec.get("prompt") or "")
     model = spec.get("model")
     if team.is_codex(model):
         cmd = [
             cfg.codex_bin, "exec", "--json", "--skip-git-repo-check",
-            *team.codex_access(team.codex_sandbox(spec), cfg.artifacts_dir(job.id), guard=guard),
+            *team.codex_access(
+                team.codex_sandbox(spec, remote_job), cfg.artifacts_dir(job.id), guard=guard, network=remote_job,
+            ),
         ]
         if team.codex_model(model):
             cmd += ["-m", team.codex_model(model)]
@@ -154,12 +168,15 @@ def run_member(
         if guard is not None:
             cmd += ["--settings", guard.claude_settings(
                 writable=[str(cfg.artifacts_dir(job.id))], protected=cfg.protected_paths,
+                excluded=[f"{team.runner_command(path)} *" for path in helpers],
             )]
+        if helpers:
+            cmd += ["--allowedTools", *(team.runner_rule(path) for path in helpers)]
         stdin = task
         translator = Translator(lead=role)
     try:
         proc = subprocess.Popen(
-            cmd, cwd=job.workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            cmd, cwd=cwd or job.workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1, env=agent_env(guard),
         )
     except OSError as exc:

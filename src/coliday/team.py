@@ -22,7 +22,7 @@ import shlex
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from coliday.guard import EnvGuard
+from coliday.guard import EnvGuard, codex_profile
 
 LEAD_ROLE = "lead"
 DEFAULT_ROLE = "default"  # 기본 에이전트 설정을 가리키는 이름 (팀원 이름이 아니다)
@@ -569,7 +569,7 @@ def claude_agents(
 
 def codex_runners(
     resolved: dict[str, dict], codex_bin: str = CODEX, artifacts: str | None = None, *, local: bool = True,
-    guard: EnvGuard | None = None,
+    guard: EnvGuard | None = None, network: bool = False,
 ) -> dict[str, tuple[str, str]]:
     """Codex 로 일할 팀원마다 {역할: (파일 이름, sh 스크립트)}. 스크립트는 작업 명세 파일을 받아 Codex 의 답을 출력한다.
 
@@ -578,12 +578,13 @@ def codex_runners(
     명세를 heredoc 으로 넘기면 본문의 글자([P0]~[P3] 같은 대괄호)에 따라 규칙이 맞지 않아, 파일 경로만 인자로 받는다.
     local=False 는 서버에서 실행할 때다: artifacts 가 서버의 경로라 이 컴퓨터의 파일 시스템으로 풀지 않는다.
     guard 를 주면 Codex 가 .env 파일을 읽지 못하게 막는다 (`guard.py`).
+    network 는 서버의 프로젝트를 다루는 작업이다: Codex 가 실행하는 명령이 ssh 로 서버에 닿을 수 있게 한다.
     """
     out: dict[str, tuple[str, str]] = {}
     for name, spec in resolved.items():
         if is_codex(spec.get("model")):
             file_name = f"{len(out) + 1}-{re.sub(r'[^A-Za-z0-9_-]', '_', name)}"  # 규칙·명령에 그대로 쓸 수 있는 이름
-            out[name] = (file_name, _codex_runner(spec, codex_sandbox(spec), codex_bin, artifacts, local, guard))
+            out[name] = (file_name, _codex_runner(spec, codex_sandbox(spec, network), codex_bin, artifacts, local, guard, network))
     return out
 
 
@@ -598,23 +599,29 @@ def runner_rule(path: str) -> str:
 
 
 def codex_access(
-    sandbox: str, *writable: str | Path | None, local: bool = True, guard: EnvGuard | None = None,
+    sandbox: str, *writable: str | Path | None, local: bool = True, guard: EnvGuard | None = None, network: bool = False,
 ) -> list[str]:
-    """Codex 의 접근 범위 옵션: 샌드박스와, 작업 디렉토리 말고도 쓸 수 있는 폴더. guard 가 있으면 .env 읽기도 막는다."""
-    if guard is not None:
+    """Codex 의 접근 범위 옵션: 샌드박스와, 작업 디렉토리 말고도 쓸 수 있는 폴더. guard 가 있으면 .env 읽기도 막는다.
+
+    network 는 서버의 프로젝트를 다룰 때다: 명령이 ssh 로 서버에 닿아야 한다.
+    """
+    if guard is not None or network:
         # 권한 프로필은 -s 와 함께 쓸 수 없다: 샌드박스와 쓰기 폴더를 프로필 하나로 준다.
         roots = [str(Path(p).resolve()) if local else str(p) for p in writable if p]
-        return guard.codex_args(sandbox, roots)
+        if guard is not None:
+            return guard.codex_args(sandbox, roots, network=network)
+        return codex_profile(sandbox, roots, network=network)
     roots = codex_writable_roots(*writable, local=local) if sandbox == "workspace-write" else []
     return ["-c", f'sandbox_mode="{sandbox}"', *roots]
 
 
 def _codex_runner(
     spec: dict, sandbox: str, codex_bin: str, artifacts: str | None, local: bool, guard: EnvGuard | None = None,
+    network: bool = False,
 ) -> str:
     model = codex_model(spec["model"])
     command = f'{shlex.quote(codex_bin)} exec -C "$(pwd -P)" --skip-git-repo-check'
-    command += "".join(f" {shlex.quote(part)}" for part in codex_access(sandbox, artifacts, local=local, guard=guard))
+    command += "".join(f" {shlex.quote(part)}" for part in codex_access(sandbox, artifacts, local=local, guard=guard, network=network))
     if model:
         command += f" -m {shlex.quote(model)}"
     command += ' -o "$OUT" -'
@@ -652,6 +659,18 @@ def without_codex(resolved: dict[str, dict]) -> tuple[dict[str, dict], list[str]
     return {n: {k: v for k, v in s.items() if not (n in names and k == "model")} for n, s in resolved.items()}, names
 
 
+def for_server(resolved: dict[str, dict], note: str) -> dict[str, dict]:
+    """서버의 프로젝트를 다루는 작업의 팀원 정의: 지침에 다루는 방법(note)을 덧붙이고, 그 명령을 실행할 Bash 를 준다."""
+    out: dict[str, dict] = {}
+    for name, spec in resolved.items():
+        spec = {**spec, "prompt": f"{spec.get('prompt') or ''}\n{note}"}
+        tools = spec.get("tools")
+        if isinstance(tools, list) and "Bash" not in tools:
+            spec["tools"] = [*tools, "Bash"]
+        out[name] = spec
+    return out
+
+
 def codex_writable_roots(*paths: str | Path | None, local: bool = True) -> list[str]:
     """Codex 샌드박스(workspace-write)에서 작업 디렉토리 말고도 쓸 수 있게 열 폴더를 주는 옵션."""
     # Codex 는 심볼릭 링크가 낀 쓰기 폴더를 거부하고 모든 명령 실행을 막는다 (macOS 의 임시 폴더 /var → /private/var 도 링크다).
@@ -660,8 +679,13 @@ def codex_writable_roots(*paths: str | Path | None, local: bool = True) -> list[
     return ["-c", f"sandbox_workspace_write.writable_roots={json.dumps(roots)}"] if roots else []
 
 
-def codex_sandbox(spec: dict) -> str:
-    """이 역할을 Codex 로 돌릴 때의 샌드박스. 수정 도구가 없는 역할(설계·리뷰)은 파일을 못 고치게 한다."""
+def codex_sandbox(spec: dict, remote: bool = False) -> str:
+    """이 역할을 Codex 로 돌릴 때의 샌드박스. 수정 도구가 없는 역할(설계·리뷰)은 파일을 못 고치게 한다.
+
+    서버의 프로젝트(remote)면 누구든 작업 폴더에 쓸 수 있다: 그 폴더는 서버의 파일을 가져다 보는 곳일 뿐이다.
+    """
+    if remote:
+        return "workspace-write"
     if spec.get("codex_sandbox") in ("read-only", "workspace-write"):
         return spec["codex_sandbox"]
     tools = spec.get("tools")
