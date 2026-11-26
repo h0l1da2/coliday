@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 from urllib.parse import quote
 
 from coliday import gitops, guard, projects, remote, team
 from coliday.config import Config
+from coliday.joblist import JobGroup
 from coliday.store import RESULT, USER, Job, Store
 
 STATUS_ICON = {"queued": "…", "running": "●", "succeeded": "✓", "failed": "✗", "cancelled": "■"}
@@ -77,27 +81,122 @@ def launch(
         if gitops.is_dirty(root):
             warnings.append("커밋하지 않은 변경은 worktree 에 포함되지 않습니다 (HEAD 기준으로 작업).")
         base = gitops.head_commit(root)
-        job = store.create_job(prompt=prompt, repo=root, workdir="", model=model)
-        branch = f"coliday/{job.id}"
-        try:
-            wt = worktree_path(cfg, job)
-            gitops.add_worktree(root, wt, branch, base)
-        except (gitops.GitError, remote.RemoteError) as exc:
-            store.finish_job(job.id, "failed", phase=f"worktree 생성 실패: {exc}")
-            raise JobError(f"worktree 생성 실패: {exc}") from exc
         # 하위 디렉토리에서 실행했다면 worktree 안의 같은 위치에서 작업한다.
         inside = os.path.relpath(remote.split(target)[1], remote.split(root)[1])
-        store.update_job(job.id, workdir=remote.join(wt, inside), branch=branch, base_commit=base)
-        job = store.get_job(job.id)
+        job = _create_in_worktree(cfg, store, prompt, root, base, inside, model)
 
-    if allow_env:
-        store.set_allow_env(job.id, True)
-    _spawn_worker(cfg, job.id)
+    _start(cfg, store, job, allow_env)
     try:
         add_project(cfg, store, target)
     except JobError as exc:  # 목록 파일이 깨져도 작업은 이미 시작됐다
         warnings.append(f"프로젝트 목록에 추가하지 못했습니다: {exc}")
     return Launched(job, warnings, project=target)
+
+
+def derive(
+    cfg: Config, store: Store, parent_id: int, prompt: str, *, model: str | None = None, allow_env: bool = False,
+) -> Launched:
+    """부모 작업의 지금 작업 디렉토리 상태(커밋하지 않은 변경 포함)에서 새 작업을 시작한다.
+
+    부모 worktree 를 스냅샷 커밋으로 만들고 거기서 새 worktree·브랜치를 연다 (자식 diff 에는 자식 변경만 나온다).
+    부모가 worktree 없이 실행한 작업이면 같은 디렉토리에서 worktree 없이 실행한다. 세션은 새로 시작하고
+    .env 읽기 허용은 물려받지 않는다 (allow_env 로 따로 준다). 부모가 실행 중이어도 된다.
+    """
+    prompt = prompt.strip()
+    if not prompt:
+        raise JobError("요청 내용이 비어 있습니다.")
+    try:
+        parent = store.get_job(parent_id)
+    except KeyError:
+        raise JobError(f"작업 #{parent_id} 을(를) 찾을 수 없습니다.") from None
+    if not parent.workdir or not _is_dir(parent.workdir):
+        raise JobError(f"작업 #{parent.id} 의 작업 디렉토리가 없습니다 (정리된 작업). 파생할 수 없습니다.")
+    model = team.canonical(model or lead_model(cfg))
+    check_team(cfg)
+    try:
+        check_codex(cfg, model)
+        check_env_guard(cfg, model, allow_env)
+    except remote.RemoteError as exc:
+        raise JobError(str(exc)) from exc
+
+    if parent.branch is None:
+        job = store.create_job(
+            prompt=prompt, repo=parent.repo, workdir=parent.workdir, model=model, parent_id=parent.id,
+        )
+    else:
+        try:
+            top = gitops.repo_root(parent.workdir)
+            if top is None:
+                raise gitops.GitError(f"git worktree 가 아닙니다: {parent.workdir}")
+            base = gitops.snapshot(top, f"coliday: 작업 #{parent.id} 의 작업 상태 (파생 작업의 시작점)")
+        except (gitops.GitError, remote.RemoteError) as exc:
+            raise JobError(f"작업 #{parent.id} 의 상태를 저장하지 못했습니다: {exc}") from exc
+        inside = _relative(parent.workdir, top)
+        job = _create_in_worktree(cfg, store, prompt, parent.repo, base, inside, model, parent_id=parent.id)
+    _start(cfg, store, job, allow_env)
+    # project 는 비워 둔다: 부모의 레포 최상위는 연결된 프로젝트 목록에 없을 수 있다 (하위 폴더를 연결한 경우)
+    return Launched(job)
+
+
+def _relative(workdir: str, top: str) -> str:
+    """worktree 최상위(top)에서 본 workdir 의 상대 위치. 밖이면 최상위."""
+    host, path = remote.split(workdir)
+    top_path = remote.split(top)[1]
+    if host is None:  # 링크가 낀 경로(/var ↔ /private/var)를 같게 본다
+        path, top_path = os.path.realpath(path), os.path.realpath(top_path)
+    inside = posixpath.relpath(path, top_path) if host is not None else os.path.relpath(path, top_path)
+    return "." if inside == ".." or inside.startswith(("../", ".." + os.sep)) else inside
+
+
+def _create_in_worktree(
+    cfg: Config, store: Store, prompt: str, repo: str, base: str, inside: str, model: str | None,
+    *, parent_id: int | None = None,
+) -> Job:
+    """repo 의 base 커밋에서 새 worktree·브랜치를 만든 작업. inside 는 worktree 안에서 일할 상대 위치다."""
+    job = store.create_job(prompt=prompt, repo=repo, workdir="", model=model, parent_id=parent_id)
+    branch = f"coliday/{job.id}"
+    try:
+        wt = worktree_path(cfg, job)
+        gitops.add_worktree(repo, wt, branch, base)
+    except (gitops.GitError, remote.RemoteError) as exc:
+        store.finish_job(job.id, "failed", phase=f"worktree 생성 실패: {exc}")
+        raise JobError(f"worktree 생성 실패: {exc}") from exc
+    store.update_job(job.id, workdir=remote.join(wt, inside), branch=branch, base_commit=base)
+    return store.get_job(job.id)
+
+
+def _start(cfg: Config, store: Store, job: Job, allow_env: bool) -> None:
+    if allow_env:
+        store.set_allow_env(job.id, True)
+    _spawn_worker(cfg, job.id)
+
+
+def create_group(store: Store, name: str, project: str) -> JobGroup:
+    """project 는 그룹이 속한 프로젝트 (projects.json 의 정규화된 경로). 이름은 그 프로젝트 안에서만 겹치지 않으면 된다."""
+    try:
+        return store.create_group(name, project=project)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise JobError(str(exc)) from exc
+
+
+def rename_group(store: Store, group_id: int, name: str) -> None:
+    try:
+        store.rename_group(group_id, name)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise JobError(str(exc)) from exc
+
+
+def delete_group(store: Store, group_id: int) -> None:
+    """그룹만 지운다 (들어 있던 작업은 그룹 없음). 이미 없는 그룹이면 아무 일도 하지 않는다."""
+    store.delete_group(group_id)
+
+
+def set_group(store: Store, job_ids: Iterable[int], group_id: int | None) -> None:
+    """작업들을 그룹에 넣거나 (None) 뺀다. 그 사이 다른 화면에서 그룹을 지웠으면 JobError."""
+    try:
+        store.set_group(list(job_ids), group_id)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise JobError(str(exc)) from exc
 
 
 def continue_job(
@@ -658,7 +757,10 @@ def _spawn_worker(cfg: Config, job_id: int) -> None:
 
 
 def worktree_path(cfg: Config, job: Job) -> str:
-    """작업의 worktree 위치. 서버의 레포면 그 서버의 `~/.coliday/worktrees` 아래다."""
+    """작업의 worktree 위치. 서버의 레포면 그 서버의 `~/.coliday/worktrees` 아래다.
+
+    폴더 이름 `{레포 이름}-{작업 번호}` 는 scope.location 이 작업의 소속 프로젝트를 계산하는 데 쓴다 (바꾸면 함께 바꾼다).
+    """
     folder = f"{remote.name(job.repo)}-{job.id}"
     host = remote.split(job.repo)[0]
     if host is not None:
@@ -703,8 +805,14 @@ def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
                 raise WorktreeRemoveError(f"삭제 실패 (검토하지 않은 변경이 있으면 --force 필요): {exc}") from exc
             # 없어진 서버의 작업도 목록에서는 지울 수 있어야 한다. 강제 삭제면 기록만 지운다.
             note = f" 서버의 worktree 와 브랜치는 지우지 못했습니다: {exc}"
+    children = store.children(job.id)
+    meta = store.job_meta().get(job.id)
     if not store.delete_job(job.id):
         raise JobError(f"작업 #{job.id} 은(는) 다시 실행 중이라 삭제하지 않았습니다.")
+    if children:
+        moved = ", ".join(f"#{c}" for c in children)
+        where = f"#{meta.parent_id} 밑으로" if meta and meta.parent_id is not None else "최상위로"
+        note += f" 하위 작업 {moved} 은(는) {where} 옮겼습니다."
     shutil.rmtree(cfg.job_dir(job.id), ignore_errors=True)
     if host is not None:
         remote.spawn(host, f"rm -rf {REMOTE_JOBS}/{job.id}")  # 예전 버전이 서버에 남긴 것
@@ -712,12 +820,15 @@ def remove(cfg: Config, store: Store, job: Job, *, force: bool = False) -> str:
 
 
 def reconcile(store: Store, job: Job) -> Job:
-    """worker 가 비정상 종료돼 running/queued 로 남은 작업을 failed 로 정리한다."""
+    """worker 가 비정상 종료돼 running/queued 로 남은 작업을 failed 로 정리한다.
+
+    job 은 조금 전에 읽은 것일 수 있다. 그 사이 worker 가 시작했거나 다시 실행됐으면 바꾸지 않는다 (읽은 상태·pid 가 같을 때만).
+    """
     if job.status == "running" and job.pid and not alive(job.pid):
-        store.finish_job(job.id, "failed", phase="worker 비정상 종료")
+        store.finish_job(job.id, "failed", unchanged=job, phase="worker 비정상 종료")
         return store.get_job(job.id)
     if job.status == "queued" and time.time() - _queued_at(store, job) > _QUEUED_TIMEOUT_SEC:
-        store.finish_job(job.id, "failed", phase="worker 시작 실패")
+        store.finish_job(job.id, "failed", unchanged=job, phase="worker 시작 실패")
         return store.get_job(job.id)
     return job
 

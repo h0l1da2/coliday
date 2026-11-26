@@ -56,8 +56,10 @@ def _parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="새 작업 실행")
     run.add_argument("prompt", help="팀장에게 시킬 일")
-    run.add_argument("-C", "--dir", default=".",
+    run.add_argument("-C", "--dir",
                      help="프로젝트 디렉토리 (기본: 현재 디렉토리). 서버의 디렉토리는 user@host:/경로 (SSH)")
+    run.add_argument("--from", dest="parent", type=int, metavar="ID",
+                     help="작업 #ID 의 지금 상태(커밋하지 않은 변경 포함)에서 파생해 새 작업을 시작 (-C, --no-worktree 와 함께 쓰지 않는다)")
     run.add_argument("--no-worktree", action="store_true", help="worktree 없이 프로젝트 디렉토리에서 직접 작업")
     run.add_argument("--allow-env", action="store_true",
                      help="이 작업에서 에이전트가 .env 파일을 읽어도 된다 (기본: 읽지 못하게 막는다)")
@@ -165,9 +167,15 @@ def _cmd_ui(cfg: config.Config) -> int:
 
 
 def _cmd_run(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
-    launched = jobs.launch(
-        cfg, store, args.prompt, args.dir, no_worktree=args.no_worktree, model=args.model, allow_env=args.allow_env,
-    )
+    if args.parent is not None:
+        if args.dir is not None or args.no_worktree:
+            raise JobError("--from 은 -C, --no-worktree 와 함께 쓸 수 없습니다 (파생 작업은 부모 작업의 위치와 방식을 따른다).")
+        launched = jobs.derive(cfg, store, args.parent, args.prompt, model=args.model, allow_env=args.allow_env)
+    else:
+        launched = jobs.launch(
+            cfg, store, args.prompt, "." if args.dir is None else args.dir, no_worktree=args.no_worktree, model=args.model,
+            allow_env=args.allow_env,
+        )
     for w in launched.warnings:
         print(f"주의: {w}", file=sys.stderr)
     job = launched.job
@@ -342,12 +350,15 @@ def _cmd_ls(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
         print('아직 작업이 없습니다. 예: coliday run "README 오타 수정"')
         return 0
     now = time.time()
+    meta = store.job_meta()
     for j in rows:
         icon = STATUS_ICON.get(j.status, "?")
         repo = remote.name(j.repo)
+        parent = meta[j.id].parent_id if j.id in meta else None
+        prompt = (f"↳#{parent} " if parent is not None else "") + j.prompt  # 파생 작업이면 부모 번호
         print(
             f"{icon} #{j.id:<4} {jobs.ago(now - j.last_asked):>6}  {repo:<20.20}  "
-            f"{_pad(jobs.one_line(j.prompt, 40), 40)}  {jobs.one_line(j.phase, 50)}"
+            f"{_pad(jobs.one_line(prompt, 40), 40)}  {jobs.one_line(j.phase, 50)}"
         )
     return 0
 

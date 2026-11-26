@@ -56,6 +56,11 @@ class Config:
     def projects_path(self) -> Path:
         return self.home / "projects.json"
 
+    @property
+    def ui_path(self) -> Path:
+        """화면 설정 (목록 묶기 기준, 접은 묶음)."""
+        return self.home / "ui.json"
+
     def job_dir(self, job_id: int) -> Path:
         return self.jobs_dir / str(job_id)
 

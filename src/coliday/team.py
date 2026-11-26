@@ -155,7 +155,15 @@ def lead_prompt(
     template 은 사용자가 바꾼 지시문 (없으면 기본). artifacts 를 주면 결과물을 그 폴더에 남기라는 절이 붙는다.
     """
     agents = DEFAULT_AGENTS if agents is None else agents
-    return _render_lead(template, f"{_TEAM_HEADING}\n{_roles(agents)}", max_attempts, artifacts)
+    section = (
+        f"{_TEAM_HEADING}\n{_roles(agents)}\n\n"
+        "## 위임 결과 대기\n"
+        "- 다음 단계가 팀원의 결과에 의존하면 기본적으로 Agent 도구를 포그라운드로 실행하고, "
+        "결과를 받은 뒤 다음 단계로 넘어간다.\n"
+        "- 독립 작업을 병렬로 맡겼으면 모든 팀원의 결과를 받은 뒤에만 팀장 턴을 끝낸다. "
+        "백그라운드로 맡긴 작업도 결과를 받을 때까지 기다린다."
+    )
+    return _render_lead(template, section, max_attempts, artifacts)
 
 
 def _roles(agents: dict[str, dict]) -> str:
@@ -761,6 +769,8 @@ def codex_lead_prompt(
         f"{agent_command} <역할> <<'COLIDAY_TASK'\n<작업 명세>\nCOLIDAY_TASK\n\n"
         "- 명령은 팀원이 일을 끝낼 때까지 기다렸다가 그 팀원의 보고를 출력한다. 몇 분 이상 걸릴 수 있으니\n"
         "  명령 실행 시간 제한을 60분(3600000ms)으로 지정하고, 끝나기 전에 다시 실행하지 않는다.\n"
+        "- 실행 도구가 명령이 끝나기 전에 세션 ID를 반환하면 그 ID로 기존 세션을 계속 기다리고, "
+        "종료 상태와 팀원 보고를 확인한다. 새 명령을 시작하지 않는다.\n"
         "- 팀원은 이 대화를 볼 수 없다. 명세에 필요한 맥락(목표, 관련 파일, 제약)을 모두 적는다.\n"
         "- 이 명령 말고 다른 방법으로 팀원을 흉내 내지 않는다.\n\n"
         f"### 팀원\n{_roles(resolved)}\n"

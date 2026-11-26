@@ -341,6 +341,50 @@ def test_오래된_작업을_이어서_시켜도_대기_시간초과로_정리�
     assert [e.message for e in store.events(job.id)] == ["이어서"]
 
 
+def test_읽어_둔_대기_작업으로_정리해도_그_사이_시작한_worker의_작업은_실패로_바꾸지_않는다(env, repo):
+    store = _store()
+    job = store.create_job(prompt="p", repo=str(repo), workdir=str(repo), model=None)
+    store._conn.execute("UPDATE jobs SET created_at = created_at - 3600 WHERE id = ?", (job.id,))
+    stale = store.active_jobs()[0]               # 화면이 매 초 읽는다: 아직 queued
+    assert store.start_job(job.id, os.getpid())  # 그 직후 worker 가 정상적으로 시작했다
+
+    result = jobs.reconcile(store, stale)
+
+    assert (result.status, result.pid) == ("running", os.getpid())
+    assert store.get_job(job.id).phase == "팀장 시작 중"
+
+
+def test_읽어_둔_죽은_worker_작업으로_정리해도_그_사이_다시_시작한_실행은_그대로다(env, repo):
+    store = _store()
+    job = store.create_job(prompt="p", repo=str(repo), workdir=str(repo), model=None)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    store.start_job(job.id, dead.pid)
+    stale = store.get_job(job.id)                # 죽은 pid 로 running
+    # 그 사이 이 실행이 끝나고 이어서 시켜 새 worker 가 시작했다
+    store.finish_job(job.id, "failed")
+    store.requeue_job(job.id, "이어서")
+    store.start_job(job.id, os.getpid())
+
+    assert jobs.reconcile(store, stale).status == "running"
+    assert store.get_job(job.id).pid == os.getpid()
+
+
+def test_읽은_상태가_그대로면_정리는_예전처럼_실패로_바꾼다(env, repo):
+    store = _store()
+    job = store.create_job(prompt="p", repo=str(repo), workdir=str(repo), model=None)
+    store._conn.execute("UPDATE jobs SET created_at = created_at - 3600 WHERE id = ?", (job.id,))
+    result = jobs.reconcile(store, store.active_jobs()[0])
+    assert (result.status, result.phase) == ("failed", "worker 시작 실패")
+
+    other = store.create_job(prompt="p", repo=str(repo), workdir=str(repo), model=None)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    store.start_job(other.id, dead.pid)
+    result = jobs.reconcile(store, store.get_job(other.id))
+    assert (result.status, result.phase) == ("failed", "worker 비정상 종료")
+
+
 def test_이어서_시킨_실행이_세션_없이_실패해도_이전_세션은_남는다(env, repo, monkeypatch):
     cli.main(["run", "x", "-C", str(repo)])
     fake_bin = env / "claude"
@@ -1497,3 +1541,55 @@ def test_샌드박스에서_도는_에이전트의_JVM은_화면_없는_모드�
     monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=false")   # 사용자가 정해 둔 값은 그대로 둔다
     assert members.agent_env(env_guard)["JAVA_TOOL_OPTIONS"] == "-Djava.awt.headless=false"
     assert members.agent_env(None) is None                                 # 샌드박스를 켜지 않는 작업은 환경을 바꾸지 않는다
+
+
+def test_run_from은_부모_작업에서_파생하고_ls에_부모_번호가_나온다(env, repo, capsys):
+    cli.main(["run", "부모 요청", "-C", str(repo / "sub")])
+    (config.load().worktrees_dir / "myrepo-1" / "sub" / "a.txt").write_text("부모가 고침\n")
+    capsys.readouterr()
+
+    assert cli.main(["run", "--from", "1", "자식 요청"]) == 0
+
+    out = capsys.readouterr().out
+    assert "작업 #2 시작" in out and "브랜치: coliday/2" in out
+    child = _store().get_job(2)
+    assert Path(child.workdir) == config.load().worktrees_dir / "myrepo-2" / "sub"
+    assert (Path(child.workdir) / "a.txt").read_text() == "부모가 고침\n"
+
+    assert cli.main(["ls"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert any("#2" in line and "↳#1 자식 요청" in line for line in lines)
+    assert any("#1" in line and "부모 요청" in line and "↳" not in line for line in lines)
+
+
+@pytest.mark.parametrize("extra", [["-C", "."], ["--no-worktree"]])
+def test_run_from은_C나_no_worktree와_함께_쓸_수_없다(env, repo, capsys, extra):
+    cli.main(["run", "부모", "-C", str(repo)])
+    capsys.readouterr()
+
+    assert cli.main(["run", "--from", "1", *extra, "자식"]) == 2
+
+    assert "--from 은 -C, --no-worktree 와 함께 쓸 수 없습니다" in capsys.readouterr().err
+    assert [j.id for j in _store().list_jobs()] == [1]
+
+
+def test_run_from은_없는_작업이면_거부한다(env, capsys):
+    assert cli.main(["run", "--from", "9", "자식"]) == 2
+    assert "작업 #9 을(를) 찾을 수 없습니다" in capsys.readouterr().err
+
+
+def test_rm은_하위_작업을_어디로_옮겼는지_알린다(env, tmp_path, capsys):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    cli.main(["run", "a", "-C", str(plain), "--no-worktree"])
+    cli.main(["run", "--from", "1", "b"])
+    cli.main(["run", "--from", "2", "c"])
+    cli.main(["run", "--from", "2", "d"])
+    capsys.readouterr()
+
+    assert cli.main(["rm", "2"]) == 0
+    assert "하위 작업 #3, #4 은(는) #1 밑으로 옮겼습니다." in capsys.readouterr().out
+    assert cli.main(["rm", "1"]) == 0
+    assert "하위 작업 #3, #4 은(는) 최상위로 옮겼습니다." in capsys.readouterr().out
+    assert cli.main(["rm", "3"]) == 0
+    assert "하위 작업" not in capsys.readouterr().out

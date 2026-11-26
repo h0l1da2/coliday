@@ -8,15 +8,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
 from coliday import guard, members, remote, team
-from coliday.jobs import organize as jobs_organize
+from coliday.jobs import one_line, organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
 from coliday.store import RESULT, Store
+
+
+_CLAUDE_BG_WAIT_ENV = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
+_CLAUDE_BG_WAIT_DEFAULT_MS = "3600000"
+_CLAUDE_BG_WAIT_WARNING = re.compile(
+    rb"Background tasks still running .+? after the last turn \(.*\); stopping them\. "
+    rb"Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely\."
+)
 
 
 def build_command(
@@ -125,12 +135,13 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
 
     # 후속 요청이 있으면 이어서 시킨 실행이다: 같은 세션을 resume 하고 로그는 덧붙인다.
     follow_up = store.last_follow_up(job_id)
-    prompt = follow_up.message if follow_up else job.prompt
+    prompt = follow_up.message if follow_up else _derived_note(store, job_id) + job.prompt
     resume = job.session_id if follow_up else None
 
     server: members.Server | None = None
     translator: Translator | CodexTranslator
-    if team.is_codex(job.model):
+    is_codex = team.is_codex(job.model)
+    if is_codex:
         # Codex 팀장: 지시문을 요청 앞에 붙이고, 팀원 실행 요청은 members.Server 가 받는다.
         server = members.Server(cfg, job, resolved, env_guard, cwd=workdir, helpers=helpers)
         cmd = build_codex_command(cfg, job.model, resume, server.directory, artifacts, env_guard, network=host is not None)
@@ -191,13 +202,18 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     keeper = remote.keep_alive(host) if host is not None else None  # 에이전트의 명령이 매번 새로 접속하지 않게
     try:
         with (job_dir / "stream.jsonl").open(log_mode, encoding="utf-8") as raw_log, \
-                stderr_path.open(log_mode, encoding="utf-8") as err_log:
+                stderr_path.open(log_mode + "b") as err_log:
+            stderr_start = err_log.tell()  # resume 로그에서는 이번 실행이 추가한 바이트만 검사한다
             if server:
                 server.start()
+            env = members.agent_env(env_guard)
+            if not is_codex:
+                env = dict(os.environ if env is None else env)
+                env.setdefault(_CLAUDE_BG_WAIT_ENV, _CLAUDE_BG_WAIT_DEFAULT_MS)
             proc = subprocess.Popen(
                 cmd, cwd=workdir, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=err_log, text=True, bufsize=1,
-                env=members.agent_env(env_guard),
+                env=env,
             )
             assert proc.stdin is not None and proc.stdout is not None
             proc.stdin.write(prompt)
@@ -224,8 +240,13 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         if keeper is not None:
             keeper.terminate()
 
-    ok = returncode == 0 and not translator.is_error
-    if not ok:
+    warning = None if is_codex else _claude_bg_wait_warning(stderr_path, stderr_start)
+    ok = returncode == 0 and not translator.is_error and warning is None
+    phase = "완료" if ok else "실패"
+    if warning is not None:
+        phase = "Claude 백그라운드 대기 한도 초과"
+        store.add_event(job_id, LEAD, "error", f"{phase} (종료 코드 {returncode}): {warning}")
+    elif not ok:
         tail = _tail(stderr_path)
         store.add_event(job_id, LEAD, "error", f"종료 코드 {returncode}" + (f": {tail}" if tail else ""))
     if translator.result:  # 상태를 끝으로 바꾸기 전에 남긴다 (끝난 작업을 본 쪽은 보고도 이미 볼 수 있게)
@@ -237,13 +258,41 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     finished = store.finish_or_continue(
         job_id,
         "succeeded" if ok else "failed",
-        phase="완료" if ok else "실패",
+        phase=phase,
         result=translator.result,
         cost_usd=_total_cost(job.cost_usd if follow_up else None, cost),
         # 이번 실행이 세션을 만들기 전에 실패해도 이전 세션 id 는 지우지 않는다 (다시 이어갈 수 있게).
         session_id=translator.session_id or job.session_id,
     )
     return (0 if ok else 1) if finished else None
+
+
+_PARENT_REPORT_LIMIT = 2000  # 파생 작업 안내에 붙이는 부모 보고의 최대 글자 수
+
+
+def _derived_note(store: Store, job_id: int) -> str:
+    """파생 작업의 첫 실행에서 요청 앞에 붙이는 안내. 파생 작업이 아니거나 출처 작업이 지워졌으면 빈 문자열.
+
+    jobs.prompt 에는 사용자가 쓴 요청만 남기고, 에이전트에게 줄 때만 붙인다.
+    목록의 부모(parent_id)는 부모를 지우면 조부모로 옮겨지므로 스냅샷을 뜬 출처(origin)를 쓴다.
+    """
+    try:
+        parent_id = store.origin(job_id)
+        if parent_id is None:
+            return ""
+        parent = store.get_job(parent_id)
+        report = (store.last_result(parent_id) or "").strip()
+    except (KeyError, sqlite3.Error):  # 안내 때문에 작업이 실패하면 안 된다
+        return ""
+    note = (
+        f"[파생 작업 안내] 이 작업은 #{parent.id}(요청: {one_line(parent.prompt, 200)})에서 파생됐다. "
+        "작업 디렉토리는 그 작업의 변경 위에서 시작한다 (그 변경은 이 작업 시작 시점의 기준 커밋에 들어 있다).\n"
+    )
+    if report:
+        if len(report) > _PARENT_REPORT_LIMIT:
+            report = report[:_PARENT_REPORT_LIMIT].rstrip() + "\n…(뒷부분 생략)"
+        note += f"\n## #{parent.id} 의 마지막 보고\n{report}\n"
+    return note + "\n## 이번 요청\n"
 
 
 def build_codex_command(
@@ -299,6 +348,19 @@ def _total_cost(previous: float | None, current: float | None) -> float | None:
     if previous is None or current is None:
         return current if previous is None else previous
     return previous + current
+
+
+def _claude_bg_wait_warning(path: Path, start: int) -> str | None:
+    try:
+        with path.open("rb") as log:
+            log.seek(start)
+            for line in log:
+                match = _CLAUDE_BG_WAIT_WARNING.fullmatch(line.rstrip(b"\r\n"))
+                if match:
+                    return match[0].decode("utf-8", errors="replace")
+    except OSError:
+        pass
+    return None
 
 
 def _tail(path, limit: int = 300) -> str:

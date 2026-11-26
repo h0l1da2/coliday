@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 
 from coliday import remote
@@ -70,6 +72,60 @@ def remove_worktree(repo: Location, path: Location, branch: str | None, force: b
     _git(repo, *args)
     if branch:
         _git(repo, "branch", "-D" if force else "-d", branch)
+
+
+# 스냅샷 커밋의 작성자. 사용자의 git 설정(user.name·email)이 없어도 커밋을 만들 수 있게 직접 준다.
+_SNAPSHOT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "coliday", "GIT_AUTHOR_EMAIL": "coliday@localhost",
+    "GIT_COMMITTER_NAME": "coliday", "GIT_COMMITTER_EMAIL": "coliday@localhost",
+}
+
+
+def snapshot(worktree: Location, message: str) -> str:
+    """worktree 의 지금 상태(커밋하지 않은 변경과 추적하지 않는 새 파일, .gitignore 된 것은 빼고)를 커밋으로 만들어 그 id 를 돌려준다.
+
+    임시 인덱스를 쓰므로 그 worktree 의 파일·인덱스·HEAD·브랜치는 그대로다 (커밋은 어느 브랜치에도 달지 않는다).
+    바뀐 것이 없으면 새 커밋을 만들지 않고 HEAD 를 돌려준다.
+    """
+    host, path = remote.split(worktree)
+    if host is not None:
+        return _remote_snapshot(host, path, message)
+    with tempfile.TemporaryDirectory(prefix="coliday-snapshot-") as tmp:
+        # 빈 파일은 깨진 인덱스로 보므로 아직 없는 경로를 준다
+        env = {**os.environ, "GIT_INDEX_FILE": os.path.join(tmp, "index"), **_SNAPSHOT_IDENTITY}
+
+        def git(*args: str) -> str:
+            proc = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=False, env=env)
+            if proc.returncode != 0:
+                raise GitError(proc.stderr.strip() or f"git {' '.join(args)} 실패")
+            return proc.stdout.strip()
+
+        git("read-tree", "HEAD")
+        git("add", "-A", ":/")  # 하위 폴더를 줘도 worktree 전체를 담는다
+        tree = git("write-tree")
+        head = git("rev-parse", "HEAD")
+        if tree == git("rev-parse", "HEAD^{tree}"):
+            return head
+        return git("commit-tree", "--no-gpg-sign", tree, "-p", head, "-m", message)
+
+
+def _remote_snapshot(host: str, path: str, message: str) -> str:
+    """같은 일을 서버에서 접속 한 번으로 한다."""
+    identity = " ".join(f"{k}={shlex.quote(v)}" for k, v in _SNAPSHOT_IDENTITY.items())
+    script = (
+        f"set -e; cd {shlex.quote(path)}; "
+        'tmp=$(mktemp -d); trap \'rm -rf "$tmp"\' EXIT; GIT_INDEX_FILE="$tmp/index"; export GIT_INDEX_FILE; '
+        "git read-tree HEAD; git add -A :/; tree=$(git write-tree); head=$(git rev-parse HEAD); "
+        'if [ "$tree" = "$(git rev-parse "HEAD^{tree}")" ]; then echo "$head"; '
+        f'else {identity} git commit-tree --no-gpg-sign "$tree" -p "$head" -m {shlex.quote(message)}; fi'
+    )
+    try:
+        out = remote.check(host, script, timeout=120).strip()
+    except remote.RemoteError as exc:
+        raise GitError(str(exc)) from exc
+    if not re.fullmatch(r"[0-9a-f]{40,64}", out.splitlines()[-1] if out else ""):
+        raise GitError(f"{host}: 스냅샷 커밋을 만들지 못했습니다: {out or '출력 없음'}")
+    return out.splitlines()[-1]
 
 
 def diff(workdir: Location, base: str | None) -> str:
