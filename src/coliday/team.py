@@ -62,19 +62,11 @@ _LEAD_TEMPLATE = """\
    같은 파일을 두 팀원이 동시에 고치게 하지 않는다.
 3. 구현이 끝나면 리뷰 담당과 검증 담당을 실행한다. 그 밖의 팀원은 각자의 설명에 적힌 때에 쓴다.
 4. [P0]~[P2] 문제나 검사 실패가 있으면 담당 구현자에게 재작업을 맡긴다.
-   같은 작업은 처음 시도를 포함해 최대 {max_attempts}번까지만 시도한다 (팀원에게 다시 맡기는 것과 직접 다시 해 보는 것 모두 센다).
-   {max_attempts}번 안에 해결되지 않으면 더 시도하지 말고 아래 "실패한 작업 정리"로 넘어간다.
+   {max_attempts}번 안에 해결되지 않으면 더 시도하지 말고 "실패한 작업 정리"를 따른다.
 5. 직접 코드를 수정하지 말고 위임한다. 단, 팀원 결과를 확인하려고 파일을 읽는 것은 괜찮다.
    어떤 단계를 맡을 팀원이 목록에 없으면 그 단계만 직접 한다.
 6. git commit, push, merge 는 하지 않는다. 변경은 작업 디렉토리에 남겨 사용자가 검토하게 한다.
 7. 모든 서브에이전트가 끝난 뒤 최종 보고한다.
-
-## 실패한 작업 정리
-어떤 작업이 {max_attempts}번 시도해도 실패하거나 팀원이 "최대 시도 횟수 도달"로 보고하면, 그 작업을 멈추고 직접 정리한다:
-- 반쯤 고친 코드가 빌드·테스트를 깨뜨리는지 확인하고, 깨뜨리면 그 작업의 변경만 되돌리거나 동작하는 상태로 맞춘다
-  (다른 작업의 변경이나 사용자가 원래 가지고 있던 변경은 건드리지 않는다).
-- 최종 보고에 그 작업을 "실패"로 적고, 시도한 방법과 횟수, 마지막 오류, 지금 코드 상태, 사용자가 할 수 있는 다음 선택지를 쓴다.
-- 나머지 작업은 가능한 범위에서 계속 진행한다.
 
 ## 최종 보고 (한국어)
 - 변경 요약 (파일별)
@@ -133,6 +125,27 @@ DEFAULT_AGENTS: dict[str, dict] = {
 }
 
 
+_FAILURE_HEADING = "## 실패한 작업 정리"
+
+# 팀장 지시문 뒤에 늘 붙는다 (사용자가 지시문을 고쳐 써도 빠지지 않는다. 팀원의 '실패했을 때' 규칙과 짝이다).
+_LEAD_FAILURE_RULE = f"""\
+
+{_FAILURE_HEADING}
+같은 작업은 처음 시도를 포함해 최대 {{max_attempts}}번까지만 시도한다 (팀원에게 다시 맡기는 것과 직접 다시 해 보는 것 모두 센다).
+방법을 바꿔도 목표가 같으면 같은 작업이다 (예: 테스트가 실행되지 않아 옵션·환경·우회 스크립트를 바꿔 가며 다시 돌리는 것).
+어떤 작업이 {{max_attempts}}번 시도해도 실패하거나 팀원이 "최대 시도 횟수 도달"로 보고하면, 같은 일을 다시 맡기지 말고 그 작업을 멈춘다.
+1. 원인을 직접 찾는다: 오류 메시지와 로그를 읽고, 코드 문제인지 실행 환경 문제(권한 거부·샌드박스·도구나 런타임 초기화 실패·외부 서비스)인지 가린다.
+2. 원인을 알았고 이 작업 안에서 고칠 수 있으면, 그 원인을 고치는 일로 한 번만 더 맡긴다. 그래도 실패하면 3으로 간다.
+3. 원인을 모르겠거나 이 작업 안에서 고칠 수 없으면 작업 전체를 거기서 끝내고 사용자에게 넘긴다. 남은 단계(리뷰·검증 등)를 이어가지 않는다.
+   최종 보고 맨 위에 "진행 중단"이라고 쓰고, 무엇이 왜 안 되는지(모르면 모른다고), 확인한 사실, 사용자가 해 줄 일을 적는다.
+끝내기 전에 정리한다:
+- 반쯤 고친 코드가 빌드·테스트를 깨뜨리는지 확인하고, 깨뜨리면 그 작업의 변경만 되돌리거나 동작하는 상태로 맞춘다
+  (다른 작업의 변경이나 사용자가 원래 가지고 있던 변경은 건드리지 않는다).
+- 최종 보고에 그 작업을 "실패"로 적고, 시도한 방법과 횟수, 마지막 오류, 지금 코드 상태, 사용자가 할 수 있는 다음 선택지를 쓴다.
+- 실패한 작업과 상관없이 이미 끝난 다른 작업의 결과는 그대로 두고 보고에 적는다.
+"""
+
+
 def lead_prompt(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS, artifacts: str | None = None,
     agents: dict[str, dict] | None = None, template: str | None = None,
@@ -153,15 +166,33 @@ def _render_lead(template: str | None, section: str, max_attempts: int, artifact
     text = (template or _LEAD_TEMPLATE).rstrip() + "\n"
     if TEAM_PLACEHOLDER not in text:  # 자리를 지운 지시문에도 팀원 목록은 넣는다 (없으면 맡길 방법을 모른다)
         text += f"\n{TEAM_PLACEHOLDER}\n"
+    text = _without_section(text, _FAILURE_HEADING) + _LEAD_FAILURE_RULE  # 예전 기본 지시문을 고쳐 쓴 것에는 옛 규칙이 들어 있다
     text = text.replace(_N, str(max_attempts)).replace(TEAM_PLACEHOLDER, section.strip())
     return text + _LEAD_ARTIFACTS_RULE.replace("{artifacts}", artifacts) if artifacts else text
+
+
+def _without_section(text: str, heading: str) -> str:
+    """마크다운에서 heading 으로 시작하는 절(다음 `## ` 제목 앞까지)을 뺀다."""
+    out, skipping = [], False
+    for line in text.split("\n"):
+        if line.strip() == heading:
+            skipping = True
+        elif skipping and line.startswith("## "):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return "\n".join(out).rstrip() + "\n"
 
 _MEMBER_RETRY_RULE = """\
 
 ## 실패했을 때
 명령·빌드·테스트 등 맡은 작업이 실패하면 원인을 고쳐 다시 시도하되, 같은 작업은 처음 시도를 포함해 최대 {max_attempts}번까지만 시도한다.
+방법을 바꿔도 목표가 같으면 같은 작업으로 센다: 테스트나 빌드가 실행되지 않아 옵션·환경 변수·우회 스크립트를 바꿔 가며 다시 돌리는 것은
+모두 한 작업의 시도다. 오래 걸리는 명령을 기다리며 결과를 거듭 확인하는 것으로 횟수를 피하지 않는다.
 {max_attempts}번 해도 안 되면 더 시도하지 말고 멈춘 뒤, "최대 시도 횟수 도달"이라고 밝히고 팀장에게 정리해서 보고한다:
 시도한 방법과 횟수, 마지막 오류 메시지, 지금 코드 상태(무엇을 바꿨고 무엇이 깨져 있는지). 성공한 것처럼 쓰지 않는다.
+코드가 아니라 실행 환경 때문에 막힌 것 같으면(권한 거부, Operation not permitted, 도구·런타임 초기화 실패 등) 그렇게 적는다:
+막힌 명령과 오류 원문을 그대로 붙인다. 그래야 팀장과 사용자가 원인을 찾는다.
 """
 
 
@@ -671,6 +702,13 @@ def without_codex(resolved: dict[str, dict]) -> tuple[dict[str, dict], list[str]
     """
     names = [name for name, spec in resolved.items() if is_codex(spec.get("model"))]
     return {n: {k: v for k, v in s.items() if not (n in names and k == "model")} for n, s in resolved.items()}, names
+
+
+def with_note(resolved: dict[str, dict], note: str) -> dict[str, dict]:
+    """팀원 지침 뒤에 이 작업에만 해당하는 안내(note)를 덧붙인다."""
+    if not note:
+        return resolved
+    return {name: {**spec, "prompt": f"{spec.get('prompt') or ''}\n{note}"} for name, spec in resolved.items()}
 
 
 def for_server(resolved: dict[str, dict], note: str) -> dict[str, dict]:

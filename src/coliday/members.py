@@ -210,16 +210,31 @@ def run_member(
     return ok, text, translator.cost_usd
 
 
+_HEADLESS = "-Djava.awt.headless=true"
+
+
 def agent_env(guard: EnvGuard | None) -> dict[str, str] | None:
-    """에이전트 프로세스의 환경. 샌드박스 안에서는 macOS 의 /usr/bin/java 가 JDK 를 찾지 못해, 미리 찾아 JAVA_HOME 으로 준다."""
-    if guard is None or sys.platform != "darwin" or os.environ.get("JAVA_HOME"):
+    """에이전트 프로세스의 환경. 샌드박스 안에서 Java 가 막히는 두 가지를 미리 피한다 (macOS).
+
+    - /usr/bin/java 가 JDK 를 찾지 못한다: 미리 찾아 JAVA_HOME 으로 준다.
+    - 화면(AWT)을 초기화하는 코드가 끝없이 멈춘다 (글꼴 너비를 재는 Apache POI 테스트 등. 오류도 내지 않아 에이전트가
+      하염없이 기다린다): 모든 JVM 이 읽는 JAVA_TOOL_OPTIONS 로 화면 없는 모드를 켠다. 사용자가 직접 정해 두었으면 건드리지 않는다.
+    """
+    if guard is None or sys.platform != "darwin":
         return None
-    try:
-        found = subprocess.run(["/usr/libexec/java_home"], capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    home = found.stdout.strip()
-    return {**os.environ, "JAVA_HOME": home} if found.returncode == 0 and home.startswith("/") else None
+    env = dict(os.environ)
+    options = env.get("JAVA_TOOL_OPTIONS", "")
+    if "java.awt.headless" not in options:
+        env["JAVA_TOOL_OPTIONS"] = f"{options} {_HEADLESS}".strip()
+    if not env.get("JAVA_HOME"):
+        try:
+            found = subprocess.run(["/usr/libexec/java_home"], capture_output=True, text=True, timeout=10, check=False)
+            home = found.stdout.strip()
+            if found.returncode == 0 and home.startswith("/"):
+                env["JAVA_HOME"] = home
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return env
 
 
 def _write_json(path: Path, data: dict) -> None:

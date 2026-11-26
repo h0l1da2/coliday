@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -99,7 +100,7 @@ class EnvGuard:
             "network": {"allowedDomains": ["*"], "allowLocalBinding": True, "allowAllUnixSockets": True},
             "filesystem": {
                 "denyRead": [f"/**/{PATTERN}"] if self.everywhere else self.globs,
-                "allowWrite": ["~/", "/tmp", "/private/tmp", *writable],
+                "allowWrite": ["~/", "/tmp", "/private/tmp", *_system_temp(), *writable],
                 "denyWrite": list(protected),
             },
         }
@@ -114,6 +115,54 @@ class EnvGuard:
     def codex_args(self, sandbox: str, writable: list[str] | tuple[str, ...] = (), *, network: bool = False) -> list[str]:
         """`codex exec` 에 줄 권한 프로필. `-s <샌드박스>` 와 쓰기 폴더 옵션을 대신한다."""
         return codex_profile(sandbox, writable, deny=self.globs, network=network)
+
+
+_CS_DARWIN_USER_TEMP_DIR = 65537  # <unistd.h>. 파이썬은 이 이름을 몰라 번호로 부른다
+
+
+def jdk_homes() -> list[str]:
+    """이 컴퓨터(macOS)에 설치된 JDK 의 홈 폴더들. 샌드박스 밖에서 미리 알아 둔다 (안에서는 알아내지 못한다)."""
+    if sys.platform != "darwin":
+        return []
+    try:
+        proc = subprocess.run(["/usr/libexec/java_home", "-V"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    found = re.findall(r"^\s+\S.*?\s(/\S.*/Contents/Home)\s*$", proc.stderr + proc.stdout, re.M)
+    return list(dict.fromkeys(found))
+
+
+def sandbox_note() -> str:
+    """샌드박스 안에서 달라지는 점을 에이전트에게 미리 알린다. 모르면 원인을 찾고 우회하느라 시간을 다 쓴다."""
+    homes = jdk_homes()
+    if not homes:
+        return ""
+    return (
+        "\n## 샌드박스에서 Java 를 쓸 때\n"
+        "명령은 샌드박스 안에서 실행된다. 여기서는 `/usr/libexec/java_home` 이 동작하지 않아 Gradle 이 설치된 JDK 를 자동으로 찾지 못한다 "
+        "(\"Cannot find a Java installation\" 오류). 프로젝트의 문제가 아니니 빌드 설정을 고치지 않는다.\n"
+        f"- 설치된 JDK: {', '.join(homes)}\n"
+        f"- Gradle 에는 `-Porg.gradle.java.installations.paths={','.join(homes)}` 를 붙여 실행한다.\n"
+    )
+
+
+def _system_temp() -> list[str]:
+    """이 사용자의 시스템 임시·캐시 폴더 (macOS 의 `/var/folders/…/T`, `…/C`).
+
+    샌드박스는 TMPDIR 를 `/tmp` 아래로 바꿔 주지만, TMPDIR 를 보지 않고 이 폴더를 직접 쓰는 도구가 있다.
+    JVM 이 그렇다: 실행 중인 JVM 에 붙는 통로(`.java_pid…`)를 여기에 만든다. 막혀 있으면 Mockito 를 쓰는 테스트가
+    전부 초기화에서 실패해, 에이전트가 우회로를 찾느라 시간을 다 쓴다.
+    """
+    if sys.platform != "darwin":
+        return []
+    try:
+        temp = os.confstr(_CS_DARWIN_USER_TEMP_DIR)
+    except (OSError, ValueError):
+        return []
+    if not temp:
+        return []
+    base = Path(temp).parent  # T(임시)와 C(캐시)가 함께 든 사용자별 폴더
+    return [str(base), str(base.resolve())] if base.resolve() != base else [str(base)]
 
 
 def codex_profile(

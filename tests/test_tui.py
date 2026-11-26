@@ -775,12 +775,13 @@ def test_타임라인과_diff를_드래그하면_클립보드에_복사된다(en
             await pilot.pause(0.3)
 
             await drag(pilot, "#timeline", (1, 0), (60, 10))
-            assert copied and "주문 취소 API 추가" in copied[-1]
+            await _until(pilot, lambda: bool(copied))  # 복사는 드래그가 끝난 뒤에 처리된다 (느린 컴퓨터에서 0.3초를 넘긴다)
+            assert "주문 취소 API 추가" in copied[-1]
             assert "architect에게 분배: 주문 취소 설계" in copied[-1]
             assert any("복사했습니다" in n.message for n in app._notifications)
 
             await drag(pilot, "#diff-pane", (1, 1), (10, 7))
-            assert "+new file" in copied[-1]
+            await _until(pilot, lambda: "+new file" in copied[-1])
 
             count = len(copied)
             await pilot.click("#jobs")  # 드래그 없이 클릭만 하면 다시 복사하지 않는다
@@ -1150,6 +1151,123 @@ def test_위치_줄과_보고에_적힌_경로를_누르면_그_폴더가_열린
             report.post_message(Markdown.LinkClicked(report, str(made / "gone.md")))   # 그사이 지워진 경로
             await pilot.pause(0.3)
             assert len(opened()) == 2
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_작업_목록에서_Space로_여러_개를_골라_한꺼번에_삭제한다(env, repo, monkeypatch):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        jobs.launch(cfg, store, prompt, repo, no_worktree=True)
+    monkeypatch.setenv("FAKE_CLAUDE_TOUCH", "created.txt")   # 넷째는 worktree 에 검토하지 않은 변경을 남긴다
+    jobs.launch(cfg, store, "넷째 작업", repo)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            table = app.query_one("#jobs", DataTable)
+            chat = app.query_one("#chat", Input)
+            await _until(pilot, lambda: all(j.is_terminal for j in store.list_jobs()))
+            await _until(pilot, lambda: app.selected_id == 4)
+            table.focus()
+            assert "Space" in str(table.border_subtitle)
+
+            await pilot.press("space")            # #4 선택, 커서는 한 줄 내려간다
+            await pilot.press("space")            # #3 선택
+            await pilot.pause()
+            assert app._marked == {4, 3} and app.selected_id == 2
+            assert chat.value == "" and app.focused is table       # Space 는 채팅 입력으로 넘어가지 않는다
+            assert "2개 선택" in str(table.border_subtitle)
+            assert str(table.get_cell("4", "st")).startswith("✔") and not str(table.get_cell("2", "st")).startswith("✔")
+
+            await pilot.press("up")
+            await pilot.press("space")            # #3 을 다시 누르면 선택이 풀린다
+            await pilot.pause()
+            assert app._marked == {4}
+            await pilot.press("escape")           # Esc 는 선택을 모두 푼다
+            await pilot.pause()
+            assert app._marked == set() and not str(table.get_cell("4", "st")).startswith("✔")
+
+            for _ in range(3):                    # 커서를 맨 위로 올려 #4, #3, #2 를 고른다
+                await pilot.press("up")
+            for _ in range(3):
+                await pilot.press("space")
+            await pilot.pause()
+            assert app._marked == {4, 3, 2}
+
+            await pilot.press("delete")           # 바로 지우지 않고 무엇을 지우는지 물어본다
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            assert "선택한 작업 3개(#4, #3, #2)" in app.screen._question
+            await pilot.press("n")
+            await pilot.pause()
+            assert table.row_count == 4 and app._marked == {4, 3, 2}
+
+            await pilot.press("delete")
+            await pilot.press("y")
+            await pilot.pause()
+            # 지울 수 있는 것은 지우고, 변경이 남은 worktree 는 한 번 더 묻는다
+            assert [j.id for j in store.list_jobs()] == [4, 1]
+            assert isinstance(app.screen, ConfirmScreen) and "작업 #4 의 worktree 에 검토하지 않은 변경" in app.screen._question
+            await pilot.press("n")
+            await pilot.pause()
+            assert [j.id for j in store.list_jobs()] == [4, 1] and app._marked == {4}   # 남은 것은 선택된 채로 둔다
+
+            await pilot.press("ctrl+r")           # Ctrl+R 도 선택한 것을 지운다
+            await pilot.press("y")
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            assert [j.id for j in store.list_jobs()] == [1] and app._marked == set()
+            assert table.row_count == 1 and app.selected_id == 1
+            assert "Space" in str(table.border_subtitle)
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_Ctrl_Y는_보이지_않는_부분까지_타임라인_전체를_복사한다(env, repo, monkeypatch):
+    copied = []   # 실제 클립보드를 건드리지 않는다
+    monkeypatch.setattr(ColidayApp, "copy_to_clipboard", lambda self, text: copied.append(text))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    jobs.launch(cfg, store, "첫 작업", repo, no_worktree=True)
+    jobs.launch(cfg, store, "주문 취소 API 추가", repo)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            table = app.query_one("#jobs", DataTable)
+            await _until(pilot, lambda: all(j.is_terminal for j in store.list_jobs()))
+            await _until(pilot, lambda: app.selected_id == 2)
+            for n in range(300):   # 화면을 훨씬 넘는 긴 타임라인
+                store.add_event(2, "architect", "tool", f"Bash step-{n}")
+            app.query_one("#chat", Input).focus()   # 채팅 입력 중에도 된다
+
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            text = copied[-1]
+            lines = text.splitlines()
+            assert lines[0] == "요청: 주문 취소 API 추가" and lines[1].startswith("위치: ") and "브랜치" in lines[1]
+            assert "architect에게 분배: 주문 취소 설계" in text and "최종 보고: 완료" in text and "── 팀장 보고 (" in text
+            assert "Bash step-0" in text and "Bash step-299" in text
+            import re
+            assert re.search(r"^\d\d:\d\d:\d\d architect  Bash step-7$", text, re.M)   # 화면의 줄 모양 그대로
+            assert "succeeded" in text and "첫 작업" not in text
+            assert any("타임라인을 복사했습니다" in n.message for n in app._notifications)
+
+            table.focus()                     # Space 로 고른 작업이 있으면 그것들을 모두 복사한다
+            await pilot.press("space")
+            await pilot.press("space")
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert copied[-1].startswith("요청: 첫 작업") and "\n\n요청: 주문 취소 API 추가" in copied[-1]
 
     try:
         _run(scenario())

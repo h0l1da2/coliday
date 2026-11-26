@@ -644,10 +644,14 @@ def test_최대_시도_횟수는_기본_5번이고_팀장과_팀원_지침에_�
     lead = argv[argv.index("--append-system-prompt") + 1]
     assert "최대 5번까지만 시도한다" in lead and "## 실패한 작업 정리" in lead
     assert "5번 시도해도 실패하거나" in lead and "{max_attempts}" not in lead
+    # 원인을 못 찾으면 이어가지 않고 사용자에게 넘긴다. 방법만 바꿔 같은 일을 되풀이하는 것도 같은 작업으로 센다
+    assert "작업 전체를 거기서 끝내고 사용자에게 넘긴다" in lead and '"진행 중단"' in lead
+    assert "방법을 바꿔도 목표가 같으면 같은 작업이다" in lead
     for name in ("architect", "coder", "reviewer", "verifier", "codex-coder"):  # Codex 래퍼도 역할 지침째로 넘긴다
         prompt = _role_prompt(agents, name)
         assert "최대 5번까지만 시도한다" in prompt, name
         assert '"최대 시도 횟수 도달"' in prompt and "{max_attempts}" not in prompt
+        assert "방법을 바꿔도 목표가 같으면 같은 작업으로 센다" in prompt and "오류 원문을 그대로 붙인다" in prompt, name
 
 
 def test_COLIDAY_MAX_ATTEMPTS로_최대_시도_횟수를_바꾼다(env, repo, monkeypatch, capsys):
@@ -1426,3 +1430,70 @@ def test_이어서_시킨_작업은_목록_맨_위로_올라오고_경과도_그
     store._conn.execute("UPDATE jobs SET status = 'running' WHERE id = 1")
     assert store.queue_message(1, "대기 요청")
     assert [j.id for j in store.list_jobs()] == [1, 2]
+
+
+def test_샌드박스는_시스템_임시_폴더에_쓸_수_있게_연다(tmp_path):
+    """JVM 은 TMPDIR 가 아니라 이 폴더에 attach 통로를 만든다. 막혀 있으면 Mockito 테스트가 전부 초기화에서 실패한다."""
+    from coliday import guard
+    settings = json.loads(guard.for_job(str(tmp_path), str(tmp_path), None, local=True).claude_settings())
+    allowed = settings["sandbox"]["filesystem"]["allowWrite"]
+    if sys.platform == "darwin":
+        temp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True).stdout.strip()
+        assert any(temp.startswith(path.rstrip("/") + "/") and path.startswith(("/var/folders/", "/private/var/folders/"))
+                   for path in allowed)
+    assert allowed[:3] == ["~/", "/tmp", "/private/tmp"]
+
+
+def test_실패한_작업_정리_규칙은_팀장_지시문을_고쳐_써도_늘_붙는다():
+    # 예전 기본 지시문을 고쳐 저장해 둔 경우: 옛 규칙 절은 빼고 지금 규칙을 붙인다. 사용자가 쓴 다른 내용은 그대로 둔다
+    custom = "너는 팀장이다.\n\n{team}\n\n## 실패한 작업 정리\n옛 규칙: 나머지 작업은 계속 진행한다.\n\n## 최종 보고\n- 내가 정한 보고 형식\n"
+    lead = team.lead_prompt(3, None, template=custom)
+    assert lead.startswith("너는 팀장이다.") and "- 내가 정한 보고 형식" in lead and "옛 규칙" not in lead
+    assert lead.count("## 실패한 작업 정리") == 1 and "최대 3번까지만 시도한다" in lead
+    assert "작업 전체를 거기서 끝내고 사용자에게 넘긴다" in lead and "{max_attempts}" not in lead
+
+    plain = team.lead_prompt(5, None, template="한 줄짜리 지시문")   # 그 절이 아예 없던 지시문에도 붙는다
+    assert plain.count("## 실패한 작업 정리") == 1 and "## 팀원" in plain
+    assert "## 실패한 작업 정리" not in team.lead_template(team.Custom())   # 고쳐 쓰는 원문에는 없다 (자동으로 붙는 규칙이다)
+
+
+def test_샌드박스에서_JDK를_찾지_못하는_점을_팀장과_팀원에게_미리_알린다(env, repo, monkeypatch):
+    from coliday import guard
+    java_home = env / "java_home"
+    java_home.write_text(
+        "#!/bin/sh\n"
+        "echo 'Matching Java Virtual Machines (2):' >&2\n"
+        "echo '    26 (arm64) \"Oracle Corporation\" - \"Java SE 26\" /Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home' >&2\n"
+        "echo '    25.0.5 (arm64) \"Eclipse Adoptium\" - \"OpenJDK 25.0.5\" /Library/Java/My JDKs/temurin-25.jdk/Contents/Home' >&2\n"
+        "echo /Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home\n"
+    )
+    java_home.chmod(0o755)
+    real_run = subprocess.run
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    monkeypatch.setattr(guard.subprocess, "run", lambda cmd, **kw: real_run(
+        [str(java_home), *cmd[1:]] if cmd[0] == "/usr/libexec/java_home" else cmd, **kw))
+    homes = ["/Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home", "/Library/Java/My JDKs/temurin-25.jdk/Contents/Home"]
+    assert guard.jdk_homes() == homes
+    note = guard.sandbox_note()
+    assert f"-Porg.gradle.java.installations.paths={','.join(homes)}" in note and "java_home" in note
+
+    java_home.write_text("#!/bin/sh\necho 'Unable to locate a Java Runtime.' >&2\nexit 1\n")   # JDK 가 없으면 알릴 것도 없다
+    assert guard.jdk_homes() == [] and guard.sandbox_note() == ""
+    assert team.with_note({"coder": {"prompt": "p"}}, "") == {"coder": {"prompt": "p"}}
+    assert team.with_note({"coder": {"prompt": "p", "model": "m"}}, "\n## 안내\n") == {"coder": {"prompt": "p\n\n## 안내\n", "model": "m"}}
+
+
+def test_샌드박스에서_도는_에이전트의_JVM은_화면_없는_모드로_켠다(tmp_path, monkeypatch):
+    """샌드박스 안에서 AWT 를 초기화하면 오류 없이 멈춘다 (POI 로 엑셀을 만드는 테스트가 끝나지 않는다)."""
+    from coliday import guard
+    env_guard = guard.for_job(str(tmp_path), str(tmp_path), None, local=True)
+    monkeypatch.setattr(members.sys, "platform", "darwin")
+    monkeypatch.setenv("JAVA_HOME", "/jdk")
+    monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Djava.net.preferIPv4Stack=true")
+    env = members.agent_env(env_guard)
+    assert env["JAVA_TOOL_OPTIONS"] == "-Djava.net.preferIPv4Stack=true -Djava.awt.headless=true" and env["JAVA_HOME"] == "/jdk"
+    monkeypatch.delenv("JAVA_TOOL_OPTIONS")
+    assert members.agent_env(env_guard)["JAVA_TOOL_OPTIONS"] == "-Djava.awt.headless=true"
+    monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Djava.awt.headless=false")   # 사용자가 정해 둔 값은 그대로 둔다
+    assert members.agent_env(env_guard)["JAVA_TOOL_OPTIONS"] == "-Djava.awt.headless=false"
+    assert members.agent_env(None) is None                                 # 샌드박스를 켜지 않는 작업은 환경을 바꾸지 않는다

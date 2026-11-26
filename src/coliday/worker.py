@@ -119,6 +119,9 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     env_rule = ""
     if env_guard is not None:
         env_rule = guard.LEAD_RULE if host is None else guard.LOCAL_ONLY_RULE
+        sandbox_note = guard.sandbox_note()  # 샌드박스 안에서 달라지는 점 (JDK 찾기)
+        env_rule += sandbox_note
+        resolved = team.with_note(resolved, sandbox_note)
 
     # 후속 요청이 있으면 이어서 시킨 실행이다: 같은 세션을 resume 하고 로그는 덧붙인다.
     follow_up = store.last_follow_up(job_id)

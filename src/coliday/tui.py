@@ -37,6 +37,7 @@ from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
     "models", "prompts", "cancel_job", "remove_job", "remove_listed_job", "timeline_scroll", "open_artifacts", "env_access",
+    "copy_timeline",
 })
 POLL_SEC = 1.0
 DIFF_EVERY_TICKS = 2
@@ -636,6 +637,7 @@ class ColidayApp(App[None]):
         Binding("ctrl+p", "prompts", "팀·프롬프트", priority=True, key_display="P"),
         Binding("ctrl+f", "open_artifacts", "결과물 폴더", priority=True, key_display="F"),
         Binding("ctrl+l", "env_access", ".env 허용", priority=True, key_display="L"),
+        Binding("ctrl+y", "copy_timeline", "타임라인 복사", priority=True, key_display="Y"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
         # 작업 목록에서 고른 채로 누르는 Delete (맥의 delete 는 backspace 로 들어온다). 입력 칸에서는 글자를 지우는 키라 priority 가 아니다.
@@ -660,6 +662,7 @@ class ColidayApp(App[None]):
         self._projects_error: str | None = None
         self.selected_id: int | None = None
         self._row_snapshot: dict[int, tuple] = {}
+        self._marked: set[int] = set()  # 작업 목록에서 Space 로 고른 작업들 (한꺼번에 삭제한다)
         self._last_event_id = 0
         self._result_shown = False
         self._result_event_seen = False
@@ -692,8 +695,9 @@ class ColidayApp(App[None]):
     def on_mount(self) -> None:
         table = self.query_one("#jobs", DataTable)
         table.border_title = "작업 목록"
+        self._update_marks_hint()
         self.query_one("#timeline").border_title = "타임라인"
-        self.query_one("#timeline").border_subtitle = "PgUp/PgDn·휠로 이전 내용 · 드래그하면 복사"
+        self.query_one("#timeline").border_subtitle = "PgUp/PgDn·휠로 이전 내용 · 드래그하면 복사 · Ctrl+Y 전체 복사"
         self.query_one("#diff-pane").border_title = "변경 사항"
         self.query_one("#diff-pane").border_subtitle = "드래그하면 복사"
         for key, label in (("st", ""), ("id", "#"), ("age", "경과"), ("repo", "레포"),
@@ -819,7 +823,9 @@ class ColidayApp(App[None]):
         table = self.query_one("#jobs", DataTable)
         rows = [jobs.reconcile(self.store, j) for j in self.store.list_jobs(100)]
         now = time.time()
-        snapshot = {j.id: self._row(j, now) for j in rows}
+        self._marked &= {j.id for j in rows}  # 다른 곳에서 지워진 작업은 선택에서도 뺀다
+        self._update_marks_hint()
+        snapshot = {j.id: self._row(j, now, j.id in self._marked) for j in rows}
         if list(snapshot) != list(self._row_snapshot):
             # 작업이 추가·삭제됐으면 다시 그리고 선택 위치를 유지한다.
             old_row = table.cursor_row
@@ -846,10 +852,12 @@ class ColidayApp(App[None]):
             self.query_one("#diff", Static).update(Text("아직 작업이 없습니다. 아래 입력창에 시킬 일을 쓰고 Enter 를 누르세요."))  # 문자열은 markup 으로 해석돼 [n] 이 사라진다
 
     @staticmethod
-    def _row(job: Job, now: float) -> tuple:
+    def _row(job: Job, now: float, marked: bool = False) -> tuple:
         style = _STATUS_STYLE.get(job.status, "")
+        status = Text("✔" if marked else " ", style="bold yellow")  # 선택 표시는 늘 한 칸을 차지한다 (열 너비가 변하지 않게)
+        status.append(STATUS_ICON.get(job.status, "?"), style=style)
         return (
-            Text(STATUS_ICON.get(job.status, "?"), style=style),
+            status,
             str(job.id),
             jobs.ago(now - job.last_asked),
             remote.name(job.repo),
@@ -1179,8 +1187,16 @@ class ColidayApp(App[None]):
         if len(self.screen_stack) > 1:
             return  # 대화 상자가 떠 있을 때는 그쪽 입력이다
         chat = self.query_one("#chat", Input)
+        table = self.query_one("#jobs", DataTable)
         if event.key == "escape" and self.focused is chat:
-            self.query_one("#jobs", DataTable).focus()
+            table.focus()
+            event.stop()
+        elif event.key == "space" and self.focused is table:
+            self._toggle_mark()  # 글자가 아니라 선택이다 (채팅 입력으로 넘기지 않는다)
+            event.stop()
+        elif event.key == "escape" and self.focused is table and self._marked:
+            self._marked.clear()
+            self.refresh_jobs()
             event.stop()
         elif event.is_printable and event.character and not isinstance(self.focused, Input):
             chat.focus()
@@ -1301,35 +1317,84 @@ class ColidayApp(App[None]):
         if self.focused is self.query_one("#jobs"):  # 프로젝트 목록 등 다른 곳에서 누른 것은 무시한다
             self.action_remove_job()
 
-    def action_remove_job(self) -> None:
-        job = self._selected_job()
-        if job is None:
-            return
-
-        def remove(force: bool) -> None:
+    def action_copy_timeline(self) -> None:
+        """타임라인 전체를 글자로 복사한다 (화면에 보이지 않는 앞부분까지). Space 로 고른 작업이 있으면 그것들을 모두."""
+        ids = sorted(self._marked) or ([self.selected_id] if self.selected_id is not None else [])
+        parts = []
+        for job_id in ids:
             try:
-                message = jobs.remove(self.cfg, self.store, self.store.get_job(job.id), force=force)
+                parts.append(timeline_text(self.store, self.store.get_job(job_id)))
             except KeyError:
-                message = f"작업 #{job.id} 은(는) 이미 삭제됐습니다."
-            except WorktreeRemoveError as exc:
-                if force:
-                    self.notify(str(exc), severity="error", timeout=10)
-                    return
-                self.push_screen(
-                    ConfirmScreen(f"작업 #{job.id} 의 worktree 에 검토하지 않은 변경이 있습니다.\n변경을 버리고 삭제할까요?"),
-                    lambda ok: remove(True) if ok else None,
-                )
-                return
-            except (JobError, gitops.GitError) as exc:
-                self.notify(str(exc), severity="error", timeout=10)
-                return
-            self.notify(message)
-            self.refresh_jobs()  # 목록에서 바로 사라진다
+                continue  # 그사이 삭제됐다
+        if not parts:
+            self.notify("복사할 작업이 없습니다.", severity="warning")
+            return
+        text = "\n\n".join(parts)
+        self._copied = text  # 마우스를 떼는 순간의 '선택 복사'가 이것을 덮어쓰지 않게 한다
+        self.copy_to_clipboard(text)
+        names = ", ".join(f"#{i}" for i in ids)
+        self.notify(f"작업 {names} 의 타임라인을 복사했습니다 ({len(text.splitlines())}줄)", timeout=3)
 
-        self.push_screen(
-            ConfirmScreen(f"작업 #{job.id} 을(를) 삭제할까요? 목록·기록과 worktree·브랜치가 지워집니다."),
-            lambda ok: remove(False) if ok else None,
+    def _toggle_mark(self) -> None:
+        """커서가 있는 작업을 선택하거나 선택을 푼다. 이어서 고르기 쉽게 커서를 한 줄 내린다."""
+        table = self.query_one("#jobs", DataTable)
+        if self.selected_id is None or not table.row_count:
+            return
+        self._marked ^= {self.selected_id}
+        self.refresh_jobs()
+        table.action_cursor_down()
+
+    def _update_marks_hint(self) -> None:
+        table = self.query_one("#jobs", DataTable)
+        table.border_subtitle = (
+            f"{len(self._marked)}개 선택 · Delete 로 함께 삭제 · Esc 선택 해제" if self._marked
+            else "Space 로 여러 개 선택 · Delete 삭제"
         )
+
+    def action_remove_job(self) -> None:
+        """고른 작업을 삭제한다. Space 로 선택해 둔 작업이 있으면 그것들을 한꺼번에, 없으면 보고 있는 작업 하나를."""
+        ids = sorted(self._marked, reverse=True)
+        if not ids:
+            job = self._selected_job()
+            if job is None:
+                return
+            ids = [job.id]
+        names = ", ".join(f"#{i}" for i in ids)
+
+        def remove(targets: list[int], force: bool) -> None:
+            done, dirty, errors, messages = [], [], [], []
+            for job_id in targets:
+                try:
+                    messages.append(jobs.remove(self.cfg, self.store, self.store.get_job(job_id), force=force))
+                    done.append(job_id)
+                except KeyError:
+                    messages.append(f"작업 #{job_id} 은(는) 이미 삭제됐습니다.")
+                    done.append(job_id)
+                except WorktreeRemoveError as exc:
+                    (errors if force else dirty).append((job_id, str(exc)))
+                except (JobError, gitops.GitError) as exc:
+                    errors.append((job_id, str(exc)))
+            self._marked -= set(done)
+            if messages:
+                self.notify("\n".join(messages))
+            for job_id, reason in errors:  # 하나가 실패해도 나머지는 지운다. 실패한 것은 이유와 함께 남는다
+                self.notify(f"작업 #{job_id}: {reason}", severity="error", timeout=10)
+            self.refresh_jobs()  # 목록에서 바로 사라진다
+            if dirty:
+                left = [job_id for job_id, _ in dirty]
+                self.push_screen(
+                    ConfirmScreen(
+                        f"작업 {', '.join(f'#{i}' for i in left)} 의 worktree 에 검토하지 않은 변경이 있습니다.\n"
+                        "변경을 버리고 삭제할까요?"
+                    ),
+                    lambda ok: remove(left, True) if ok else None,
+                )
+
+        question = (
+            f"작업 {names} 을(를) 삭제할까요? 목록·기록과 worktree·브랜치가 지워집니다." if len(ids) == 1
+            else f"선택한 작업 {len(ids)}개({names})를 삭제할까요? 목록·기록과 worktree·브랜치가 지워집니다."
+        )
+        self.push_screen(ConfirmScreen(question), lambda ok: remove(ids, False) if ok else None)
 
 
 def _pbcopy(text: str) -> None:
@@ -1354,6 +1419,25 @@ def _diff_renderable(text: str) -> Text:
             style = ""
         out.append(line + "\n", style=style)
     return out
+
+
+def timeline_text(store: Store, job: Job) -> str:
+    """작업 하나의 타임라인을 화면에 보이는 그대로 글자로 만든다: 요청, 위치, 시각·담당·내용 줄, 팀장 보고."""
+    lines = [f"요청: {job.prompt}", f"위치: {job.workdir}" + (f"  (브랜치 {job.branch})" if job.branch else "")]
+    reported = False
+    for ev in store.events(job.id):
+        if ev.kind == RESULT:
+            reported = True
+            ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
+            lines += [f"── 팀장 보고 ({ts}) ──", ev.message.strip()]
+        else:
+            lines.append(_event_line(ev).plain.rstrip())
+    if job.is_terminal:
+        lines.append(f"{STATUS_ICON.get(job.status, '?')} {job.status}  {job.phase}"
+                     + (f"   비용 ${job.cost_usd:.4f}" if job.cost_usd is not None else ""))
+        if job.result and not reported:  # 보고를 이벤트로 남기기 전에 끝난 작업
+            lines += ["── 팀장 보고 ──", job.result.strip()]
+    return "\n".join(lines)
 
 
 def _event_line(ev: EventRow) -> Text:
