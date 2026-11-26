@@ -346,7 +346,7 @@ def _cmd_ls(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
         icon = STATUS_ICON.get(j.status, "?")
         repo = remote.name(j.repo)
         print(
-            f"{icon} #{j.id:<4} {jobs.ago(now - j.created_at):>6}  {repo:<20.20}  "
+            f"{icon} #{j.id:<4} {jobs.ago(now - j.last_asked):>6}  {repo:<20.20}  "
             f"{_pad(jobs.one_line(j.prompt, 40), 40)}  {jobs.one_line(j.phase, 50)}"
         )
     return 0
@@ -380,9 +380,8 @@ def _cmd_diff(cfg: config.Config, store: Store, args: argparse.Namespace) -> int
 
 def _cmd_open(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
     root = jobs.open_artifacts(cfg, store, args.id)
-    files = [p for p in jobs.artifacts(cfg, args.id) if jobs.is_media(p)]
-    print(f"결과물 {jobs.artifacts_summary(jobs.artifacts(cfg, args.id))}: {root}" if files
-          else f"아직 결과물(사진·영상)이 없습니다: {root}")
+    files = jobs.artifacts(cfg, args.id)
+    print(f"결과물 {jobs.artifacts_summary(files)}: {root}" if files else f"아직 결과물이 없습니다: {root}")
     for path in files:
         print(f"  {path.relative_to(root)}")
     return 0
@@ -433,7 +432,7 @@ def _follow(store: Store, job_id: int, after_id: int = 0) -> int:
 
 def _print_artifacts(cfg: config.Config, job_id: int) -> None:
     files = jobs.artifacts(cfg, job_id)
-    if any(jobs.is_media(p) for p in files):
+    if files:
         print(f"결과물 {jobs.artifacts_summary(files)}: {cfg.artifacts_dir(job_id)}  (열기: coliday open {job_id})")
 
 

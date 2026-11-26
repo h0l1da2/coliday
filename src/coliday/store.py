@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS job_options (
 );
 """
 
+# 실행 중에 보낸 요청(QUEUED)은 전달될 때 FOLLOW_UP 으로 바뀐다. 둘 다 사용자가 이어서 시킨 것이다.
+_SELECT_JOBS = (
+    "SELECT j.*, (SELECT MAX(e.ts) FROM events e WHERE e.job_id = j.id AND e.kind IN ('prompt', 'queued')) AS asked_at "
+    "FROM jobs j"
+)
+
 _UPDATABLE = frozenset(
     {
         "workdir", "branch", "base_commit", "status", "phase", "pid", "session_id", "model",
@@ -76,6 +82,12 @@ class Job:
     created_at: float
     started_at: float | None
     finished_at: float | None
+    asked_at: float | None = None  # 마지막으로 이어서 시킨 시각 (그런 적이 없으면 None). 표에는 없고 읽을 때 계산한다
+
+    @property
+    def last_asked(self) -> float:
+        """사용자가 이 작업에 마지막으로 요청한 시각. 작업 목록의 순서와 '경과'의 기준이다."""
+        return self.asked_at or self.created_at
 
     @property
     def is_terminal(self) -> bool:
@@ -126,14 +138,15 @@ class Store:
         return bool(row and row["allow_env"])
 
     def get_job(self, job_id: int) -> Job:
-        row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        row = self._conn.execute(f"{_SELECT_JOBS} WHERE j.id = ?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
         return Job(**dict(row))
 
     def list_jobs(self, limit: int = 30) -> list[Job]:
+        """마지막으로 요청한 것이 위로 오게 늘어놓는다 (이어서 시킨 작업은 그때 맨 위로 올라온다)."""
         rows = self._conn.execute(
-            "SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)
+            f"{_SELECT_JOBS} ORDER BY COALESCE(asked_at, j.created_at) DESC, j.id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [Job(**dict(r)) for r in rows]
 

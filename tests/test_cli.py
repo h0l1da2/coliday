@@ -1,10 +1,13 @@
 """가짜 claude 로 run → worker → 저장 → 조회 전체 흐름을 검증한다."""
 
+import dataclasses
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -703,12 +706,12 @@ def test_결과물이_있으면_경로를_알려주고_open으로_폴더를_연�
 
     assert cli.main(["open", "1"]) == 0
     out = capsys.readouterr().out
-    assert "login-page.png" in out and ".hidden" not in out and "notes.txt" not in out
-    # 하위 폴더에 저장한 사진·영상은 맨 위로 꺼내 한 폴더에서 다 보이게 하고, 나머지는 _other 로 모은다
+    assert "login-page.png" in out and ".hidden" not in out
+    assert "notes.txt" in out  # 맨 위에 둔 사진·영상 아닌 파일은 사용자가 확인할 파일이다: 그대로 두고 함께 보여 준다
+    # 하위 폴더에 저장한 사진·영상은 맨 위로 꺼내 한 폴더에서 다 보이게 한다
     assert "flows-order-cancel.webm" in out and "flows/" not in out
     assert sorted(p.name for p in folder.iterdir() if not p.name.startswith(".")) == [
-        "_other", "flows-order-cancel.webm", "login-page.png"]
-    assert (folder / "_other" / "notes.txt").is_file()
+        "flows-order-cancel.webm", "login-page.png", "notes.txt"]
     _wait(lambda: (env / "opened.txt").exists())
     assert (env / "opened.txt").read_text().strip() == str(folder)
 
@@ -722,7 +725,7 @@ def test_결과물이_있으면_경로를_알려주고_open으로_폴더를_연�
     assert not folder.exists()
 
 
-def test_결과물_정리는_사진_영상만_맨_위에_늘어놓고_나머지는_other로_모은다(tmp_path):
+def test_결과물_정리는_사진_영상을_맨_위로_꺼내고_하위_폴더의_나머지는_other로_모은다(tmp_path):
     root = tmp_path / "artifacts"
     (root / "verify" / "deep").mkdir(parents=True)
     (root / "01-ok.png").write_text("top")
@@ -738,10 +741,11 @@ def test_결과물_정리는_사진_영상만_맨_위에_늘어놓고_나머지�
     jobs.organize(root)  # 여러 번 불러도 같다
 
     assert sorted(p.name for p in root.iterdir()) == [
-        ".tmp", "01-ok.png", "_other", "verify-01-ok-2.png", "verify-01-ok.png", "verify-deep-flow.WEBM"]
+        ".tmp", "01-ok.png", "_other", "dom-ok.html", "verify-01-ok-2.png", "verify-01-ok.png", "verify-deep-flow.WEBM"]
     assert (root / "verify-01-ok.png").read_text() == "already" and (root / "verify-01-ok-2.png").read_text() == "nested"
     assert sorted(str(p.relative_to(root / "_other")) for p in (root / "_other").rglob("*") if p.is_file()) == [
-        "dom-ok.html", "verify/check.js"]
+        "verify/check.js"]
+    assert jobs.artifacts_summary([root / "report.md"]) == "파일 1개"   # 사진·영상 없이 확인할 파일만 있을 때
 
 
 def test_실행중에는_결과물_폴더를_정리하지_않는다(env, repo, monkeypatch, capsys):
@@ -772,7 +776,7 @@ def test_결과물이_아직_없어도_open은_폴더를_열고_없다고_알린
     capsys.readouterr()
 
     assert cli.main(["open", "1"]) == 0
-    assert "아직 결과물(사진·영상)이 없습니다" in capsys.readouterr().out
+    assert "아직 결과물이 없습니다" in capsys.readouterr().out
     _wait(lambda: (env / "opened.txt").exists())
     assert (env / "opened.txt").read_text().strip() == str(config.load().artifacts_dir(1))
     assert cli.main(["open", "99"]) == 2
@@ -1322,3 +1326,103 @@ def test_env_명령으로_작업_도중에_허용하고_막힌_읽기를_타임�
     assert guard.blocked_read({"type": "user", "x": "/w/.env.prod File is in a directory that is denied by your permission settings."})
     assert not guard.blocked_read({"type": "user", "x": "cat: a.txt: Operation not permitted"})
     assert not guard.blocked_read({"type": "system", "x": ".env Operation not permitted"})
+
+
+def test_보고에_적힌_경로_가운데_실제로_있는_것만_링크가_된다(tmp_path):
+    work = tmp_path / "work"
+    (work / "src").mkdir(parents=True)
+    (work / "src" / "a.py").write_text("x")
+    (work / "한글 폴더").mkdir()
+    (work / "한글 폴더" / "보고서.md").write_text("x")
+    href = lambda path: quote(str(path), safe="/")
+
+    text = jobs.link_paths(
+        f"`src/a.py:12` 수정, `git status`, `없는.py`. 보고서는 {work}/src/a.py에 있고 폴더는 {work}/src.\n"
+        f"`{work}/한글 폴더/보고서.md` https://example.com/a/b and/or ~/ / [기존](/tmp)\n"
+        f"```\n{work}/src/a.py\n```",
+        str(work),
+    )
+    lines = text.split("\n")
+    assert f"[`src/a.py:12`]({href(work / 'src' / 'a.py')})" in lines[0]            # 줄 번호가 붙어도 파일을 찾는다
+    assert "`git status`, `없는.py`." in lines[0]                                   # 없는 경로는 그대로
+    assert f"[{work}/src/a.py]({href(work / 'src' / 'a.py')})에 있고" in lines[0]    # 붙여 쓴 조사는 링크 밖
+    assert f"[{work}/src]({href(work / 'src')})." in lines[0]
+    assert f"({href(work / '한글 폴더' / '보고서.md')})" in lines[1] and "%20" in lines[1]
+    assert "https://example.com/a/b and/or ~/ / [기존](/tmp)" in lines[1]            # URL·단어 사이의 /·기존 링크는 그대로
+    assert lines[3] == f"{work}/src/a.py"                                           # 코드 블록 안은 건드리지 않는다
+
+    # 서버의 프로젝트: 지정한 폴더 밖의 경로는 이 컴퓨터에 있어도 링크하지 않는다
+    assert jobs.link_paths(f"{tmp_path} `src/a.py`", str(work), within=str(work)) == (
+        f"{tmp_path} [`src/a.py`]({href(work / 'src' / 'a.py')})")
+
+
+def test_폴더_열기는_파일을_실행하지_않고_그_파일이_든_폴더를_연다(env, tmp_path, monkeypatch):
+    cfg = config.load()   # env 의 가짜 open 은 받은 인자를 opened.txt 에 적는다
+    folder = tmp_path / "out"
+    folder.mkdir()
+    (folder / "report.md").write_text("x")
+    (folder / "Evil.app").mkdir()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert jobs.open_folder(cfg, folder) == folder
+    assert jobs.open_folder(cfg, folder / "report.md") == folder
+    log = env / "opened.txt"
+    _wait(lambda: log.exists() and len(log.read_text().split()) == 2)
+    assert log.read_text().split() == [str(folder), str(folder)]
+    with pytest.raises(jobs.JobError, match="없는 경로"):
+        jobs.open_folder(cfg, folder / "none")
+
+    # macOS 의 open 은 .app 같은 묶음 폴더를 실행하므로 위치만 보여 준다
+    monkeypatch.setattr(sys, "platform", "darwin")
+    opened = []
+    monkeypatch.setattr(jobs.subprocess, "Popen", lambda cmd, **_: opened.append(cmd))
+    cfg = dataclasses.replace(cfg, open_bin="open")
+    assert jobs.open_folder(cfg, folder / "Evil.app") == folder
+    assert jobs.open_folder(cfg, folder / "report.md") == folder
+    assert jobs.open_folder(cfg, folder) == folder
+    assert opened == [["open", "-R", str(folder / "Evil.app")], ["open", "-R", str(folder / "report.md")], ["open", str(folder)]]
+
+
+def test_보고에_중간_폴더를_빼먹은_경로는_실제_위치를_찾아_옆에_붙인다(tmp_path):
+    work = tmp_path / "work"
+    (work / "out" / "_output").mkdir(parents=True)
+    (work / "out" / "_output" / "result.csv").write_text("x")
+    (work / "a").mkdir()
+    (work / "b").mkdir()
+    (work / "a" / "same.txt").write_text("x")
+    (work / "b" / "same.txt").write_text("x")
+    actual = quote(str(work / "out" / "_output" / "result.csv"), safe="/")
+
+    text = jobs.link_paths(f"결과는 {work}/out/result.csv 와 `out/result.csv`", str(work))
+    assert text.count(f"(실제 위치: [`out/_output/result.csv`]({actual}))") == 2
+    assert f"{work}/out/result.csv (실제 위치" in text          # 적힌 글자는 그대로 둔다
+    # 폴더도 찾는다. 이름이 같은 것이 둘 이상이거나 경로처럼 생기지 않은 것은 건드리지 않는다
+    assert "(실제 위치: [`out/_output`]" in jobs.link_paths("`reports/_output`", str(work))
+    for plain in ("`x/same.txt`", "`result.csv`", "`git status`", "`x/none.md`", "`https://a.example/out/result.csv`"):
+        assert jobs.link_paths(plain, str(work)) == plain
+
+
+def test_이어서_시킨_작업은_목록_맨_위로_올라오고_경과도_그때부터_센다(env, repo, capsys):
+    cli.main(["run", "첫 작업", "-C", str(repo)])
+    cli.main(["run", "둘째 작업", "-C", str(repo)])
+    store = _store()
+    old = time.time() - 7300   # 둘 다 두 시간쯤 전에 시킨 작업으로 만든다
+    store._conn.execute("UPDATE jobs SET created_at = ? + id", (old,))
+    assert [j.id for j in store.list_jobs()] == [2, 1]
+    assert store.get_job(1).last_asked == store.get_job(1).created_at
+
+    cli.main(["continue", "1", "하나 더"])   # 끝난 작업에 이어서 시킨다
+    assert [j.id for j in store.list_jobs()] == [1, 2]
+    assert time.time() - store.get_job(1).last_asked < 60 and store.get_job(1).created_at < time.time() - 7000
+    capsys.readouterr()
+    cli.main(["ls"])
+    first, second = capsys.readouterr().out.strip().splitlines()
+    assert "#1" in first and " 2h " not in first and "#2" in second and " 2h " in second
+
+    # 실행 중에 보낸 요청(대기)도 요청한 시각으로 친다
+    store._conn.execute("UPDATE events SET ts = ? WHERE job_id = 1", (old,))
+    store._conn.execute("UPDATE jobs SET status = 'running' WHERE id = 2")
+    assert [j.id for j in store.list_jobs()] == [2, 1]
+    store._conn.execute("UPDATE jobs SET status = 'running' WHERE id = 1")
+    assert store.queue_message(1, "대기 요청")
+    assert [j.id for j in store.list_jobs()] == [1, 2]

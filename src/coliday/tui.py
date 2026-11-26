@@ -24,6 +24,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button, Checkbox, DataTable, Footer, Header, Input, Label, Markdown, Select, Static, TextArea,
 )
@@ -91,6 +92,18 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool, bool] | None]):
     @on(Button.Pressed, "#close")
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+class FolderLine(Static):
+    """타임라인의 '위치' 줄. 클릭하면 그 폴더를 연다."""
+
+    def __init__(self, text: Text, path: str) -> None:
+        super().__init__(text, classes="folder-line")
+        self._path = path
+
+    def on_click(self) -> None:
+        if not self.screen.get_selected_text():  # 경로를 드래그해 복사하는 중이면 열지 않는다
+            self.app.open_path(self._path)
 
 
 class ArtifactBar(Static):
@@ -574,6 +587,7 @@ class ColidayApp(App[None]):
     #jobs { height: 2fr; border: round $primary; }
     #timeline { height: 3fr; border: round $secondary; }
     #timeline Markdown { margin: 0; padding: 0; }
+    .folder-line:hover { background: $primary; color: $text; }
     #artifacts { height: auto; padding: 0 1; background: $boost; color: $text-muted; text-style: underline; display: none; }
     #artifacts.-shown { display: block; }
     #artifacts.-has { color: $success; }
@@ -837,7 +851,7 @@ class ColidayApp(App[None]):
         return (
             Text(STATUS_ICON.get(job.status, "?"), style=style),
             str(job.id),
-            jobs.ago(now - job.created_at),
+            jobs.ago(now - job.last_asked),
             remote.name(job.repo),
             jobs.one_line(job.prompt, 40),
             Text(jobs.one_line(job.phase, 60), style=style),
@@ -875,9 +889,11 @@ class ColidayApp(App[None]):
         self.call_after_refresh(log.scroll_end, animate=False)  # 최신 내용부터 보여준다. 이전 내용은 위로 올려 본다
         job = self.store.get_job(job_id)
         log.border_title = f"타임라인 #{job.id}"
+        where = Text(f"위치: {job.workdir}" + (f"  (브랜치 {job.branch})" if job.branch else ""), style="dim")
+        local = None if remote.is_remote(job.workdir or job.repo) else job.workdir
         self._timeline_write(
             Text(f"요청: {job.prompt}", style="bold"),
-            Text(f"위치: {job.workdir}" + (f"  (브랜치 {job.branch})" if job.branch else ""), style="dim"),
+            FolderLine(where.append("  ← 클릭하면 폴더 열기"), local) if local else where,
         )
         self.query_one("#diff-pane").border_title = f"변경 사항 #{job.id}"
         self.query_one("#diff", Static).update("diff 계산 중…")
@@ -895,7 +911,7 @@ class ColidayApp(App[None]):
         new_events = self.store.events(job.id, after_id=self._last_event_id)
         if new_events:
             # 연달아 온 이벤트는 위젯 하나로 묶는다 (이벤트마다 위젯을 만들면 긴 작업에서 느려진다).
-            items: list[Text | Markdown] = []
+            items: list[Text | Widget] = []
             lines: list[Text] = []
             for ev in new_events:
                 if ev.kind != RESULT:
@@ -906,7 +922,7 @@ class ColidayApp(App[None]):
                     items.append(Text("\n").join(lines))
                     lines = []
                 ts = time.strftime("%H:%M:%S", time.localtime(ev.ts))
-                items += [Text(f"── 팀장 보고 ({ts}) ──", style="bold"), Markdown(ev.message)]
+                items += [Text(f"── 팀장 보고 ({ts}) ──", style="bold"), self._report(job, ev.message)]
             if lines:
                 items.append(Text("\n").join(lines))
             self._timeline_write(*items)
@@ -919,7 +935,7 @@ class ColidayApp(App[None]):
                            + (f"   비용 ${job.cost_usd:.4f}" if job.cost_usd is not None else ""),
                            style=_STATUS_STYLE.get(job.status, ""))
             if job.result and not self._result_event_seen:  # 보고를 이벤트로 남기기 전에 끝난 작업
-                self._timeline_write(summary, Text("── 팀장 보고 ──", style="bold"), Markdown(job.result))
+                self._timeline_write(summary, Text("── 팀장 보고 ──", style="bold"), self._report(job, job.result))
             else:
                 self._timeline_write(summary)
         # 실행 중이면 주기적으로, 방금 끝났으면 한 번 더 diff 를 계산한다.
@@ -940,10 +956,35 @@ class ColidayApp(App[None]):
             self.sub_title = "새 버전 있음 · coliday update"
             self.notify(text, title="업데이트", timeout=10)
 
-    def _timeline_write(self, *items: Text | Markdown) -> None:
+    def _report(self, job: Job, text: str) -> Markdown:
+        """팀장 보고. 적힌 경로 가운데 이 컴퓨터에 있는 것은 누르면 그 폴더가 열린다."""
+        within = str(self.cfg.home) if remote.is_remote(job.workdir or job.repo) else None
+        try:
+            text = jobs.link_paths(text, jobs.local_workdir(self.cfg, job), within, [str(self.cfg.artifacts_dir(job.id))])
+        except Exception:  # 링크를 못 만들어도 보고는 보여야 한다
+            pass
+        return Markdown(text, open_links=False)
+
+    @on(Markdown.LinkClicked)
+    def _report_link(self, event: Markdown.LinkClicked) -> None:
+        event.stop()
+        if "://" in event.href or event.href.startswith("mailto:"):
+            self.open_url(event.href)
+        else:
+            self.open_path(event.href)
+
+    def open_path(self, path: str) -> None:
+        try:
+            folder = jobs.open_folder(self.cfg, Path(path))
+        except JobError as exc:
+            self.notify(str(exc), severity="warning", timeout=6)
+            return
+        self.notify(f"폴더를 열었습니다: {projects.display(str(folder))}", timeout=4)
+
+    def _timeline_write(self, *items: Text | Widget) -> None:
         log = self.query_one("#timeline", VerticalScroll)
         at_end = log.scroll_y >= log.max_scroll_y - 1  # 위로 올려 읽는 중이면 끌어내리지 않는다
-        log.mount(*(item if isinstance(item, Markdown) else Static(item) for item in items))
+        log.mount(*(item if isinstance(item, Widget) else Static(item) for item in items))
         if at_end:
             self.call_after_refresh(log.scroll_end, animate=False)
 
@@ -1015,8 +1056,8 @@ class ColidayApp(App[None]):
         bar = self.query_one("#artifacts", ArtifactBar)
         files = jobs.artifacts(self.cfg, self.selected_id) if self.selected_id is not None else []
         text = ""
-        # 지금 보고 있는 작업이 사진·영상을 남겼을 때만 보인다. 화면과 무관한 작업에는 줄도 단축키도 없다.
-        if any(jobs.is_media(p) for p in files):
+        # 지금 보고 있는 작업이 결과물(사진·영상, 사용자가 확인할 파일)을 남겼을 때만 보인다. 없으면 줄도 단축키도 없다.
+        if files:
             folder = projects.display(str(self.cfg.artifacts_dir(self.selected_id)))
             text = f"📁 결과물 {jobs.artifacts_summary(files)}: {folder}  ← 클릭하면 폴더 열기 (Ctrl+F)"
         if text != self._artifacts_text:

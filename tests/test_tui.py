@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -14,7 +15,7 @@ pytest.importorskip("textual")
 from textual.widgets import DataTable, Input, Label, Markdown, Static, TextArea  # noqa: E402
 
 from coliday import config, jobs, team  # noqa: E402
-from coliday.store import Store  # noqa: E402
+from coliday.store import RESULT, Store  # noqa: E402
 from coliday.tui import (  # noqa: E402
     AddProjectScreen, ConfirmScreen, ColidayApp, ModelScreen, NewJobScreen, RoleEditScreen, TeamScreen,
 )
@@ -770,6 +771,7 @@ def test_타임라인과_diff를_드래그하면_클립보드에_복사된다(en
             await _until(pilot, lambda: store.get_job(1).is_terminal)
             await _until(pilot, lambda: "최종 보고: 완료" in _timeline_text(app))
             await _until(pilot, lambda: "+new file" in _diff_text(app))
+            app.query_one("#timeline").scroll_home(animate=False)   # 요청 줄이 보이게 (긴 경로는 여러 줄을 차지한다)
             await pilot.pause(0.3)
 
             await drag(pilot, "#timeline", (1, 0), (60, 10))
@@ -912,10 +914,13 @@ def test_결과물_폴더는_결과물이_있는_작업에서만_보이고_클�
             await pilot.pause(0.3)
             assert len((env / "opened.txt").read_text().split()) == 2
 
-            # 사진·영상이 아닌 파일만 있는 작업도 결과물이 없는 것으로 본다
-            (cfg.artifacts_dir(plain.id) / "notes.log").write_text("x")
-            await pilot.pause(1.5)
-            assert not bar.display
+            # 사진·영상이 아닌 파일(사용자가 확인할 문서 등)만 있어도 폴더 줄이 보이고 열린다
+            (cfg.artifacts_dir(plain.id) / "report.md").write_text("x")
+            await _until(pilot, lambda: bar.display)
+            assert "결과물 파일 1개" in str(bar.content) and f"jobs/{plain.id}/artifacts" in str(bar.content)
+            await pilot.click("#artifacts")
+            await _until(pilot, lambda: len((env / "opened.txt").read_text().split()) == 3)
+            assert (env / "opened.txt").read_text().split()[-1] == str(cfg.artifacts_dir(plain.id))
 
             # 결과물이 있는 작업으로 돌아오면 그 작업의 폴더가 다시 보인다
             await pilot.press("up")
@@ -1102,6 +1107,49 @@ def test_작업_도중에_env_읽기를_버튼으로_그_작업에만_허용한�
             await pilot.press("ctrl+l")                           # 다시 막는 쪽은 묻지 않는다
             await _until(pilot, lambda: not store.allow_env(first.id))
             assert len(app.screen_stack) == 1
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_위치_줄과_보고에_적힌_경로를_누르면_그_폴더가_열린다(env, repo, monkeypatch):
+    fake_open = env / "opener"
+    fake_open.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {env / 'opened.txt'}\n")
+    fake_open.chmod(0o755)
+    monkeypatch.setenv("COLIDAY_OPEN_BIN", str(fake_open))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    job = jobs.launch(cfg, store, "보고서 작성", repo, no_worktree=True).job
+    made = Path(job.workdir) / "docs"
+    opened = lambda: (env / "opened.txt").read_text().split() if (env / "opened.txt").exists() else []
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: store.get_job(job.id).is_terminal)
+            made.mkdir()
+            (made / "report.md").write_text("x")
+            store.add_event(job.id, "팀장", RESULT, "보고서를 `docs/report.md` 에 만들었습니다. 없는 경로: `docs/none.md`")
+            await _until(pilot, lambda: any("docs/report.md" in w.source for w in app.query(Markdown)))
+            report = next(w for w in app.query(Markdown) if "docs/report.md" in w.source)
+            href = quote(str(made / "report.md"), safe="/")   # 한글이 든 경로도 링크가 깨지지 않게 인코딩한다
+            assert f"[`docs/report.md`]({href})" in report.source and "[`docs/none.md`]" not in report.source
+
+            report.post_message(Markdown.LinkClicked(report, href))   # 링크를 누른 것과 같다
+            await _until(pilot, lambda: len(opened()) == 1)
+            assert opened() == [str(made)]   # 파일을 열지 않고 그 파일이 든 폴더를 연다
+
+            app.query_one("#timeline").scroll_home(animate=False)   # 위치 줄은 타임라인 맨 위에 있다
+            await pilot.pause(0.2)
+            await pilot.click(".folder-line")
+            await _until(pilot, lambda: len(opened()) == 2)
+            assert opened()[-1] == job.workdir
+
+            report.post_message(Markdown.LinkClicked(report, str(made / "gone.md")))   # 그사이 지워진 경로
+            await pilot.pause(0.3)
+            assert len(opened()) == 2
 
     try:
         _run(scenario())

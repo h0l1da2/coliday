@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -10,6 +11,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from coliday import gitops, guard, projects, remote, team
 from coliday.config import Config
@@ -331,21 +333,25 @@ def remove_project(cfg: Config, store: Store, directory: str | Path) -> bool:
     return True
 
 
-OTHER_DIR = "_other"  # 사진·영상이 아닌 파일(찍는 데 쓴 HTML·스크립트·로그 등)을 모아 두는 하위 폴더
+OTHER_DIR = "_other"  # 하위 폴더에 있던 사진·영상이 아닌 파일(찍는 데 쓴 HTML·스크립트·로그 등)을 모아 두는 곳
 
 
 def artifacts(cfg: Config, job_id: int) -> list[Path]:
-    """작업이 남긴 결과물 파일 (스크린샷·영상 등). 숨김 파일은 뺀다. 파일을 옮기지는 않는다."""
+    """작업이 남긴 결과물 파일 (스크린샷·영상, 사용자가 확인할 문서 등). 숨김 파일과 `_other/` 는 뺀다. 파일을 옮기지는 않는다."""
     root = cfg.artifacts_dir(job_id)
     if not root.is_dir():
         return []
     try:
         return sorted(
             p for p in root.rglob("*")
-            if p.is_file() and not any(part.startswith(".") for part in p.relative_to(root).parts)
+            if p.is_file() and not _skipped(p.relative_to(root).parts)
         )
     except OSError:  # 팀원이 정리하는 중에 읽은 경우
         return []
+
+
+def _skipped(parts: tuple[str, ...]) -> bool:
+    return parts[0] == OTHER_DIR or any(part.startswith(".") for part in parts)
 
 
 def is_media(path: Path) -> bool:
@@ -356,7 +362,8 @@ def organize(root: Path) -> None:
     """결과물 폴더를 사용자가 열었을 때 한눈에 보이게 정리한다. 실행이 끝난 뒤에만 부른다.
 
     - 사진·영상은 하위 폴더에 있어도 root 바로 아래로 꺼낸다 (`verify/wide-ok.png` → `verify-wide-ok.png`).
-    - 나머지 파일(찍는 데 쓴 HTML·스크립트·로그)은 지우지 않고 `_other/` 아래로 옮긴다.
+    - 맨 위에 둔 나머지 파일(사용자가 확인할 문서·데이터)은 그대로 둔다.
+    - 하위 폴더에 있는 나머지 파일(찍는 데 쓴 HTML·스크립트·로그)은 지우지 않고 `_other/` 아래로 옮긴다.
     팀원이 작업 공간으로 쓰는 동안 옮기면 그 작업이 깨지므로 실행 중에는 건드리지 않는다.
     """
     try:
@@ -365,11 +372,9 @@ def organize(root: Path) -> None:
         return
     for path in sorted(files):
         parts = path.relative_to(root).parts
-        if parts[0] == OTHER_DIR or any(part.startswith(".") for part in parts):
+        if _skipped(parts) or len(parts) == 1:
             continue
         if is_media(path):
-            if len(parts) == 1:
-                continue
             target = root / "-".join(parts)
         else:
             target = root / OTHER_DIR / Path(*parts)
@@ -390,13 +395,14 @@ def organize(root: Path) -> None:
 
 
 def artifacts_summary(files: list[Path]) -> str:
-    """'3개 (사진 2, 영상 1)' 같은 한 줄 요약."""
+    """'3개 (사진 2, 영상 1)', '파일 2개' 같은 한 줄 요약."""
     images = sum(p.suffix.lower() in _IMAGE_SUFFIXES for p in files)
     videos = sum(p.suffix.lower() in _VIDEO_SUFFIXES for p in files)
     kinds = [f"{label} {n}" for label, n in (("사진", images), ("영상", videos)) if n]
     other = len(files) - images - videos
-    text = f"{images + videos}개 ({', '.join(kinds)})" if kinds else "사진·영상 없음"
-    return text + (f" + 기타 파일 {other}개" if other else "")
+    if not kinds:
+        return f"파일 {other}개" if other else "사진·영상 없음"
+    return f"{images + videos}개 ({', '.join(kinds)})" + (f" + 기타 파일 {other}개" if other else "")
 
 
 def open_artifacts(cfg: Config, store: Store, job_id: int) -> Path:
@@ -409,13 +415,148 @@ def open_artifacts(cfg: Config, store: Store, job_id: int) -> Path:
         root.mkdir(parents=True, exist_ok=True)
         if reconcile(store, store.get_job(job_id)).is_terminal:
             organize(root)
+    except OSError as exc:
+        raise JobError(f"폴더를 열 수 없습니다: {exc}\n직접 여세요: {root}") from exc
+    return open_folder(cfg, root)
+
+
+def open_folder(cfg: Config, path: Path) -> Path:
+    """path 가 폴더면 그 폴더를, 파일이면 그 파일이 든 폴더를 파일 탐색기로 연다. 연 폴더를 돌려준다.
+
+    파일을 실행하거나 앱으로 열지는 않는다 (경로는 에이전트의 보고에서 온다). macOS 의 `open` 은 `.app` 같은
+    묶음 폴더를 실행하므로, 파일과 이름에 확장자가 붙은 폴더는 Finder 에서 위치만 보여 준다 (`open -R`).
+    """
+    path = Path(path)
+    if not path.exists():
+        raise JobError(f"없는 경로입니다: {path}")
+    folder = path if path.is_dir() else path.parent
+    cmd = [cfg.open_bin, str(folder)]
+    if sys.platform == "darwin" and Path(cfg.open_bin).name == "open" and (folder != path or folder.suffix):
+        cmd = [cfg.open_bin, "-R", str(path)]
+        folder = path.parent
+    try:
         subprocess.Popen(
-            [cfg.open_bin, str(root)], stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
     except OSError as exc:
-        raise JobError(f"폴더를 열 수 없습니다 ({cfg.open_bin}): {exc}\n직접 여세요: {root}") from exc
-    return root
+        raise JobError(f"폴더를 열 수 없습니다 ({cfg.open_bin}): {exc}\n직접 여세요: {folder}") from exc
+    return folder
+
+
+def local_workdir(cfg: Config, job: Job) -> str:
+    """에이전트가 이 컴퓨터에서 일한 폴더. 서버의 프로젝트면 작업별 폴더다 (서버에서 가져온 파일이 있다)."""
+    if remote.is_remote(job.workdir or job.repo):
+        return str(cfg.job_dir(job.id) / "work")
+    return job.workdir or job.repo
+
+
+# 이미 링크인 곳 | `코드` | 맨 경로(/…, ~/…, ./…, ../…). URL 의 // 와 단어 사이의 / 는 경로로 보지 않는다.
+_PATH_TOKEN = re.compile(
+    r"(!?\[[^\]\n]*\]\([^)\n]*\))|`([^`\n]+)`|(?<![\w/.~@:-])((?:~|\.{1,2})?/[^\s`<>\"'|*\[\]()]+)"
+)
+_PATH_TAIL = re.compile(r"(:\d+(?::\d+)?|[^\x00-\x7f]|[.,:;])$")  # 줄 번호, 붙여 쓴 조사, 문장 부호
+
+
+_SEARCH_SKIP = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".gradle"})
+_SEARCH_LIMIT = 20000  # 잘못 적힌 경로의 실제 위치를 찾을 때 훑는 항목 수의 상한 (화면이 멈추지 않게)
+
+
+class _Finder:
+    """보고에 적힌 경로가 없을 때 같은 이름의 파일·폴더를 작업 폴더 아래에서 찾는다.
+
+    에이전트가 중간 폴더를 빼먹고 적는 일이 있다 (`out/a.csv` 라고 적었는데 실제로는 `out/_output/a.csv`).
+    이름이 같은 것이 하나뿐일 때만 알려 준다. 처음 필요할 때 한 번만 훑는다.
+    """
+
+    def __init__(self, roots: list[str]) -> None:
+        self._roots = roots
+        self._names: dict[str, list[Path]] | None = None
+
+    def find(self, text: str) -> Path | None:
+        name = Path(_PATH_TAIL.sub("", text.rstrip().rstrip("/"))).name
+        if not name or name in (".", ".."):
+            return None
+        if self._names is None:
+            self._names = self._scan()
+        found = self._names.get(name, [])
+        return found[0] if len(found) == 1 else None
+
+    def _scan(self) -> dict[str, list[Path]]:
+        names: dict[str, list[Path]] = {}
+        seen = 0
+        for root in self._roots:
+            for folder, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in _SEARCH_SKIP]
+                for name in (*dirs, *files):
+                    names.setdefault(name, []).append(Path(folder) / name)
+                seen += len(dirs) + len(files)
+                if seen > _SEARCH_LIMIT:
+                    return {}  # 다 훑지 못했으면 '하나뿐'인지 알 수 없다
+        return names
+
+
+def link_paths(markdown: str, workdir: str, within: str | None = None, search: list[str] | tuple[str, ...] = ()) -> str:
+    """보고(마크다운)에 적힌 경로 가운데 이 컴퓨터에 실제로 있는 것을 링크로 바꾼다 (누르면 폴더를 연다).
+
+    상대 경로는 `코드` 로 적힌 것만 workdir 기준으로 본다. within 을 주면 그 아래의 경로만 바꾼다
+    (서버의 프로젝트: 보고에 적힌 서버의 경로가 이 컴퓨터에도 우연히 있을 수 있다). 코드 블록 안은 건드리지 않는다.
+    경로처럼 적혔는데 없는 것은 workdir 와 search 아래에서 같은 이름을 찾아, 하나뿐이면 실제 위치를 옆에 링크로 붙인다.
+    """
+    finder = _Finder([root for root in (workdir, *search) if root and os.path.isdir(root)])
+    out, fenced = [], False
+    for line in markdown.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and not line.startswith("    "):
+            line = _PATH_TOKEN.sub(lambda m: _linked(m, workdir, within, finder), line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _linked(match: re.Match, workdir: str, within: str | None, finder: _Finder) -> str:
+    link, code, bare = match.groups()
+    if link:
+        return link
+    text = code or bare
+    found = _existing(text, workdir, within, relative=bool(code))
+    if not found:
+        # 경로처럼 생긴 것만 찾아본다 (`git status`, `main`, URL 은 경로가 아니다)
+        looks_like_path = "/" in text.strip("/") and " " not in text.strip() and "://" not in text
+        actual = finder.find(text) if looks_like_path else None
+        if actual is None:
+            return match.group(0)
+        shown = os.path.relpath(actual, workdir) if actual.is_relative_to(workdir) else str(actual)
+        return f"{match.group(0)} (실제 위치: [`{shown}`]({quote(str(actual), safe='/')}))"
+    path, length = found
+    href = quote(str(path), safe="/")
+    if code:  # 줄 번호가 붙어 있어도 코드 전체를 링크 글자로 둔다
+        return f"[`{code}`]({href})"
+    return f"[{bare[:length]}]({href}){bare[length:]}"
+
+
+def _existing(text: str, workdir: str, within: str | None, *, relative: bool) -> tuple[Path, int] | None:
+    """text 의 앞부분이 가리키는 실제 경로와 그 길이. 뒤에 붙은 줄 번호·조사·문장 부호는 떼어 가며 찾는다."""
+    text = text.rstrip()
+    for _ in range(8):
+        if not text.strip("/~. "):
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            if not relative and not text.startswith((".", "~")):
+                return None
+            path = Path(workdir) / path
+        try:
+            path = Path(os.path.abspath(path))
+            inside = within is None or path.is_relative_to(within)
+            if inside and path.exists() and path != Path(path.anchor):
+                return path, len(text)
+        except (OSError, ValueError):
+            return None
+        shorter = _PATH_TAIL.sub("", text)
+        if shorter == text:
+            return None
+        text = shorter
+    return None
 
 
 def role_prompts(cfg: Config, role: str | None = None) -> list[tuple[str, str]]:
