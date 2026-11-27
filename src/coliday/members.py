@@ -25,6 +25,7 @@ from pathlib import Path
 from coliday import team
 from coliday.guard import EnvGuard
 from coliday.config import Config
+from coliday import review_gate
 from coliday.events import LEAD, CodexTranslator, Translator
 from coliday.store import Job, Store
 
@@ -66,9 +67,10 @@ class Server:
 
     def __init__(
         self, cfg: Config, job: Job, resolved: dict[str, dict], guard: EnvGuard | None = None,
-        *, cwd: str | None = None, helpers: list[str] | tuple[str, ...] = (),
+        *, cwd: str | None = None, helpers: list[str] | tuple[str, ...] = (), review_counter: Path | None = None,
     ) -> None:
         self.cfg = cfg
+        self.review_counter = review_counter  # 있으면 리뷰 담당 호출 수를 세어 상한을 넘으면 막는다 (review_gate)
         self.job = job
         self.resolved = resolved
         self.guard = guard  # 있으면 팀원도 .env 를 읽지 못한다
@@ -117,6 +119,8 @@ class Server:
         job_id = self.job.id
         if role not in self.resolved:
             return False, f"알 수 없는 역할: {role} (가능: {', '.join(self.resolved)})"
+        if self.review_counter is not None and (reason := review_gate.take(self.review_counter, role)):
+            return False, reason
         first_line = " ".join(task.strip().splitlines()[0].split())[:120]
         store.add_event(job_id, LEAD, "dispatch", f"{role}에게 분배: {first_line}")
         store.update_job(job_id, phase=f"{LEAD}: {role}에게 분배")

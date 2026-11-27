@@ -42,7 +42,16 @@ LOCAL_ONLY_RULE = (
     "이 컴퓨터의 파일이니 읽으려 하지 않는다. 서버의 .env 를 가져와(server-pull) 읽으려 해도 막히므로, "
     "꼭 필요하면 서버에서 직접 본다.\n"
 )
-ALLOWED_NOTE = "사람이 이 작업에서 .env 파일 읽기를 허용했습니다. .env 를 읽지 못해 멈췄거나 건너뛴 일이 있으면 이어서 진행하세요."
+ALLOWED_NOTE = (
+    "사람이 이 작업에서 .env 파일 읽기를 허용했습니다. .env 를 읽지 못해 멈췄던 일만 이어서 진행하세요. "
+    "이미 끝낸 일을 다시 검토하거나 범위를 넓히지 않습니다."
+)
+# 실행 중에 허용했지만 에이전트가 .env 때문에 멈추지 않고 끝났을 때 타임라인에 남기는 안내
+ALLOWED_NOT_RESUMED = (
+    ".env 읽기를 허용했지만 에이전트가 .env 때문에 멈추지 않고 끝나서 이어서 실행하지 않았습니다. "
+    "허용은 유지되니 필요하면 이어서 시키세요."
+)
+BLOCKED_HINT = " 이번 실행에서 .env 읽기가 막힌 적이 있으니 보고에서 건너뛴 일이 없는지 확인하세요."
 _BLOCKED_SIGNS = ("Operation not permitted", "denied by your permission settings", "Permission denied")
 
 

@@ -61,7 +61,7 @@ _LEAD_TEMPLATE = """\
 2. 구현을 독립 단위로 나눠 구현 담당에게 맡긴다. 구현 담당이 여럿이면 독립 단위를 나눠 병렬로 맡긴다.
    같은 파일을 두 팀원이 동시에 고치게 하지 않는다.
 3. 구현이 끝나면 리뷰 담당과 검증 담당을 실행한다. 그 밖의 팀원은 각자의 설명에 적힌 때에 쓴다.
-4. [P0]~[P2] 문제나 검사 실패가 있으면 담당 구현자에게 재작업을 맡긴다.
+4. [P0]~[P2] 문제나 검사 실패가 있으면 담당 구현자에게 재작업을 맡긴다. 리뷰 지적의 재작업은 "리뷰 반복 상한"을 따른다.
    {max_attempts}번 안에 해결되지 않으면 더 시도하지 말고 "실패한 작업 정리"를 따른다.
 5. 직접 코드를 수정하지 말고 위임한다. 단, 팀원 결과를 확인하려고 파일을 읽는 것은 괜찮다.
    어떤 단계를 맡을 팀원이 목록에 없으면 그 단계만 직접 한다.
@@ -126,6 +126,22 @@ DEFAULT_AGENTS: dict[str, dict] = {
 
 
 _FAILURE_HEADING = "## 실패한 작업 정리"
+_REVIEW_HEADING = "## 리뷰 반복 상한"
+MAX_REVIEW_ROUNDS = 2  # 리뷰 지적으로 재작업을 맡기는 최대 차례 수 (요청 하나마다)
+MAX_REVIEW_CALLS = MAX_REVIEW_ROUNDS + 1  # 리뷰 담당을 부를 수 있는 횟수: 첫 리뷰 + 재리뷰 (review_gate 가 센다)
+
+# 팀장 지시문 뒤에 늘 붙는다. 재리뷰가 매번 새 문제를 찾아 리뷰·재작업이 끝없이 도는 것을 막는다.
+_LEAD_REVIEW_RULE = f"""\
+
+{_REVIEW_HEADING}
+리뷰 지적으로 재작업을 맡기는 것은 요청 하나(이어서 시킨 요청은 그 요청 안에서 새로 센다)에서 최대 {MAX_REVIEW_ROUNDS}차례다.
+여러 팀원에게 동시에 맡긴 재작업은 한 차례로 센다. 재리뷰가 새 문제를 찾아도 이 횟수는 늘지 않는다.
+- {MAX_REVIEW_ROUNDS}번째 재작업 뒤의 리뷰가 마지막 리뷰다. 거기서 나온 문제는 재작업을 맡기지 않고 최종 보고의 "남은 문제"에 심각도와 함께 적는다.
+- [P0]·[P1] 이 남았으면 최종 보고 맨 위에 "차단 문제 남음"이라고 쓰고, 이어서 고칠지는 사용자가 정하게 한다.
+- 빌드·테스트 같은 검사 실패를 고치는 재시도는 이 상한이 아니라 "실패한 작업 정리"의 횟수를 따른다.
+- 리뷰 담당(이름에 review 가 든 팀원)은 요청 하나에서 최대 {MAX_REVIEW_CALLS}번만 부를 수 있고, 넘으면 coliday 가 그 호출을 막는다.
+  리뷰할 범위가 여럿이어도 한 차례에는 리뷰 담당을 한 번만 불러 한꺼번에 맡긴다.
+"""
 
 # 팀장 지시문 뒤에 늘 붙는다 (사용자가 지시문을 고쳐 써도 빠지지 않는다. 팀원의 '실패했을 때' 규칙과 짝이다).
 _LEAD_FAILURE_RULE = f"""\
@@ -174,7 +190,9 @@ def _render_lead(template: str | None, section: str, max_attempts: int, artifact
     text = (template or _LEAD_TEMPLATE).rstrip() + "\n"
     if TEAM_PLACEHOLDER not in text:  # 자리를 지운 지시문에도 팀원 목록은 넣는다 (없으면 맡길 방법을 모른다)
         text += f"\n{TEAM_PLACEHOLDER}\n"
-    text = _without_section(text, _FAILURE_HEADING) + _LEAD_FAILURE_RULE  # 예전 기본 지시문을 고쳐 쓴 것에는 옛 규칙이 들어 있다
+    # 예전 기본 지시문을 고쳐 쓴 것에는 옛 규칙이 들어 있다: 빼고 지금 규칙을 붙인다
+    text = _without_section(_without_section(text, _REVIEW_HEADING), _FAILURE_HEADING)
+    text += _LEAD_REVIEW_RULE + _LEAD_FAILURE_RULE
     text = text.replace(_N, str(max_attempts)).replace(TEAM_PLACEHOLDER, section.strip())
     return text + _LEAD_ARTIFACTS_RULE.replace("{artifacts}", artifacts) if artifacts else text
 
@@ -688,6 +706,10 @@ def _codex_runner(
         'if [ "$#" -gt 0 ] && [ ! -s "$1" ]; then echo "작업 명세 파일이 없거나 비어 있습니다: $1" >&2; exit 2; fi\n'
         'OUT=$(mktemp) && LOG=$(mktemp) || exit 1\n'
         "trap 'rm -f \"$OUT\" \"$LOG\"' EXIT\n"
+        # 명세 파일로 불렀으면 끝날 때 <명세>.out(답·실패 내용)과 <명세>.done(종료 코드)을 남긴다.
+        # 명령이 백그라운드로 넘어가도 래퍼가 프로세스를 찾지 않고 이 파일로 끝났는지 안다.
+        'RES=/dev/null; DONE=""\n'
+        'if [ "$#" -gt 0 ]; then RES="$1.out"; DONE="$1.done"; rm -f "$RES" "$DONE"; fi\n'
         "{\n"
         f"cat <<'{mark}'\n{prompt}\n{mark}\n"
         "printf '\\n# 작업 명세\\n'\n"
@@ -695,11 +717,12 @@ def _codex_runner(
         f'}} | {command} > "$LOG" 2>&1\n'
         "code=$?\n"
         'if [ "$code" -ne 0 ]; then\n'
-        '  echo "codex 실행 실패 (종료 코드 $code)" >&2\n'
-        '  tail -n 40 "$LOG" >&2\n'
-        '  exit "$code"\n'
+        '  { echo "codex 실행 실패 (종료 코드 $code)"; tail -n 40 "$LOG"; } | tee "$RES" >&2\n'
+        "else\n"
+        '  tee "$RES" < "$OUT"\n'
         "fi\n"
-        'cat "$OUT"\n'
+        'if [ -n "$DONE" ]; then echo "$code" > "$DONE"; fi\n'
+        'exit "$code"\n'
     )
 
 
@@ -787,6 +810,10 @@ def _codex_wrapper(spec: dict, runner: str, task_prefix: str) -> dict:
         "2. 다음 명령을 실행한다. 다른 명령과 묶지 않고(&&, ;, |, 리다이렉션 금지) 이 명령 하나만 그대로 실행한다. "
         "오래 걸릴 수 있으니 실행 시간 제한을 최대로 지정하고 끝날 때까지 기다린다:\n"
         f"{runner_command(runner)} <1에서 쓴 파일의 경로>\n"
+        "   명령이 백그라운드로 넘어갔으면 완료 알림을 기다린다. 명령은 끝날 때 <1에서 쓴 파일의 경로>.done(종료 코드)과 "
+        ".out(Codex 의 답)을 남기니, 확인이 필요하면 `cat <경로>.done <경로>.out` 처럼 그 두 파일만 읽는다. "
+        "pgrep·ps 로 프로세스를 찾거나 sleep 반복문으로 기다리지 않는다 "
+        "(이 경로는 팀장과 그 반복문 자신의 명령줄에도 들어 있어 늘 찾아지므로 반복문이 끝나지 않는다).\n"
         "3. 끝나면 `git status --short`, `git diff --stat` 을 읽는다.\n"
         "4. 보고: 명령이 출력한 Codex 의 답을 빠짐없이 전하고, 변경 파일 목록과 Codex 가 보고한 검사 결과를 적는다 "
         "(직접 확인하지 않은 것은 그렇게 표시). 명령이 실패했거나 실행이 거부됐으면 오류 메시지를 그대로 보고하고 대신 일하지 않는다."

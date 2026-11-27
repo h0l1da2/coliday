@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from coliday import guard, members, remote, team, topics
+from coliday import guard, members, remote, review_gate, team, topics
 from coliday.jobs import one_line, organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
@@ -57,7 +57,7 @@ def build_command(
         cmd += ["--resume", resume]
     for directory in add_dirs or []:
         cmd += ["--add-dir", directory]
-    if settings:  # .env 읽기를 막는 규칙과 샌드박스 (guard.py)
+    if settings:  # .env 읽기를 막는 규칙과 샌드박스 (guard.py), 리뷰 상한 훅 (review_gate.py)
         cmd += ["--settings", settings]
     if allow:
         cmd += ["--allowedTools", *allow]
@@ -100,7 +100,7 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
                 Path(paths[name]).chmod(0o700)
         except (remote.RemoteError, OSError) as exc:
             store.add_event(job_id, LEAD, "error", f"서버 작업을 준비하지 못했습니다: {exc}")
-            return 1 if store.finish_or_continue(job_id, "failed", phase="서버 작업 준비 실패") else None
+            return 1 if store.finish_or_continue(job_id, "failed", phase="서버 작업 준비 실패", **_env_note_drop(None)) else None
         helpers = list(paths.values())
         server_note = remote.agent_note(host, remote_workdir, workdir, paths)
         store.add_event(job_id, LEAD, "phase", f"이 컴퓨터의 에이전트가 SSH 로 {host} 의 {remote_workdir} 에서 작업합니다")
@@ -112,7 +112,7 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         )
     except (OSError, ValueError) as exc:  # 잘못된 사용자 설정
         store.add_event(job_id, LEAD, "error", f"팀·모델 설정 오류: {exc}")
-        return 1 if store.finish_or_continue(job_id, "failed", phase="팀·모델 설정 오류") else None
+        return 1 if store.finish_or_continue(job_id, "failed", phase="팀·모델 설정 오류", **_env_note_drop(None)) else None
     if host is not None:
         resolved = team.for_server(resolved, server_note)
 
@@ -135,6 +135,10 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         env_rule += sandbox_note
         resolved = team.with_note(resolved, sandbox_note)
 
+    # 리뷰 담당 호출 수는 실행(요청)마다 새로 센다. 상한을 넘으면 그 호출을 막는다 (review_gate).
+    review_counter = job_dir / "review-count.json"
+    review_gate.reset(review_counter)
+
     # 후속 요청이 있으면 이어서 시킨 실행이다: 같은 세션을 resume 하고 로그는 덧붙인다.
     follow_up = store.last_follow_up(job_id)
     prompt = follow_up.message if follow_up else _derived_note(store, job_id) + job.prompt
@@ -145,7 +149,9 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     is_codex = team.is_codex(job.model)
     if is_codex:
         # Codex 팀장: 지시문을 요청 앞에 붙이고, 팀원 실행 요청은 members.Server 가 받는다.
-        server = members.Server(cfg, job, resolved, env_guard, cwd=workdir, helpers=helpers)
+        server = members.Server(
+            cfg, job, resolved, env_guard, cwd=workdir, helpers=helpers, review_counter=review_counter,
+        )
         cmd = build_codex_command(cfg, job.model, resume, server.directory, artifacts, env_guard, network=host is not None)
         lead = team.codex_lead_prompt(
             resolved, members.agent_command(job_id), cfg.max_attempts, artifacts, custom.lead_prompt
@@ -176,15 +182,17 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         # 명세 파일은 실행 파일과 다른 폴더에 둔다: 에이전트가 마음대로 쓸 수 있는 곳에 허용된 실행 파일을 두지 않는다.
         tasks_dir = f"{runner_dir}-tasks"
         add_dirs = [tasks_dir] if scripts else []
-        settings = None
+        settings_obj: dict = {}
         if env_guard is not None:
-            settings = env_guard.claude_settings(
+            settings_obj = json.loads(env_guard.claude_settings(
                 writable=[artifacts, *add_dirs, *env_guard.roots[:2]],  # 홈 밖에 있는 레포에서도 커밋할 수 있게
                 protected=cfg.protected_paths,
                 # Codex 는 자기 샌드박스를 따로 쓴다 (샌드박스 안에서 또 샌드박스를 켤 수 없다). .env 는 Codex 쪽 설정이 막는다.
                 # 서버를 다루는 실행 파일은 ssh 연결(네트워크, ~/.ssh)이 필요하다.
                 excluded=[f"{team.runner_command(path)} *" for path in [*scripts, *helpers]],
-            )
+            ))
+        settings_obj |= review_gate.claude_hooks(review_counter)  # .env 를 허용한 작업에도 리뷰 상한은 건다
+        settings = json.dumps(settings_obj, ensure_ascii=False)
         agents_json = json.dumps(team.claude_agents(resolved, runners, tasks_dir), ensure_ascii=False, indent=2)
         agents_file.write_text(agents_json, encoding="utf-8")
         lead_prompt = team.lead_prompt(cfg.max_attempts, artifacts, resolved, custom.lead_prompt) + env_rule + server_note
@@ -221,12 +229,13 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
             proc.stdin.write(prompt)
             proc.stdin.close()
             told_blocked = env_guard is None  # 막힌 읽기는 실행마다 한 번만 알린다
+            blocked = False
             for line in proc.stdout:
                 raw_log.write(line)
                 raw_log.flush()
                 _handle_line(store, job_id, translator, line)
                 if not told_blocked and ".env" in line and _blocked_read(line):
-                    told_blocked = True
+                    told_blocked = blocked = True
                     store.add_event(
                         job_id, LEAD, "error",
                         f"에이전트가 .env 파일을 읽으려다 막혔습니다. 읽게 하려면 이 작업에 허용하세요: "
@@ -235,7 +244,7 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
             returncode = proc.wait()
     except OSError as exc:  # 실행 파일 없음 등
         store.add_event(job_id, LEAD, "error", f"{cmd[0]} 실행 실패: {exc}")
-        return 1 if store.finish_or_continue(job_id, "failed", phase="팀장 실행 실패") else None
+        return 1 if store.finish_or_continue(job_id, "failed", phase="팀장 실행 실패", **_env_note_drop(None)) else None
     finally:
         if server:
             server.stop()
@@ -251,6 +260,11 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
     elif not ok:
         tail = _tail(stderr_path)
         store.add_event(job_id, LEAD, "error", f"종료 코드 {returncode}" + (f": {tail}" if tail else ""))
+    if refused := review_gate.refused(review_counter):
+        store.add_event(
+            job_id, LEAD, "phase",
+            f"리뷰 반복 상한({team.MAX_REVIEW_CALLS}번)에 도달해 리뷰 담당 호출 {refused}번을 막았습니다",
+        )
     if translator.result:  # 상태를 끝으로 바꾸기 전에 남긴다 (끝난 작업을 본 쪽은 보고도 이미 볼 수 있게)
         store.add_event(job_id, LEAD, RESULT, translator.result)
     jobs_organize(cfg.artifacts_dir(job_id))  # 팀장이 멈춘 지금, 사진·영상을 한 폴더에 늘어놓는다
@@ -265,8 +279,21 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         cost_usd=_total_cost(job.cost_usd if follow_up else None, cost),
         # 이번 실행이 세션을 만들기 전에 실패해도 이전 세션 id 는 지우지 않는다 (다시 이어갈 수 있게).
         session_id=translator.session_id or job.session_id,
+        **_env_note_drop(translator.result, blocked=blocked),
     )
     return (0 if ok else 1) if finished else None
+
+
+def _env_note_drop(result: str | None, *, blocked: bool = False) -> dict:
+    """실행 도중에 .env 를 허용해 대기시킨 '이어서 진행' 요청을 이번 실행이 끝날 때 쓸지 정한다.
+
+    에이전트가 .env 가 필요하다고 멈췄을 때(보고에 NEED_MARKER)만 이어서 실행한다. 그 밖에는 이미 끝난 작업을
+    다시 열어 범위를 넓히므로 버리고, 허용은 유지된 채 사용자가 이어서 시킬지 정하게 타임라인에 알린다.
+    """
+    if guard.NEED_MARKER in (result or ""):
+        return {}
+    note = guard.ALLOWED_NOT_RESUMED + (guard.BLOCKED_HINT if blocked else "")
+    return {"drop": (guard.ALLOWED_NOTE,), "dropped_note": note}
 
 
 _PARENT_REPORT_LIMIT = 2000  # 파생 작업 안내에 붙이는 부모 보고의 최대 글자 수

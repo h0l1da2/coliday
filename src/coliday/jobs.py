@@ -267,8 +267,9 @@ def check_codex(cfg: Config, model: str | None) -> None:
 def set_env_access(cfg: Config, store: Store, job_id: int, allow: bool) -> str:
     """사람이 작업 도중이나 끝난 뒤에 그 작업의 .env 읽기를 허용하거나 다시 막는다. 한 일을 설명하는 문장을 돌려준다.
 
-    허용은 그 작업(세션)에만 해당한다. 실행 중인 에이전트의 권한은 바꿀 수 없으므로, 지금 실행이 끝난 뒤
-    같은 세션을 허용된 상태로 이어서 실행한다. 에이전트가 허용을 기다리며 멈춘 작업은 바로 이어서 시작한다.
+    허용은 그 작업(세션)에만 해당한다. 실행 중인 에이전트의 권한은 바꿀 수 없으므로, 지금 실행이 .env 때문에
+    멈추고 끝나면 같은 세션을 허용된 상태로 이어서 실행한다 (그렇지 않으면 이어서 실행하지 않는다: worker 가 판단).
+    에이전트가 허용을 기다리며 멈춘 채 끝난 작업은 바로 이어서 시작한다.
     """
     job = reconcile(store, store.get_job(job_id))
     if store.allow_env(job.id) == allow:
@@ -282,7 +283,10 @@ def set_env_access(cfg: Config, store: Store, job_id: int, allow: bool) -> str:
     if not job.is_terminal:
         store.set_allow_env(job.id, True)
         if store.queue_message(job.id, guard.ALLOWED_NOTE):
-            return f"작업 #{job.id}: .env 읽기를 허용했습니다. 지금 실행이 끝나면 허용된 상태로 이어서 진행합니다."
+            return (
+                f"작업 #{job.id}: .env 읽기를 허용했습니다. 지금 실행이 .env 때문에 멈추면 허용된 상태로 이어서 진행하고, "
+                "그렇지 않으면 다음에 이어서 시킬 때부터 적용됩니다."
+            )
         job = store.get_job(job.id)  # 그 사이에 끝났다
     waiting = guard.NEED_MARKER in (job.result or "")
     if waiting:

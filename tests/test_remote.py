@@ -351,6 +351,8 @@ def test_서버_작업도_이_컴퓨터의_env는_막고_허용하면_푼다(env
     assert "이 컴퓨터의 claude(1.0.58)는 .env 읽기를 막지 못합니다" in capsys.readouterr().err
     assert cli.main(["run", "y", "-C", app, "--allow-env"]) == 0
     argv = json.loads((env / "args.json").read_text())["argv"]
-    assert "--settings" not in argv and "Bash(" in " ".join(argv)         # 허용해도 서버용 실행 파일은 열려 있다
+    settings = json.loads(argv[argv.index("--settings") + 1])            # 리뷰 상한 훅만 남는다
+    assert "sandbox" not in settings and "permissions" not in settings and "hooks" in settings
+    assert "Bash(" in " ".join(argv)                                      # 허용해도 서버용 실행 파일은 열려 있다
     assert ".env 로 시작하는 파일" not in argv[argv.index("--append-system-prompt") + 1]
 

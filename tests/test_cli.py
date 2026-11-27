@@ -12,7 +12,7 @@ from urllib.parse import quote
 import pytest
 
 from coliday import cli, config, jobs, members, team, topics, worker
-from coliday.store import Store
+from coliday.store import FOLLOW_UP, Store
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_claude.py"
 FAKE_CODEX = Path(__file__).parent / "fixtures" / "fake_codex.py"
@@ -951,6 +951,8 @@ def test_codex_실행_파일은_역할_지침과_작업_명세를_넘기고_답�
     spec = repo / "spec.md"                            # 래퍼는 명세를 파일로 넘긴다
     spec.write_text("심각도 [P0]~[P3] `git diff` $(pwd)")
     assert subprocess.run([str(runner), str(spec)], cwd=repo, capture_output=True, text=True).stdout == "코덱스 팀원 보고\n"
+    # 백그라운드로 넘어가도 래퍼가 프로세스를 찾지 않고 끝났는지 알 수 있게 완료 표시와 답을 남긴다
+    assert (repo / "spec.md.done").read_text() == "0\n" and (repo / "spec.md.out").read_text() == "코덱스 팀원 보고\n"
     assert _codex_calls(env)[-1]["stdin"].endswith("\n\n# 작업 명세\n심각도 [P0]~[P3] `git diff` $(pwd)")
     missing = subprocess.run([str(runner), str(repo / "none.md")], cwd=repo, capture_output=True, text=True)
     assert missing.returncode == 2 and "작업 명세 파일이 없거나 비어 있습니다" in missing.stderr
@@ -960,6 +962,10 @@ def test_codex_실행_파일은_역할_지침과_작업_명세를_넘기고_답�
     failed = subprocess.run([str(runner)], input="x", cwd=repo, capture_output=True, text=True)
     assert failed.returncode == 3 and failed.stdout == ""
     assert "codex 실행 실패 (종료 코드 3)" in failed.stderr and "codex stderr tail" in failed.stderr
+    failed = subprocess.run([str(runner), str(spec)], cwd=repo, capture_output=True, text=True)
+    assert failed.returncode == 3 and (repo / "spec.md.done").read_text() == "3\n"
+    assert "codex 실행 실패 (종료 코드 3)" in (repo / "spec.md.out").read_text()
+    assert not (repo / "-.done").exists() and not list(repo.glob("*.done"))[1:]  # stdin 으로 부르면 남기지 않는다
 
 
 def test_역할_지침에_heredoc_표시가_있어도_실행_파일이_깨지지_않는다():
@@ -973,6 +979,8 @@ def test_기본_codex_coder는_codex_래퍼다(env, repo, capsys):
     cli.main(["run", "x", "-C", str(repo)])
     _, agents = _recorded(env)
     assert "Codex CLI" in agents["codex-coder"]["prompt"] and agents["codex-coder"]["model"] == "haiku"
+    wrapper = agents["codex-coder"]["prompt"]
+    assert ".done" in wrapper and "pgrep" in wrapper and "sleep 반복문으로 기다리지 않는다" in wrapper
 
     capsys.readouterr()
     cli.main(["model"])
@@ -1255,7 +1263,10 @@ def test_이_컴퓨터에_codex가_없으면_codex_팀원을_claude로_돌린다
 
 # ── .env 읽기 차단 (guard.py) ──────────────────────────────────────────
 def _settings(argv):
-    return json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else None
+    """--settings 가운데 .env 차단 부분. 리뷰 상한 훅(hooks)은 늘 붙으므로 빼고 보고, 차단이 없으면 None."""
+    settings = json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else {}
+    settings.pop("hooks", None)
+    return settings or None
 
 
 def test_기본으로는_env_파일을_읽지_못하게_막고_실행한다(env, repo):
@@ -1359,7 +1370,7 @@ def test_env_명령으로_작업_도중에_허용하고_막힌_읽기를_타임�
     assert cli.main(["env", "1", "allow"]) == 0 and "이미" in capsys.readouterr().out
     assert cli.main(["continue", "1", "더"]) == 0
     lead = _recorded(env)[0]
-    assert "--settings" not in lead and "## .env 파일" not in lead[lead.index("--append-system-prompt") + 1]
+    assert _settings(lead) is None and "## .env 파일" not in lead[lead.index("--append-system-prompt") + 1]
     assert cli.main(["env", "1", "deny"]) == 0 and not _store().allow_env(1)
 
     # 에이전트가 허용을 기다리며 멈춘 작업은 허용하면 같은 세션으로 바로 이어서 실행한다
@@ -1368,12 +1379,58 @@ def test_env_명령으로_작업_도중에_허용하고_막힌_읽기를_타임�
     assert cli.main(["env", "1", "allow"]) == 0 and "이어서 시작했습니다" in capsys.readouterr().out
     _wait(lambda: _store().get_job(1).is_terminal and "--resume" in json.loads((env / "args.json").read_text())["argv"])
     recorded = json.loads((env / "args.json").read_text())
-    assert recorded["stdin"] == guard.ALLOWED_NOTE and "--resume" in recorded["argv"] and "--settings" not in recorded["argv"]
+    assert recorded["stdin"] == guard.ALLOWED_NOTE and "--resume" in recorded["argv"] and _settings(recorded["argv"]) is None
 
     assert guard.blocked_read({"type": "user", "message": {"content": [{"type": "tool_result", "content": "cat: .env: Operation not permitted"}]}})
     assert guard.blocked_read({"type": "user", "x": "/w/.env.prod File is in a directory that is denied by your permission settings."})
     assert not guard.blocked_read({"type": "user", "x": "cat: a.txt: Operation not permitted"})
     assert not guard.blocked_read({"type": "system", "x": ".env Operation not permitted"})
+
+
+def test_실행_중에_env를_허용해도_env_때문에_멈추지_않고_끝났으면_이어서_실행하지_않는다(env, repo, monkeypatch, capsys):
+    from coliday import guard
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "2")
+    assert cli.main(["run", "x", "-C", str(repo), "-d"]) == 0
+    _wait(lambda: (env / "args.json").exists())                          # claude 가 실제로 뜬 뒤에 허용한다
+    _wait(lambda: _store().get_job(1).status == "running")
+    capsys.readouterr()
+    assert cli.main(["env", "1", "allow"]) == 0 and "멈추면" in capsys.readouterr().out
+    assert _store().queue_message(1, "사용자가 대기시킨 요청")            # 사람이 보낸 요청은 그대로 이어서 전달된다
+    _wait(lambda: _store().get_job(1).is_terminal, timeout=30)
+
+    events = _store().events(1)
+    prompts = [e.message for e in events if e.kind == FOLLOW_UP]
+    assert prompts[-1] == "사용자가 대기시킨 요청"                         # 자동 '이어서 진행' 요청은 버렸다
+    assert not any(guard.ALLOWED_NOTE in m for m in prompts)
+    assert json.loads((env / "args.json").read_text())["stdin"] == "사용자가 대기시킨 요청"
+    assert any(e.message.startswith(guard.ALLOWED_NOT_RESUMED) for e in events)
+    assert _store().allow_env(1)                                          # 허용은 유지된다
+
+
+def test_실행_중에_env를_허용하고_에이전트가_env_때문에_멈췄으면_멈춘_일만_이어서_실행한다(env, repo, monkeypatch):
+    from coliday import guard
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "2")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT", f"{guard.NEED_MARKER}\n.env 의 DB_URL 이 필요합니다.")
+    assert cli.main(["run", "x", "-C", str(repo), "-d"]) == 0
+    _wait(lambda: (env / "args.json").exists())                          # claude 가 실제로 뜬 뒤에 허용한다
+    _wait(lambda: _store().get_job(1).status == "running")
+    assert cli.main(["env", "1", "allow"]) == 0
+    _wait(lambda: _store().get_job(1).is_terminal
+          and any(e.kind == FOLLOW_UP and e.message == guard.ALLOWED_NOTE for e in _store().events(1)), timeout=30)
+
+    recorded = json.loads((env / "args.json").read_text())
+    assert recorded["stdin"] == guard.ALLOWED_NOTE and "--resume" in recorded["argv"] and _settings(recorded["argv"]) is None
+    assert "멈췄던 일만" in guard.ALLOWED_NOTE and "범위를 넓히지" in guard.ALLOWED_NOTE
+    assert not any(e.message.startswith(guard.ALLOWED_NOT_RESUMED) for e in _store().events(1))
+
+
+def test_리뷰_반복_상한은_팀장_지시문을_고쳐_써도_늘_한_번만_붙는다():
+    custom = "너는 팀장이다.\n\n{team}\n\n## 리뷰 반복 상한\n옛 규칙: 문제가 없을 때까지 계속 재리뷰한다.\n"
+    for lead in (team.lead_prompt(3, None, template=custom), team.lead_prompt(),
+                 team.codex_lead_prompt({}, "coliday _agent 1", template=custom)):
+        assert lead.count("## 리뷰 반복 상한") == 1 and "옛 규칙" not in lead
+        assert f"최대 {team.MAX_REVIEW_ROUNDS}차례" in lead and "남은 문제" in lead and "차단 문제 남음" in lead
+        assert lead.count("## 실패한 작업 정리") == 1
 
 
 def test_보고에_적힌_경로_가운데_실제로_있는_것만_링크가_된다(tmp_path):
@@ -2112,3 +2169,36 @@ def test_Codex_팀장이면_묶기도_Codex로_하고_env_읽기를_막는다(en
     profile = " ".join(argv)
     assert f'{repo.resolve()}/**/.env*"="none"' in profile and '"."="read"' in profile   # 읽기 전용, .env 는 못 읽는다
     assert store.bundles()[0].name == "주문 취소"
+
+
+def test_claude_팀장의_리뷰_호출은_훅이_세어_상한을_넘으면_막고_타임라인에_남긴다(env, repo, monkeypatch):
+    limit = team.MAX_REVIEW_CALLS
+    monkeypatch.setenv("FAKE_CLAUDE_DISPATCH", ",".join(["reviewer", "coder"] * (limit + 1)))
+    monkeypatch.setenv("FAKE_CLAUDE_HOOK_LOG", str(env / "hooks.json"))
+    assert cli.main(["run", "x", "-C", str(repo), "--allow-env"]) == 0      # .env 를 허용한 작업에도 건다
+
+    results = json.loads((env / "hooks.json").read_text())
+    assert [r["code"] for r in results if r["role"] == "reviewer"] == [0] * limit + [2]
+    assert all(r["code"] == 0 for r in results if r["role"] == "coder")
+    assert "리뷰 반복 상한" in results[-2]["stderr"]
+    assert any(e.message == f"리뷰 반복 상한({limit}번)에 도달해 리뷰 담당 호출 1번을 막았습니다" for e in _store().events(1))
+
+    (env / "hooks.json").unlink()                                          # 이어서 시킨 요청은 새로 센다
+    monkeypatch.setenv("FAKE_CLAUDE_DISPATCH", "reviewer")
+    assert cli.main(["continue", "1", "더"]) == 0
+    assert [r["code"] for r in json.loads((env / "hooks.json").read_text())] == [0]
+
+
+def test_codex_팀장의_리뷰_호출도_상한을_넘으면_막는다(env, repo, monkeypatch, capsys):
+    limit = team.MAX_REVIEW_CALLS
+    cli.main(["model", "lead", "codex"])
+    cli.main(["model", "reviewer", "sonnet"])
+    monkeypatch.setenv("FAKE_CODEX_DELEGATE", ",".join(["reviewer"] * (limit + 1)))
+    assert cli.main(["run", "x", "-C", str(repo)]) == 0
+
+    events = _store().events(1)
+    reports = [e.message for e in events if e.kind == "text" and e.message.startswith("팀원 보고")]
+    assert [r.startswith("팀원 보고(0)") for r in reports] == [True] * limit + [False]
+    assert "리뷰 반복 상한" in reports[-1]
+    assert sum(e.kind == "dispatch" and e.message.startswith("reviewer에게") for e in events) == limit
+    assert any(e.message.startswith(f"리뷰 반복 상한({limit}번)") for e in events)

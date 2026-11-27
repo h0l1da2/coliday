@@ -37,6 +37,19 @@ if record:
          "auth": {k: os.environ[k] for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") if k in os.environ}},
         ensure_ascii=False,
     ))
+if os.environ.get("FAKE_CLAUDE_DISPATCH") and "--settings" in sys.argv:
+    # 팀장이 Agent 도구로 팀원을 차례로 부른 것처럼 --settings 의 PreToolUse 훅을 실제로 실행하고 종료 코드를 남긴다
+    import subprocess
+    hooks = json.loads(sys.argv[sys.argv.index("--settings") + 1]).get("hooks", {}).get("PreToolUse", [])
+    results = []
+    for role in os.environ["FAKE_CLAUDE_DISPATCH"].split(","):
+        payload = json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Agent",
+                              "tool_input": {"subagent_type": role, "description": "x", "prompt": "y"}})
+        for entry in hooks:
+            for hook in entry["hooks"]:
+                done = subprocess.run(hook["command"], shell=True, input=payload, capture_output=True, text=True)
+                results.append({"role": role, "code": done.returncode, "stderr": done.stderr})
+    Path(os.environ["FAKE_CLAUDE_HOOK_LOG"]).write_text(json.dumps(results, ensure_ascii=False))
 if os.environ.get("FAKE_CLAUDE_SLEEP"):
     time.sleep(float(os.environ["FAKE_CLAUDE_SLEEP"]))
 if os.environ.get("FAKE_CLAUDE_ARTIFACT"):  # 결과물 폴더(--add-dir 로 받은 곳)에 스크린샷을 남긴 것처럼 한다
@@ -48,6 +61,9 @@ if os.environ.get("FAKE_CLAUDE_TOUCH"):
     Path(os.environ["FAKE_CLAUDE_TOUCH"]).write_text("new file\n")
 sys.stdout.write((Path(__file__).parent / "stream.jsonl").read_text())
 sys.stdout.write("not json line\n")
+if os.environ.get("FAKE_CLAUDE_RESULT"):  # 마지막 보고를 바꾼다 (예: .env 허용을 기다리며 멈춘 보고)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": "s-1",
+                      "result": os.environ["FAKE_CLAUDE_RESULT"]}, ensure_ascii=False))
 code = int(os.environ.get("FAKE_CLAUDE_EXIT", "0"))
 if code:
     sys.stderr.write("boom: something failed\n")

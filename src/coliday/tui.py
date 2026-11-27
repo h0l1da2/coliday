@@ -1739,7 +1739,7 @@ class ColidayApp(App[None]):
         self.push_screen(ConfirmScreen(
             f"작업 #{job_id} 에서 에이전트가 .env 파일을 읽도록 허용할까요?\n"
             "이 작업(세션)에만 적용됩니다. 읽은 내용은 에이전트의 모델(Claude·Codex)로 전달됩니다.\n"
-            "실행 중이면 지금 실행이 끝난 뒤 허용된 상태로 이어서 진행합니다."
+            "실행 중이면 그 실행이 .env 때문에 멈췄을 때만 허용된 상태로 이어서 진행합니다."
         ), decided)
 
     def _update_artifacts(self) -> None:

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Collection, Iterable, Iterator, Mapping
 
 from . import turns
+from .events import LEAD
 from .joblist import JobGroup, JobMeta
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
@@ -369,7 +370,7 @@ class Store:
             )
             if cur.rowcount == 1:
                 # worker 가 죽어 전달되지 못한 대기 요청이 남아 있으면 버리지 않고 앞에 붙인다.
-                self.add_event(job_id, USER, FOLLOW_UP, "\n\n".join([*self._take_queued(job_id), prompt]))
+                self.add_event(job_id, USER, FOLLOW_UP, "\n\n".join([*self._take_queued(job_id)[0], prompt]))
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
@@ -388,19 +389,29 @@ class Store:
     def clear_queued(self, job_id: int) -> None:
         self._conn.execute("DELETE FROM events WHERE job_id = ? AND kind = ?", (job_id, QUEUED))
 
-    def _take_queued(self, job_id: int) -> list[str]:
-        """대기 중인 요청을 꺼낸다 (트랜잭션 안에서 부른다)."""
+    def _take_queued(self, job_id: int, drop: tuple[str, ...] = ()) -> tuple[list[str], bool]:
+        """대기 중인 요청을 꺼낸다 (트랜잭션 안에서 부른다). drop 에 든 문장과 똑같은 요청은 버린다.
+
+        (꺼낸 요청, 버린 것이 있었는지) 를 돌려준다.
+        """
         rows = self._conn.execute(
             "SELECT message FROM events WHERE job_id = ? AND kind = ? ORDER BY id", (job_id, QUEUED)
         ).fetchall()
         self._conn.execute("DELETE FROM events WHERE job_id = ? AND kind = ?", (job_id, QUEUED))
-        return [r["message"] for r in rows]
+        messages = [r["message"] for r in rows]
+        kept = [m for m in messages if m not in drop]
+        return kept, len(kept) != len(messages)
 
-    def finish_or_continue(self, job_id: int, status: str, **fields: object) -> bool:
+    def finish_or_continue(
+        self, job_id: int, status: str, *, drop: tuple[str, ...] = (), dropped_note: str = "", **fields: object,
+    ) -> bool:
         """실행 한 번을 마친다. 대기 중인 요청이 있으면 끝내지 않고 그 요청을 후속 요청으로 바꾼 뒤 False 를 돌려준다.
 
         '대기 요청 확인'과 '끝내기'를 한 트랜잭션으로 묶는다. 따로 하면 그 사이에 들어온 요청이
         끝난 작업에 남아 영영 전달되지 않는다. 이미 취소된 작업이면 아무것도 하지 않고 True.
+
+        drop 에 든 문장과 똑같은 대기 요청은 이어서 실행하지 않고 버린다 (이번 실행 결과로 필요 없어진 자동 요청).
+        버렸으면 dropped_note 를 타임라인에 남긴다.
         """
         if status not in TERMINAL_STATUSES:
             raise ValueError(status)
@@ -411,7 +422,9 @@ class Store:
             if row is None or row["status"] in TERMINAL_STATUSES:
                 self._conn.execute("COMMIT")
                 return True
-            queued = self._take_queued(job_id)
+            queued, dropped = self._take_queued(job_id, drop)
+            if dropped and dropped_note:
+                self.add_event(job_id, LEAD, "phase", dropped_note)
             if queued:
                 self.add_event(job_id, USER, FOLLOW_UP, "\n\n".join(queued))
                 extra["phase"] = "대기 중이던 요청 처리 시작"
