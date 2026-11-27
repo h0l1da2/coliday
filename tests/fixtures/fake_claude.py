@@ -7,6 +7,18 @@ if sys.argv[1:] == ["--version"]:  # 버전 확인은 기록하지 않는다
     sys.exit(0)
 
 stdin_prompt = sys.stdin.read()
+if "--tools" in sys.argv and sys.argv[sys.argv.index("--output-format") + 1] == "json":
+    # 작업을 묶는 짧은 호출 (topics.py). 팀장 실행 기록(FAKE_CLAUDE_ARGS)을 덮어쓰지 않게 따로 남긴다.
+    if os.environ.get("FAKE_CLAUDE_TOPIC_ARGS"):
+        with open(os.environ["FAKE_CLAUDE_TOPIC_ARGS"], "a") as f:
+            f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin_prompt, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
+    time.sleep(float(os.environ.get("FAKE_CLAUDE_TOPIC_DELAY", "0")))  # 묶기가 도는 동안의 상태를 보는 테스트용
+    answer = os.environ.get("FAKE_CLAUDE_TOPIC", '{"topic": null, "name": "주문 취소", "summary": "주문 취소 API 를 만들었다.", "line": "취소 API 추가"}')
+    if answer == "fail":
+        sys.stderr.write("topic boom\n")
+        sys.exit(1)
+    print(json.dumps({"type": "result", "is_error": False, "result": answer}, ensure_ascii=False))
+    sys.exit(0)
 codex_login = None
 if os.environ.get("FAKE_CLAUDE_CODEX_LOGIN") is not None and os.environ.get("CODEX_HOME"):
     login_file = Path(os.environ["CODEX_HOME"]) / "auth.json"  # 넘겨받은 Codex 로그인. 값이 있으면 그걸로 갱신한 것처럼 바꾼다

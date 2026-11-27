@@ -12,7 +12,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import config, gitops, jobs, members, projects, remote, team, worker
+from coliday import config, gitops, jobs, members, projects, remote, team, topics, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
@@ -134,6 +134,10 @@ def _parser() -> argparse.ArgumentParser:
     envp.add_argument("id", type=int)
     envp.add_argument("action", nargs="?", choices=["allow", "deny"], help="생략하면 지금 상태 보기")
     envp.set_defaults(func=_cmd_env)
+
+    tp = sub.add_parser("topics", help="자동 묶음(모델이 비슷한 작업끼리 묶은 것) 보기 (--sort: 아직 묶이지 않은 끝난 작업을 지금 묶기)")
+    tp.add_argument("--sort", action="store_true", help="자동 묶음이 없는 끝난 작업을 팀장 모델로 차례로 묶는다")
+    tp.set_defaults(func=_cmd_topics)
 
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
     cancel.add_argument("id", type=int)
@@ -360,6 +364,31 @@ def _cmd_ls(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
             f"{icon} #{j.id:<4} {jobs.ago(now - j.last_asked):>6}  {repo:<20.20}  "
             f"{_pad(jobs.one_line(prompt, 40), 40)}  {jobs.one_line(j.phase, 50)}"
         )
+    return 0
+
+
+def _cmd_topics(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
+    if args.sort:
+        failed = 0
+        for job_id in topics.pending(store):
+            try:
+                topics.classify(cfg, store, job_id, only_new=True)
+            except topics.TopicError as exc:
+                failed += 1
+                print(f"작업 #{job_id} 을(를) 묶지 못했습니다: {exc}", file=sys.stderr)
+        if failed:
+            return 1
+    rows = store.list_jobs(100)
+    if not rows:
+        print("아직 작업이 없습니다.")
+        return 0
+    lines = {job_id: link.line for job_id, link in store.job_topics().items()}
+    for topic, members_ in topics.grouped(store, rows):
+        print(f"■ {topic.name if topic else topics.UNSORTED}  ({remote.name(topic.repo) if topic else '-'}, {len(members_)}개)")
+        if topic and topic.summary:
+            print(f"  {topic.summary}")
+        for j in members_:
+            print(f"  {STATUS_ICON.get(j.status, '?')} #{j.id:<4} {jobs.one_line(lines.get(j.id) or j.prompt, 70)}")
     return 0
 
 

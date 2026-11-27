@@ -590,7 +590,8 @@ def test_git_저장소가_아닌_곳에서_열면_자동으로_연결하지_않�
         app = ColidayApp(cfg, store, default_dir=str(plain))
         async with app.run_test(size=(160, 45)) as pilot:
             assert jobs.list_projects(cfg, store) == [] and app.project_dir is None
-            assert app.focused is app.query_one("#jobs", DataTable)  # 고를 프로젝트가 없으면 작업 목록에서 시작
+            await pilot.pause()
+            assert app.focused is app.query_one("#projects", DataTable)  # 프로젝트가 없어도 프로젝트 목록에서 시작
             await pilot.press("ctrl+x")
             await pilot.pause()
             await pilot.press("ctrl+n")
@@ -742,7 +743,8 @@ def test_r로_지운_작업은_목록에서_바로_사라지고_남은_작업을
             assert "첫 작업" in _timeline_text(app) and "둘째 작업" not in _timeline_text(app)
 
             jobs.remove(cfg, store, store.get_job(1), force=True)  # 다른 터미널에서 삭제
-            await _until(pilot, lambda: table.row_count == 0)
+            # 타임라인 비우기(remove_children)는 다음 이벤트 처리에서 끝난다: 그것까지 기다린다.
+            await _until(pilot, lambda: table.row_count == 0 and "첫 작업" not in _timeline_text(app))
             assert app.selected_id is None and "첫 작업" not in _timeline_text(app)
             await pilot.press("ctrl+r")
             await pilot.pause()
@@ -775,8 +777,14 @@ def test_타임라인과_diff를_드래그하면_클립보드에_복사된다(en
             await _until(pilot, lambda: store.get_job(1).is_terminal)
             await _until(pilot, lambda: "최종 보고: 완료" in _timeline_text(app))
             await _until(pilot, lambda: "+new file" in _diff_text(app))
-            app.query_one("#timeline").scroll_home(animate=False)   # 요청 줄이 보이게 (긴 경로는 여러 줄을 차지한다)
-            await pilot.pause(0.3)
+            timeline = app.query_one("#timeline")
+            # 마지막 줄을 쓸 때 미뤄 둔 '맨 아래로' 스크롤이 scroll_home 뒤에 올 수 있다: 맨 위에 머물 때까지 다시 올린다.
+            for _ in range(10):
+                timeline.scroll_home(animate=False)   # 요청 줄이 보이게 (긴 경로는 여러 줄을 차지한다)
+                await pilot.pause(0.3)
+                if timeline.scroll_y == 0:
+                    break
+            assert timeline.scroll_y == 0
 
             await drag(pilot, "#timeline", (1, 0), (60, 10))
             await _until(pilot, lambda: bool(copied))  # 복사는 드래그가 끝난 뒤에 처리된다 (느린 컴퓨터에서 0.3초를 넘긴다)
@@ -1279,11 +1287,10 @@ def test_Ctrl_Y는_보이지_않는_부분까지_타임라인_전체를_복사�
         store.close()
 
 
-# ── 목록 정리: 묶기·접기·고정·그룹·파생 ─────────────────────────
+# ── 묶음: 평평한 목록 + 오른쪽 위 묶음 패널 (고정·그룹·파생) ─────────────────────────
 from textual.widgets import Checkbox, OptionList  # noqa: E402
 
-from coliday import prefs  # noqa: E402
-from coliday.tui import ListMenuScreen, NameScreen  # noqa: E402
+from coliday.tui import BundlePanel, ListMenuScreen, NameScreen  # noqa: E402
 
 
 def _keys(app) -> list[str]:
@@ -1308,11 +1315,29 @@ def _notified(app, text: str) -> bool:
     return any(text in str(n.message) for n in app._notifications)
 
 
+def _panel(app) -> BundlePanel:
+    return app.query_one("#bundle", BundlePanel)
+
+
+def _bundle_ids(app) -> list:
+    return [o.id for o in _panel(app)._options]
+
+
+def _bundle_texts(app) -> list[str]:
+    return [str(o.prompt) for o in _panel(app)._options]
+
+
+def _highlight(app, option_id: str) -> None:
+    panel = _panel(app)
+    panel.highlighted = panel.get_option_index(option_id)
+
+
 async def _menu(pilot, app, option_id: str) -> None:
-    """ctrl+b 목록 정리에서 항목 하나를 고른다."""
+    """ctrl+b 묶음 메뉴에서 항목 하나를 고른다. 메뉴를 열면 포커스는 묶음 패널로 옮겨져 있다."""
     await pilot.press("ctrl+b")
     await pilot.pause()
     assert isinstance(app.screen, ListMenuScreen)
+    assert app.screen_stack[0].focused is _panel(app)
     options = app.screen.query_one(OptionList)
     options.highlighted = options.get_option_index(option_id)
     await pilot.press("enter")
@@ -1323,236 +1348,14 @@ async def _to_key(pilot, app, key: str) -> None:
     """커서를 그 줄로 옮긴다 (↑↓ 로)."""
     table = app.query_one("#jobs", DataTable)
     table.focus()
+    await pilot.pause()
     target = _keys(app).index(key)
     while table.cursor_row != target:
         await pilot.press("down" if table.cursor_row < target else "up")
     await pilot.pause()
 
 
-def test_ctrl_b로_묶기_기준을_바꾸면_저장되고_다시_열어도_유지된다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    _done(store, repo, "첫 작업")
-    _done(store, repo, "둘째 작업", "failed")
-
-    async def first():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            table = app.query_one("#jobs", DataTable)
-            await _until(pilot, lambda: table.row_count == 2)
-            assert _keys(app) == ["2", "1"] and str(table.border_title) == "작업 목록 · myrepo"   # 기본은 묶지 않는다
-            await pilot.press("ctrl+b")
-            options = app.screen.query_one(OptionList)
-            assert "없음 / 상태" in str(options.get_option("group_by").prompt)   # 프로젝트로 묶기는 없다
-            options.highlighted = options.get_option_index("group_by")
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, ListMenuScreen)                  # 창은 닫히지 않고 그 자리에서 바뀐다
-            assert "지금: 상태" in str(options.get_option("group_by").prompt)
-            assert prefs.load(cfg.ui_path).group_by == "status"            # 바로 저장된다
-            assert _keys(app) == ["h:status:failed", "2", "h:status:succeeded", "1"]
-            await pilot.press("enter")
-            await pilot.pause()
-            assert prefs.load(cfg.ui_path).group_by == "none" and _keys(app) == ["2", "1"]   # 다시 누르면 없음으로
-            await pilot.press("enter")
-            await pilot.pause()
-            await pilot.press("escape")
-            await pilot.pause()
-            assert len(app.screen_stack) == 1 and "묶기: 상태" in str(table.border_title)
-            assert _keys(app) == ["h:status:failed", "2", "h:status:succeeded", "1"]
-            assert app.selected_id == 2                                    # 보던 작업은 그대로
-
-    async def again():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.query_one("#jobs", DataTable).row_count == 4)
-            assert _keys(app) == ["h:status:failed", "2", "h:status:succeeded", "1"]
-            assert _cursor_key(app) == "2" and app.selected_id == 2         # 처음 열면 커서는 첫 작업 줄
-            assert "묶기: 상태" in str(app.query_one("#jobs", DataTable).border_title)
-
-    try:
-        _run(first())
-        _run(again())
-    finally:
-        store.close()
-
-
-def test_상태로_묶으면_머리줄과_개수가_맞고_Enter와_좌우키로_접고_편다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    _done(store, repo, "첫 작업")
-    _done(store, repo, "둘째 작업")
-    _done(store, repo, "셋째 작업", "failed")
-    prefs.save(cfg.ui_path, prefs.Prefs("status"))
-
-    async def first():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            table = app.query_one("#jobs", DataTable)
-            await _until(pilot, lambda: table.row_count == 5)
-            assert _keys(app) == ["h:status:failed", "3", "h:status:succeeded", "2", "1"]
-            assert _cell(app, "h:status:failed") == "▾ 실패 (1)" and _cell(app, "h:status:succeeded") == "▾ 완료 (2)"
-            assert "←→ 접기" in str(table.border_subtitle) and "Ctrl+B" in str(table.border_subtitle)
-            table.focus()
-            assert _cursor_key(app) == "3"
-
-            await pilot.press("left")                 # 뿌리 작업: 머리줄로
-            await pilot.pause()
-            assert _cursor_key(app) == "h:status:failed" and app.selected_id is None
-            await pilot.press("left")                 # 머리줄: 접는다
-            await pilot.pause()
-            assert _keys(app) == ["h:status:failed", "h:status:succeeded", "2", "1"]
-            assert _cell(app, "h:status:failed") == "▸ 실패 (1)"   # 접혀도 개수는 전체
-            assert "status:failed" in prefs.load(cfg.ui_path).collapsed
-            await pilot.press("right")                # 편다
-            await pilot.pause()
-            assert "3" in _keys(app) and _cursor_key(app) == "h:status:failed"
-
-            await _to_key(pilot, app, "h:status:succeeded")
-            await pilot.press("enter")                # 머리줄 Enter: 채팅으로 가지 않고 접는다
-            await pilot.pause()
-            assert _keys(app) == ["h:status:failed", "3", "h:status:succeeded"]
-            assert app.focused is table and _cursor_key(app) == "h:status:succeeded"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert _keys(app)[-2:] == ["2", "1"]
-            await pilot.press("enter")
-            await pilot.pause()
-            assert prefs.load(cfg.ui_path).collapsed == {"status:succeeded"}
-
-    async def again():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.query_one("#jobs", DataTable).row_count == 3)
-            assert _keys(app) == ["h:status:failed", "3", "h:status:succeeded"]   # 접힘도 유지된다
-            assert _cursor_key(app) == "3"
-            await pilot.click("#jobs", offset=(30, 2))  # 머리줄은 한 번 눌러도 접힌다 (테두리·열 이름 아래 첫 줄)
-            await _until(pilot, lambda: _keys(app) == ["h:status:failed", "h:status:succeeded"])
-            assert _cursor_key(app) == "h:status:failed" and app.selected_id is None
-
-    try:
-        _run(first())
-        _run(again())
-    finally:
-        store.close()
-
-
-def test_머리줄에서는_채팅을_보내지_않고_Delete도_확인_창을_띄우지_않는다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    _done(store, repo, "첫 작업")
-    _done(store, repo, "둘째 작업", "failed")
-    prefs.save(cfg.ui_path, prefs.Prefs("status"))
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            table = app.query_one("#jobs", DataTable)
-            chat = app.query_one("#chat", Input)
-            await _until(pilot, lambda: table.row_count == 4)
-            await _to_key(pilot, app, "h:status:failed")
-            assert app.selected_id is None and "머리줄" in chat.placeholder
-
-            await pilot.press("ㄱ")                    # 글자는 채팅 입력으로 간다
-            chat.value = "새로 시킬 일"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert [j.id for j in store.list_jobs()] == [2, 1]      # 새 작업을 만들지 않는다
-            assert chat.value == "새로 시킬 일" and _notified(app, "작업을 고르세요")
-
-            table.focus()
-            for key in ("delete", "ctrl+r"):
-                await pilot.press(key)
-                await pilot.pause()
-                assert len(app.screen_stack) == 1                    # 확인 창 없이 알리기만 한다
-            assert _notified(app, "머리줄은 지울 수 없습니다")
-            await pilot.press("ctrl+s")
-            await pilot.pause()
-            assert len(app.screen_stack) == 1 and _notified(app, "선택된 작업이 없습니다")
-            assert [j.id for j in store.list_jobs()] == [2, 1]
-
-    try:
-        _run(scenario())
-    finally:
-        store.close()
-
-
-def test_머리줄_Space로_묶음_전체를_고르고_접힌_곳의_작업도_확인_뒤_삭제한다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    _done(store, repo, "첫 작업")
-    _done(store, repo, "둘째 작업")
-    _done(store, repo, "셋째 작업", "failed")
-    prefs.save(cfg.ui_path, prefs.Prefs("status"))
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            table = app.query_one("#jobs", DataTable)
-            await _until(pilot, lambda: table.row_count == 5)
-            await _to_key(pilot, app, "h:status:succeeded")
-            await pilot.press("space")
-            await pilot.pause()
-            assert app._marked == {1, 2} and _cursor_key(app) == "h:status:succeeded"
-            await pilot.press("space")                 # 모두 골라져 있으면 모두 푼다
-            await pilot.pause()
-            assert app._marked == set()
-            await pilot.press("space")
-            await pilot.press("left")                  # 고른 채로 접는다
-            await pilot.pause()
-            assert app._marked == {1, 2} and "2개 선택 (접힌 곳 2개)" in str(table.border_subtitle)
-            await pilot.press("escape")                # Esc 는 접힌 곳의 선택도 모두 푼다
-            await pilot.pause()
-            assert app._marked == set()
-            await pilot.press("space")
-            await pilot.pause()
-            assert app._marked == {1, 2}
-
-            await pilot.press("delete")                # 머리줄이어도 고른 작업이 있으면 그것들을 지운다
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmScreen) and "#2, #1" in app.screen._question
-            await pilot.press("y")
-            await pilot.pause()
-            assert [j.id for j in store.list_jobs()] == [3] and app._marked == set()
-            await _until(pilot, lambda: _keys(app) == ["h:status:failed", "3"])
-            assert app.selected_id == 3                # 지운 뒤에는 작업 줄로
-
-    try:
-        _run(scenario())
-    finally:
-        store.close()
-
-
-def test_실행이_끝나_접힌_상태_묶음으로_옮겨가도_커서와_타임라인이_유지된다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    done = _done(store, repo, "끝난 작업")
-    running = store.create_job(prompt="오래 걸리는 일", repo=str(repo), workdir=str(repo), model=None)
-    assert store.start_job(running.id, pid=os.getpid())  # 화면을 확인할 때까지 실행 중으로 둔다
-    prefs.save(cfg.ui_path, prefs.Prefs("status", frozenset({"status:succeeded"})))
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: _keys(app)[:2] == ["h:status:running", str(running.id)])
-            assert app.selected_id == running.id and "h:status:succeeded" in _keys(app)
-            assert str(done.id) not in _keys(app)      # 완료 묶음은 접혀 있다
-            await _until(pilot, lambda: running.prompt in _timeline_text(app))
-
-            assert store.finish_job(running.id, "succeeded", phase="완료")
-            await _until(pilot, lambda: _keys(app) == ["h:status:succeeded", str(running.id), str(done.id)])
-            await _until(pilot, lambda: "succeeded  완료" in _timeline_text(app))
-            assert _cursor_key(app) == str(running.id) and app.selected_id == running.id
-            assert running.prompt in _timeline_text(app)
-            assert prefs.load(cfg.ui_path).collapsed == {"status:succeeded"}   # 접힘 설정은 그대로
-
-    try:
-        _run(scenario())
-    finally:
-        store.close()
-
-
-def test_고정한_작업은_어떤_기준에서도_맨_위_묶음이고_고정을_풀_수_있다(env, repo):
+def test_고정한_작업은_맨_위에_고정_표시로_보이고_풀_수_있다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     _done(store, repo, "첫 작업")
@@ -1563,21 +1366,25 @@ def test_고정한_작업은_어떤_기준에서도_맨_위_묶음이고_고정�
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.query_one("#jobs", DataTable).row_count == 3)
+            assert _keys(app) == ["3", "2", "1"]
             await _to_key(pilot, app, "1")
             await _menu(pilot, app, "pin")
             assert store.job_meta()[1].pinned and len(app.screen_stack) == 1
-            assert _keys(app) == ["h:pinned", "1", "3", "2"] and _cursor_key(app) == "1"
-            for group_by in ("status", "none"):
-                app._cycle_group_by()
-                await pilot.pause()
-                assert app._prefs.group_by == group_by and _keys(app)[:2] == ["h:pinned", "1"]
+            assert _keys(app) == ["1", "3", "2"] and _cursor_key(app) == "1"     # 머리줄 없이 맨 위로
+            assert not any(key.startswith("h:") for key in _keys(app))
+            assert _cell(app, "1").startswith("📌 ") and "📌" not in _cell(app, "3")
+            assert "📌 고정" in str(_panel(app).border_title)
+            assert app.focused is _panel(app)                                   # 메뉴를 닫으면 묶음 패널로
             await pilot.press("ctrl+b")
             await pilot.pause()
             ids = [o.id for o in app.screen.query_one(OptionList)._options]
             assert "unpin" in ids and "pin" not in ids
             await pilot.press("escape")
+            await pilot.pause()
+            assert app.focused is _panel(app)
             await _menu(pilot, app, "unpin")
             assert not store.job_meta()[1].pinned and _keys(app) == ["3", "2", "1"]
+            assert "📌" not in str(_panel(app).border_title)
 
     try:
         _run(scenario())
@@ -1611,36 +1418,53 @@ def test_그룹을_만들고_넣고_빼고_이름을_바꾸고_지워도_작업�
             await name(pilot, app, "결제")
             group = store.list_groups()[0]
             assert group.name == "결제" and {i for i, m in store.job_meta().items() if m.group_id == group.id} == {2, 3}
-            assert _keys(app) == [f"h:group:{group.id}", "3", "2", "1"]
-            assert _cell(app, f"h:group:{group.id}") == "▾ 결제 (2)"
+            assert _keys(app) == ["3", "2", "1"]      # 평평한 목록 그대로 (머리줄 없음)
+            assert _cell(app, "3").startswith("▣결제 ") and _cell(app, "2").startswith("▣결제 ") and "▣" not in _cell(app, "1")
 
-            await pilot.press("escape")               # 선택을 풀고 커서가 있는 작업 하나로
+            await _to_key(pilot, app, "3")
+            assert _bundle_texts(app)[0] == "그룹: 결제 (2)" and _bundle_ids(app) == [None, "m:3", "m:2", "menu"]
+            assert _bundle_texts(app)[1].startswith("▶ ")
+
+            await pilot.press("escape")               # 선택을 풀고 선택한 작업 하나로
             await _menu(pilot, app, "group_new")
             await name(pilot, app, "결제")            # 이름이 겹치면 알리고 만들지 않는다
             assert len(store.list_groups()) == 1 and _notified(app, "이미 있는 그룹 이름")
 
             await _to_key(pilot, app, "2")
             await _menu(pilot, app, "ungroup")
-            assert store.job_meta()[2].group_id is None and _cell(app, f"h:group:{group.id}") == "▾ 결제 (1)"
+            assert store.job_meta()[2].group_id is None and "그룹:" not in " ".join(_bundle_texts(app))
+            await _to_key(pilot, app, "3")
+            assert _bundle_texts(app)[0] == "그룹: 결제 (1)"
 
-            await _to_key(pilot, app, f"h:group:{group.id}")
-            await _menu(pilot, app, "rename_group")
+            await _menu(pilot, app, "rename_group")   # 그룹에 든 작업을 고른 채 메뉴로
             assert app.screen.query_one("#name", Input).value == "결제"
             await name(pilot, app, "결제 v2")
-            assert store.list_groups()[0].name == "결제 v2" and _cell(app, f"h:group:{group.id}") == "▾ 결제 v2 (1)"
-            store.create_group("기타", project=str(repo.resolve()))
+            assert store.list_groups()[0].name == "결제 v2" and _cell(app, "3").startswith("▣결제 v2 ")
+            assert _bundle_texts(app)[0] == "그룹: 결제 v2 (1)"
+            spare = store.create_group("기타", project=str(repo.resolve()))
             await _menu(pilot, app, "rename_group")
             await name(pilot, app, "기타")
             assert _notified(app, "이미 있는 그룹 이름") and store.list_groups()[0].name == "결제 v2"
 
-            await _to_key(pilot, app, f"h:group:{group.id}")
-            await _menu(pilot, app, "delete_group")
-            assert [g.name for g in store.list_groups()] == ["기타"]
-            assert [j.id for j in store.list_jobs()] == [3, 2, 1]          # 작업은 남는다
-            assert f"h:group:{group.id}" not in _keys(app) and app.selected_id is not None
+            store.set_group([2], group.id)            # 패널에서 ctrl+x 로 구성 작업 하나를 뺀다
+            await _until(pilot, lambda: "m:2" in _bundle_ids(app))
+            _panel(app).focus()
+            await pilot.pause()
+            _highlight(app, "m:2")
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert store.job_meta()[2].group_id is None and "m:2" not in _bundle_ids(app)
+            assert store.job_meta()[3].group_id == group.id and len(app.screen_stack) == 1
 
-            await _to_key(pilot, app, "3")            # 작업 줄에서는 그룹 이름 바꾸기·삭제가 없다
-            await pilot.press("ctrl+b")
+            await _menu(pilot, app, f"delete_empty:{spare.id}")   # 빈 그룹은 메뉴에서 지운다
+            assert [g.name for g in store.list_groups()] == ["결제 v2"]
+
+            await _menu(pilot, app, "delete_group")
+            assert store.list_groups() == []
+            assert [j.id for j in store.list_jobs()] == [3, 2, 1]          # 작업은 남는다
+            assert "▣" not in _cell(app, "3") and app.selected_id == 3
+
+            await pilot.press("ctrl+b")               # 그룹이 없는 작업에서는 그룹 이름 바꾸기·삭제가 없다
             await pilot.pause()
             ids = [o.id for o in app.screen.query_one(OptionList)._options]
             assert "rename_group" not in ids and "delete_group" not in ids
@@ -1652,7 +1476,7 @@ def test_그룹을_만들고_넣고_빼고_이름을_바꾸고_지워도_작업�
         store.close()
 
 
-def test_새_작업_창에서_파생하면_부모_아래에_들여쓰고_부모를_지워도_자식은_남는다(env, repo):
+def test_새_작업_창에서_파생하면_목록에_부모_표시가_보이고_묶음_패널에_부모와_자식이_나온다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     parent = jobs.launch(cfg, store, "부모 작업", repo).job
@@ -1664,7 +1488,7 @@ def test_새_작업_창에서_파생하면_부모_아래에_들여쓰고_부모�
             await _until(pilot, lambda: app.selected_id == parent.id)
             project = app.project_dir
 
-            await _menu(pilot, app, "derive")         # 목록 정리에서 고르면 파생이 켜진 채로 열린다
+            await _menu(pilot, app, "derive")         # 묶음 메뉴에서 고르면 파생이 켜진 채로 열린다
             assert isinstance(app.screen, NewJobScreen) and app.screen.query_one("#derive", Checkbox).value
             await pilot.press("escape")
             await pilot.pause()
@@ -1684,22 +1508,15 @@ def test_새_작업_창에서_파생하면_부모_아래에_들여쓰고_부모�
             await _until(pilot, lambda: len(store.list_jobs()) == 2 and app.selected_id == store.list_jobs()[0].id)
             child = store.list_jobs()[0]
             assert store.job_meta()[child.id].parent_id == parent.id and child.branch == f"coliday/{child.id}"
-            assert _keys(app) == [str(parent.id), str(child.id)]
-            assert _cell(app, str(child.id)).startswith("└ ") and "(+1)" in _cell(app, str(parent.id))
+            assert _keys(app) == [str(child.id), str(parent.id)]                 # 최근 순 (트리 없음)
+            assert _cell(app, str(child.id)).startswith(f"↳#{parent.id} ") and "↳" not in _cell(app, str(parent.id))
             assert app.selected_id == child.id and app.project_dir == project   # 프로젝트 선택은 바뀌지 않는다
+            assert f"p:{parent.id}" in _bundle_ids(app) and "파생" in _bundle_texts(app)
+            assert any(t.endswith("(부모)") and f"#{parent.id}" in t for t in _bundle_texts(app))
             await _until(pilot, lambda: store.get_job(child.id).is_terminal)
 
-            table = app.query_one("#jobs", DataTable)
-            table.focus()
-            await pilot.press("left")                 # 자식에서 ← 는 부모로
-            await pilot.pause()
-            assert app.selected_id == parent.id
-            await pilot.press("left")                 # 펼친 부모에서 ← 는 접기
-            await pilot.pause()
-            assert _keys(app) == [str(parent.id)] and "▸" in _cell(app, str(parent.id))
-            await pilot.press("right")
-            await pilot.pause()
-            assert _keys(app) == [str(parent.id), str(child.id)]
+            await _to_key(pilot, app, str(parent.id))
+            assert app.selected_id == parent.id and f"c:{child.id}" in _bundle_ids(app)
 
             await pilot.press("ctrl+r")
             await pilot.press("y")
@@ -1708,6 +1525,9 @@ def test_새_작업_창에서_파생하면_부모_아래에_들여쓰고_부모�
             assert store.job_meta().get(child.id) is None or store.job_meta()[child.id].parent_id is None
             await _until(pilot, lambda: _keys(app) == [str(child.id)])
             assert _cell(app, str(child.id)) == "이어서 테스트 추가" and app.selected_id == child.id
+            # 지운 부모는 고를 수 없는 줄로 남는다 (만든 출처)
+            await _until(pilot, lambda: f"↑ #{parent.id} (지워짐)" in " ".join(_bundle_texts(app)))
+            assert f"p:{parent.id}" not in _bundle_ids(app)
 
     try:
         _run(scenario())
@@ -1715,56 +1535,30 @@ def test_새_작업_창에서_파생하면_부모_아래에_들여쓰고_부모�
         store.close()
 
 
-def test_머리줄에_커서가_있어도_새로고침_뒤_그대로이고_다른_묶음의_부모는_표시된다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    first = _done(store, repo, "실패한 부모", "failed")
-    _done(store, repo, "완료된 자식", parent_id=first.id)
-    prefs.save(cfg.ui_path, prefs.Prefs("status"))
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.query_one("#jobs", DataTable).row_count == 4)
-            assert _keys(app) == ["h:status:failed", "1", "h:status:succeeded", "2"]
-            assert _cell(app, "2").startswith("↳#1 ")       # 부모가 다른 묶음에 있다
-            await _to_key(pilot, app, "h:status:succeeded")
-            _done(store, repo, "새 작업")               # 줄 구성이 바뀌는 새로고침
-            await _until(pilot, lambda: "3" in _keys(app))
-            assert _cursor_key(app) == "h:status:succeeded" and app.selected_id is None
-            store.update_job(1, phase="바뀐 단계")       # 셀만 바뀌는 새로고침
-            await _until(pilot, lambda: "바뀐 단계" in _cell(app, "1", "phase"))
-            assert _cursor_key(app) == "h:status:succeeded" and app.selected_id is None
-
-    try:
-        _run(scenario())
-    finally:
-        store.close()
-
-
-def test_깨진_화면_설정_파일로도_열린다(env, repo):
+def test_옛_화면_설정_파일이_있어도_평평한_목록으로_열리고_파일은_그대로다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     _done(store, repo, "첫 작업")
-    cfg.ui_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.ui_path.write_text("{깨진 json")
+    ui = cfg.home / "ui.json"
+    ui.parent.mkdir(parents=True, exist_ok=True)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.query_one("#jobs", DataTable).row_count == 1)
-            assert _keys(app) == ["1"] and app._prefs == prefs.Prefs()
-            app._cycle_group_by()
-            await pilot.pause()
-            assert prefs.load(cfg.ui_path).group_by == "status"    # 다시 저장하면 고쳐진다
+            assert _keys(app) == ["1"] and app.selected_id == 1
+            assert str(app.query_one("#jobs", DataTable).border_title) == "작업 목록 · myrepo"
 
     try:
-        _run(scenario())
+        for content in ('{"group_by": "status", "collapsed": ["status:succeeded", "job:1"]}', "{깨진 json"):
+            ui.write_text(content)
+            _run(scenario())
+            assert ui.read_text() == content          # 읽지도 쓰지도 않는다
     finally:
         store.close()
 
 
-# ── 리뷰 회귀: 메뉴 대상 고정 / 파생은 백그라운드 / 화면 설정 병합 ─────────────────────
+# ── 리뷰 회귀: 메뉴 대상 고정 / 파생은 백그라운드 ─────────────────────
 
 import threading  # noqa: E402
 
@@ -1772,7 +1566,7 @@ from coliday.jobs import JobError  # noqa: E402
 
 
 async def _choose(pilot, app, option_id: str) -> None:
-    """열려 있는 목록 정리 메뉴에서 항목 하나를 고른다."""
+    """열려 있는 묶음 메뉴에서 항목 하나를 고른다."""
     assert isinstance(app.screen, ListMenuScreen)
     options = app.screen.query_one(OptionList)
     options.highlighted = options.get_option_index(option_id)
@@ -1787,7 +1581,7 @@ async def _open_menu_on(pilot, app, key: str) -> None:
     assert isinstance(app.screen, ListMenuScreen)
 
 
-def test_목록_정리_메뉴는_연_때의_작업에만_적용하고_그사이_지워졌으면_바꾸지_않는다(env, repo):
+def test_묶음_메뉴는_연_때의_작업에만_적용하고_그사이_지워졌으면_바꾸지_않는다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     for prompt in ("첫", "둘째", "셋째", "넷째", "다섯째"):
@@ -1836,17 +1630,27 @@ def test_목록_정리_메뉴는_연_때의_작업에만_적용하고_그사이_
             await _choose(pilot, app, "derive")
             assert len(app.screen_stack) == 1 and _notified(app, "#4 이(가) 그사이 지워져")
 
-            # 그룹 삭제·이름 바꾸기: 메뉴를 연 그룹이 지워졌으면 다른 그룹을 건드리지 않는다
-            for option in ("delete_group", "rename_group"):
+            # 그룹 삭제·이름 바꾸기·빈 그룹 삭제: 메뉴를 연 그룹이 지워졌으면 다른 그룹을 건드리지 않는다
+            for option in ("delete_group", "rename_group", "delete_empty"):
                 target = store.create_group(f"임시 {option}", project=str(repo.resolve()))
-                await _until(pilot, lambda: f"h:group:{target.id}" in _keys(app))
-                await _open_menu_on(pilot, app, f"h:group:{target.id}")
+                if option != "delete_empty":
+                    store.set_group([5], target.id)
+                    await _until(pilot, lambda: "m:5" in _bundle_ids(app))
+                await _until(pilot, lambda: target.id in {g.id for g in app._groups})
+                await _open_menu_on(pilot, app, "5")
                 store.delete_group(target.id)
-                await _until(pilot, lambda: f"h:group:{target.id}" not in _keys(app))
-                await _choose(pilot, app, option)
+                await _until(pilot, lambda: "m:5" not in _bundle_ids(app) and target.id not in {g.id for g in app._groups})
+                await _choose(pilot, app, f"delete_empty:{target.id}" if option == "delete_empty" else option)
                 assert len(app.screen_stack) == 1 and _notified(app, f"그룹 '임시 {option}' 이(가) 그사이 지워져")
                 assert [g.name for g in store.list_groups()] == ["배포", "기타"]
             assert [j.id for j in store.list_jobs()] == [5] and other.id in {g.id for g in store.list_groups()}
+
+            # 빈 그룹 삭제: 그사이 작업이 들어갔으면 지우지 않는다
+            await _open_menu_on(pilot, app, "5")
+            store.set_group([5], other.id)
+            await _choose(pilot, app, f"delete_empty:{other.id}")
+            assert other.id in {g.id for g in store.list_groups()} and _notified(app, "그사이 작업이 들어가")
+            store.set_group([5], None)
 
             # 대상이 남아 있으면 커서가 그사이 옮겨져도 메뉴를 연 작업에 적용한다
             _done(store, repo, "여섯째")
@@ -1889,7 +1693,7 @@ async def _submit_derive(pilot, app, prompt: str) -> None:
     await pilot.pause()
 
 
-def test_파생_작업은_백그라운드에서_만들고_그동안_화면이_반응하며_끝나면_부모_아래_선택된다(env, repo, monkeypatch):
+def test_파생_작업은_백그라운드에서_만들고_그동안_화면이_반응하며_끝나면_새_작업이_선택된다(env, repo, monkeypatch):
     cfg = config.load()
     store = Store(cfg.db_path)
     parent = _done(store, repo, "부모 작업")
@@ -1921,7 +1725,7 @@ def test_파생_작업은_백그라운드에서_만들고_그동안_화면이_�
             await _until(pilot, lambda: len(store.list_jobs()) == 2 and app.selected_id == store.list_jobs()[0].id)
             child = store.list_jobs()[0]
             assert child.prompt == "이어서 테스트 추가" and store.job_meta()[child.id].parent_id == parent.id
-            assert _keys(app) == [str(parent.id), str(child.id)] and _cell(app, str(child.id)).startswith("└ ")
+            assert _keys(app) == [str(child.id), str(parent.id)] and _cell(app, str(child.id)).startswith(f"↳#{parent.id} ")
             assert _notified(app, f"작업 #{child.id} 시작 (#{parent.id} 에서 파생)")
             in_main, used = calls[0]
             assert not in_main and used is not store                   # 화면 스레드 밖에서 따로 연 연결로
@@ -1985,41 +1789,6 @@ def test_파생_작업을_만드는_중에_끝내도_앱이_기다리지_않는�
         assert time.monotonic() - closed_at[0] < 10
     finally:
         release.set()
-        store.close()
-
-
-def test_다른_화면이_저장한_묶기_기준을_작업을_접어도_되돌리지_않는다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    parent = _done(store, repo, "부모")
-    _done(store, repo, "자식", parent_id=parent.id)
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))       # 화면 B: 기본 설정(group_by=none)으로 열었다
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: _keys(app) == ["1", "2"])
-            assert app._prefs == prefs.Prefs()
-            # 그사이 화면 A 가 묶기 기준을 상태로 바꾸고 실패 묶음을 접어 저장했다
-            prefs.update(cfg.ui_path, group_by="status", add={"status:failed"})
-
-            await _to_key(pilot, app, "1")
-            await pilot.press("left")                                  # B 가 부모 작업을 접는다 → 저장
-            await pilot.pause()
-            saved = prefs.load(cfg.ui_path)
-            assert saved == prefs.Prefs("status", frozenset({"status:failed", "job:1"}))   # A 의 변경이 남는다
-            assert app._prefs == saved                                 # B 는 저장한 결과를 자기 설정으로 삼는다
-
-            # 지운 작업의 접힘 키는 B 가 저장할 때 함께 정리된다 (A 의 키는 그대로)
-            assert store.delete_job(2) and store.delete_job(1)
-            _done(store, repo, "새 작업")
-            await _until(pilot, lambda: "3" in _keys(app))
-            app._cycle_group_by()
-            await pilot.pause()
-            assert prefs.load(cfg.ui_path) == prefs.Prefs("none", frozenset({"status:failed"}))
-
-    try:
-        _run(scenario())
-    finally:
         store.close()
 
 
@@ -2228,6 +1997,7 @@ def test_목록에서_뺀_프로젝트의_작업은_기타에_보이고_기타�
             assert "pin" in [o.id for o in app.screen.query_one(OptionList)._options]   # 고정은 된다
             await pilot.press("escape")
             await pilot.pause()
+            assert app.focused is app.query_one("#bundle")             # 메뉴를 닫으면 묶음 패널로
 
             app._clear_selection()                                     # 작업을 고르지 않은 채 보내면
             chat = app.query_one("#chat", Input)
@@ -2270,7 +2040,7 @@ def test_그룹은_만든_프로젝트에서만_보이고_다른_프로젝트는
             await _menu(pilot, app, "group_new")
             await name(pilot, app, "결제")
             [ga] = store.list_groups(project=a)
-            assert _keys(app) == [f"h:group:{ga.id}", "1"]
+            assert _keys(app) == ["1"] and _bundle_texts(app)[0] == "그룹: 결제 (1)"
 
             await _to_project(pilot, app, b)
             assert _keys(app) == ["2"]                                 # A 의 그룹은 보이지 않는다
@@ -2283,15 +2053,18 @@ def test_그룹은_만든_프로젝트에서만_보이고_다른_프로젝트는
             await name(pilot, app, "결제")
             assert not _notified(app, "이미 있는 그룹 이름")
             [gb] = store.list_groups(project=b)
-            assert gb.name == "결제" and gb.id != ga.id and _keys(app) == [f"h:group:{gb.id}", "2"]
+            assert gb.name == "결제" and gb.id != ga.id and _keys(app) == ["2"]
+            assert _bundle_texts(app)[0] == "그룹: 결제 (1)" and _bundle_ids(app)[1] == "m:2"
 
             store.set_group([1], gb.id)                                # 다른 프로젝트의 그룹에 든 작업은 그룹 없이 보인다
             await _to_project(pilot, app, a)
-            assert _keys(app) == [f"h:group:{ga.id}", "1"] and _cell(app, f"h:group:{ga.id}") == "▾ 결제 (0)"
+            assert _keys(app) == ["1"] and app.selected_id == 1 and "▣" not in _cell(app, "1")
+            assert not any(t.startswith("그룹:") for t in _bundle_texts(app))
             await _to_key(pilot, app, "1")
             await pilot.press("ctrl+b")
             await pilot.pause()
-            assert "ungroup" not in [o.id for o in app.screen.query_one(OptionList)._options]
+            ids = [o.id for o in app.screen.query_one(OptionList)._options]
+            assert "ungroup" not in ids and f"delete_empty:{ga.id}" in ids   # A 의 결제 그룹은 이제 비었다
             await pilot.press("escape")
 
     try:
@@ -2324,7 +2097,8 @@ def test_다른_프로젝트로_옮긴_뒤_파생이_끝나면_화면은_그대�
             assert child.id not in (parent.id, theirs.id)
             assert app.scope == str(other.resolve()) and app.selected_id == theirs.id and _keys(app) == [str(theirs.id)]
             await _to_project(pilot, app, str(repo.resolve()))
-            assert _keys(app) == [str(parent.id), str(child.id)]      # 부모 아래에 있다
+            assert _keys(app) == [str(child.id), str(parent.id)]      # 최근 순, ↳#부모 표시
+            assert _cell(app, str(child.id)).startswith(f"↳#{parent.id} ")
             await _until(pilot, lambda: store.get_job(child.id).is_terminal)
 
     try:
@@ -2351,6 +2125,671 @@ def test_닫히는_중에_처리되는_이벤트와_타이머는_지운_위젯�
         app._on_highlight(stale)
         app._tick()
         app._show_diff(1, "x", False)
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+# ── 시작 포커스와 묶음 패널 ─────────────────────────────────────────────
+
+def test_시작하면_프로젝트_목록에_포커스가_있고_주기_갱신_뒤에도_유지된다(env, repo, tmp_path):
+    other = _second_repo(tmp_path)
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    jobs.add_project(cfg, store, other)
+    _job_in(store, repo, "A 작업")
+    _job_in(store, other, "B 작업")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            projects = app.query_one("#projects", DataTable)
+            await _until(pilot, lambda: _keys(app) == ["1"] and app.focused is not None)
+            assert app.focused is projects
+            await pilot.pause(2.5)                                     # 1초 새로고침을 두 번 넘게 지나도
+            assert app.focused is projects
+            _job_in(store, repo, "다른 터미널에서 만든 작업")           # 목록을 다시 그려도
+            await _until(pilot, lambda: _keys(app) == ["3", "1"])
+            assert app.focused is projects and app.selected_id == 1
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_프로젝트가_없어도_프로젝트_목록에서_시작한다(env, repo, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    cfg = config.load()
+    store = Store(cfg.db_path)
+
+    async def empty():
+        app = ColidayApp(cfg, store, default_dir=str(plain))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.focused is not None)
+            assert app.focused is app.query_one("#projects", DataTable) and _project_keys(app) == []
+            assert "Ctrl+G 로 추가" in str(app.query_one("#projects", DataTable).border_title)
+            assert not _panel(app).has_class("-shown")                 # 선택한 작업이 없으면 묶음 패널도 없다
+
+    async def other_only():
+        app = ColidayApp(cfg, store, default_dir=str(plain))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.focused is not None and _keys(app) == ["1"])
+            projects = app.query_one("#projects", DataTable)
+            assert app.focused is projects and _project_keys(app) == [scopes.OTHER] and projects.cursor_row == 0
+            assert app.scope == scopes.OTHER
+
+    try:
+        _run(empty())
+        _job_in(store, repo, "목록에 없는 곳의 작업")                  # 기타 줄만 있다
+        _run(other_only())
+    finally:
+        store.close()
+
+
+def test_묶음_패널은_선택한_작업의_그룹과_파생을_보이고_없으면_안내한다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == 3)
+            panel = _panel(app)
+            assert panel.has_class("-shown") and str(panel.border_title) == "묶음 #3"
+            assert _bundle_ids(app) == [None, "menu"] and _bundle_texts(app)[0].startswith("묶인 작업 없음")
+
+            group = store.create_group("결제 [v1]", project=str(repo.resolve()))   # 다른 터미널에서 그룹에 넣었다
+            store.set_group([3, 1], group.id)
+            await _until(pilot, lambda: "m:1" in _bundle_ids(app))
+            assert _bundle_ids(app) == [None, "m:3", "m:1", "menu"]
+            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (2)"           # 대괄호도 그대로 보인다
+            assert _bundle_texts(app)[1].startswith("▶ ") and "#3 셋째 작업" in _bundle_texts(app)[1]
+            assert panel.highlighted_option.id == "menu"                 # 같은 작업이면 하이라이트한 줄을 지킨다
+
+            await _to_key(pilot, app, "1")                                # 다른 작업을 고르면 자신 줄에서 시작
+            assert str(panel.border_title) == "묶음 #1" and panel.highlighted_option.id == "m:1"
+            assert _bundle_texts(app)[2].startswith("▶ ")
+            _highlight(app, "m:3")
+            await pilot.pause(1.5)                                        # 바뀐 것이 없으면 다시 그리지 않는다
+            assert panel.highlighted_option.id == "m:3"
+            store.set_group([2], group.id)                                # 바뀌어도 하이라이트한 줄은 그대로
+            await _until(pilot, lambda: "m:2" in _bundle_ids(app))
+            assert _bundle_ids(app) == [None, "m:3", "m:2", "m:1", "menu"] and panel.highlighted_option.id == "m:3"
+            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (3)"
+
+            assert store.delete_job(3)                                    # 구성 작업이 지워지면 사라진다
+            await _until(pilot, lambda: "m:3" not in _bundle_ids(app))
+            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (2)" and app.selected_id == 1
+
+            panel.focus()
+            await pilot.pause()
+            app._clear_selection()                                        # 선택한 작업이 없으면 숨고 포커스는 작업 목록으로
+            await pilot.pause()
+            assert not panel.has_class("-shown") and app.focused is app.query_one("#jobs", DataTable)
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_묶음_패널에서_Enter로_묶인_작업으로_이동한다(env, repo, tmp_path):
+    other = _second_repo(tmp_path)
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    jobs.add_project(cfg, store, other)
+    parent = _job_in(store, repo, "부모 작업")
+    child = _job_in(store, repo, "자식 작업", parent_id=parent.id)
+    far = _job_in(store, other, "다른 프로젝트의 손자", parent_id=child.id)
+    a, b = str(repo.resolve()), str(other.resolve())
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == child.id)
+            assert _bundle_ids(app) == [None, f"p:{parent.id}", f"c:{far.id}", "menu"]
+            assert _bundle_texts(app)[2].endswith("(프로젝트 other)")
+            panel = _panel(app)
+            panel.focus()
+            await pilot.pause()
+
+            _highlight(app, f"p:{parent.id}")
+            await pilot.press("enter")                                   # 같은 프로젝트: 목록 커서도 옮긴다
+            await pilot.pause()
+            assert app.selected_id == parent.id and _cursor_key(app) == str(parent.id)
+            assert app.focused is panel and f"c:{child.id}" in _bundle_ids(app)   # 포커스는 패널에 남는다
+
+            _highlight(app, f"c:{child.id}")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.selected_id == child.id and _cursor_key(app) == str(child.id)
+
+            _highlight(app, f"c:{far.id}")
+            await pilot.press("enter")                                   # 다른 프로젝트: 그 프로젝트로 옮겨 고른다
+            await pilot.pause()
+            assert app.scope == b and _keys(app) == [str(far.id)] and app.selected_id == far.id
+            assert _notified(app, "프로젝트 other 로 옮겼습니다")
+            assert f"p:{child.id}" in _bundle_ids(app) and "(프로젝트 myrepo)" in " ".join(_bundle_texts(app))
+
+            await pilot.press("escape")                                  # Esc 는 작업 목록으로
+            await pilot.pause()
+            assert app.focused is app.query_one("#jobs", DataTable)
+            await _to_project(pilot, app, a)
+            assert app.selected_id == child.id
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_ctrl_b는_묶음_패널로_가서_메뉴를_열고_Space로_고른_작업들에_적용한다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: _keys(app) == ["3", "2", "1"])
+            await _to_key(pilot, app, "2")
+            await pilot.press("space", "space")                          # #2, #1 을 고른다
+            await pilot.pause()
+            assert app._marked == {2, 1}
+            assert str(_panel(app).border_subtitle).startswith("고른 2개에 적용(메뉴)")
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert isinstance(app.screen, ListMenuScreen) and app.screen_stack[0].focused is _panel(app)
+            assert "고른 2개" in str(app.screen.query_one(OptionList).get_option("pin").prompt)
+            await _choose(pilot, app, "pin")
+            assert {i for i, m in store.job_meta().items() if m.pinned} == {1, 2}
+            assert _keys(app) == ["2", "1", "3"] and app.focused is _panel(app)
+
+            app._clear_selection()                                       # 선택한 작업이 없으면 알리기만 한다
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and _notified(app, "선택된 작업이 없습니다")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_묶음_패널의_ctrl_e와_ctrl_x는_패널에서만_동작하고_프로젝트_목록과_겹치지_않는다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+    group = store.create_group("결제 [v1]", project=str(repo.resolve()))
+    store.set_group([3, 2], group.id)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: "m:2" in _bundle_ids(app))
+            panel = _panel(app)
+            panel.focus()
+            await pilot.pause()
+            await pilot.press("ctrl+e")                                  # 패널: 그룹 이름 바꾸기
+            await pilot.pause()
+            assert isinstance(app.screen, NameScreen) and app.screen.query_one("#name", Input).value == "결제 [v1]"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.focused is panel
+
+            app.query_one("#projects", DataTable).focus()                # 프로젝트 목록: 프로젝트 이름 바꾸기
+            await pilot.pause()
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            assert isinstance(app.screen, AddProjectScreen) and app.screen._title == "프로젝트 이름 바꾸기"
+            await pilot.press("escape")
+            await pilot.pause()
+
+            panel.focus()
+            await pilot.pause()
+            _highlight(app, "menu")                                      # 구성 작업 줄이 아니면 안내만
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert _notified(app, "그룹에서 뺄 작업을") and store.job_meta()[2].group_id == group.id
+            _highlight(app, "m:2")
+            await pilot.press("ctrl+x")                                  # 패널: 하이라이트한 작업을 그룹에서 뺀다
+            await pilot.pause()
+            assert store.job_meta()[2].group_id is None and store.job_meta()[3].group_id == group.id
+            assert jobs.list_projects(cfg, store) == [str(repo.resolve())] and len(app.screen_stack) == 1
+
+            chat = app.query_one("#chat", Input)                         # 채팅 입력의 ctrl+e 는 줄 끝으로
+            chat.focus()
+            chat.value = "abc"
+            chat.cursor_position = 0
+            await pilot.press("ctrl+e")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and chat.cursor_position == 3
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+# ── 자동 묶음 (모델이 묶은 것): 묶음 패널의 한 구역과 ctrl+b 메뉴 ─────────────────
+from coliday import topics  # noqa: E402
+from coliday.tui import TopicScreen  # noqa: E402
+
+
+def _auto(store, job_ids, name, summary="", lines=None):
+    """worker 없이 작업들을 자동 묶음 하나로 묶는다 (모델이 묶은 것처럼)."""
+    topic_id = None
+    for job_id in job_ids:
+        topic_id = store.assign_topic(job_id, topic_id, name=name, line=(lines or {}).get(job_id))
+    if summary:
+        store.update_topic(topic_id, summary=summary)
+    return topic_id
+
+
+def _menu_ids(app) -> list[str]:
+    return [o.id for o in app.screen.query_one(OptionList)._options]
+
+
+def test_묶음_패널에_자동_묶음_구역이_그룹_다음_파생_앞에_나오고_한_일_한_줄을_보인다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    parent = _done(store, repo, "주문 API 초안")
+    _done(store, repo, "배포 스크립트 정리")
+    mine = _done(store, repo, "주문 취소 API 만들어 줘", parent_id=parent.id)
+    _done(store, repo, "결제 테스트 추가", parent_id=mine.id)
+    group = store.create_group("결제 [v1]", project=str(repo.resolve()))
+    store.set_group([mine.id, 2], group.id)
+    _auto(store, [parent.id, mine.id], "주문 취소 [API]", "주문 취소 API 와 환불을 만들었다. " * 5,
+          lines={mine.id: "취소 API 와 테스트 추가"})
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == 4)
+            await _to_key(pilot, app, str(mine.id))
+            assert _bundle_ids(app) == [
+                None, f"m:{mine.id}", "m:2",                          # 그룹
+                None, None, f"a:{mine.id}", f"a:{parent.id}",         # 자동 묶음: 제목·요약·구성
+                None, f"p:{parent.id}", "c:4",                        # 파생
+                "menu",
+            ]
+            texts = _bundle_texts(app)
+            assert texts[3] == "자동 묶음: 주문 취소 [API] (2)"       # 대괄호도 그대로
+            assert texts[4].strip().startswith("주문 취소 API 와 환불을") and texts[4].endswith("…")
+            assert len(texts[4].strip()) <= 80                       # 요약은 두 줄 남짓에서 자른다
+            assert "#3 취소 API 와 테스트 추가" in texts[5] and texts[5].startswith("▶ ")   # 한 일 한 줄이 있으면 그것
+            assert "#3 취소 API 와 테스트 추가" in texts[1]           # 그룹 구역도 같은 글
+            assert "#1 주문 API 초안" in texts[6]                     # 없으면 요청
+            assert _panel(app).highlighted_option.id == f"m:{mine.id}"   # 그룹이 있으면 그룹의 자기 줄부터
+
+            await _to_key(pilot, app, str(parent.id))                 # 그룹이 없으면 자동 묶음의 자기 줄부터
+            assert _panel(app).highlighted_option.id == f"a:{parent.id}"
+            assert _cell(app, str(mine.id)).endswith("주문 취소 API 만들어 줘")   # 목록은 계속 요청을 보인다
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_혼자인_자동_묶음은_보이지_않고_사람이_이름을_정하면_보인다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    _done(store, repo, "첫 작업")
+    _done(store, repo, "둘째 작업")
+    alone = _auto(store, [2], "혼자", "요약")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == 2)
+            assert _bundle_ids(app) == [None, "menu"] and _bundle_texts(app)[0].startswith("묶인 작업 없음")
+            store.update_topic(alone, name="내가 정함", manual_name=True)
+            await _until(pilot, lambda: "a:2" in _bundle_ids(app))
+            assert _bundle_texts(app)[0] == "자동 묶음: 내가 정함 (1)"
+            store.update_topic(alone, summary="")
+            await _until(pilot, lambda: "아직 요약이 없습니다" in _bundle_texts(app)[1])
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_작업_목록에는_자동_묶음_표시가_없다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+    _auto(store, [1, 3], "주문 취소", "요약", lines={1: "한 일"})
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: _keys(app) == ["3", "2", "1"])     # 순서는 그대로 (자동 묶음으로 모으지 않는다)
+            for key in ("3", "2", "1"):
+                assert "주문 취소" not in _cell(app, key) and "한 일" not in _cell(app, key)
+            assert _cell(app, "1") == "첫 작업"
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_패널에서_자동_묶음_구성원으로_Enter_이동하고_다른_프로젝트면_옮겨_간다(env, tmp_path):
+    top = tmp_path / "mono"
+    for sub in ("fe", "be"):
+        (top / sub).mkdir(parents=True)
+        (top / sub / "x.txt").write_text("x\n")
+    for args in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]):
+        subprocess.run(["git", "-C", str(top), *args], check=True)
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    fe, be = (str((top / sub).resolve()) for sub in ("fe", "be"))
+    jobs.add_project(cfg, store, top / "fe")
+    jobs.add_project(cfg, store, top / "be")
+    repo_key = str(top.resolve())
+
+    def job(where, prompt):
+        made = store.create_job(prompt=prompt, repo=repo_key, workdir=where, model=None)
+        store.finish_job(made.id, "succeeded")
+        return made.id
+
+    a, b, c = job(fe, "프론트 취소 버튼"), job(fe, "프론트 기타"), job(be, "백엔드 취소 API")
+    _auto(store, [a, c], "주문 취소")                              # 자동 묶음은 레포 기준이라 두 프로젝트에 걸친다
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(top / "fe"))
+        async with app.run_test(size=(160, 45)) as pilot:
+            assert app.scope == fe
+            await _until(pilot, lambda: _keys(app) == [str(b), str(a)])
+            await _to_key(pilot, app, str(a))
+            assert _bundle_ids(app) == [None, None, f"a:{c}", f"a:{a}", "menu"]
+            assert _bundle_texts(app)[2].endswith("(프로젝트 be)")
+            panel = _panel(app)
+            panel.focus()
+            _highlight(app, f"a:{c}")
+            await pilot.press("enter")                                # 다른 프로젝트: 그 프로젝트로 옮겨 고른다
+            await pilot.pause()
+            assert app.scope == be and app.selected_id == c and _notified(app, "프로젝트 be 로 옮겼습니다")
+            assert app.focused is panel and f"a:{a}" in _bundle_ids(app)
+            _highlight(app, f"a:{a}")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.scope == fe and app.selected_id == a
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_ctrl_b_메뉴로_자동_묶음_이름을_바꾸고_다른_묶음으로_옮기고_새_묶음을_만든다(env, repo, monkeypatch):
+    monkeypatch.setattr(topics, "spawn_pending", lambda cfg: pytest.fail("묶기 프로세스를 띄우면 안 된다"))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업", "넷째 작업"):
+        _done(store, repo, prompt)
+    order = _auto(store, [1, 2], "주문 취소", "요약")
+    login = _auto(store, [3, 4], "로그인", "요약")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: "a:4" in _bundle_ids(app))
+            await _to_key(pilot, app, "2")
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            menu = _menu_ids(app)
+            assert menu[-3:] == ["topic_move", "topic_rename", "topic_sort"]   # 그룹·파생 항목 뒤
+            assert "자동 묶음 이름 바꾸기 (주문 취소)" in str(app.screen.query_one(OptionList).get_option("topic_rename").prompt)
+            assert app.screen.query_one(OptionList).get_option("topic_sort").disabled   # 안 묶인 끝난 작업이 없다
+
+            await _choose(pilot, app, "topic_rename")                 # 이름 바꾸기
+            assert isinstance(app.screen, TopicScreen) and app.screen.query_one("#name", Input).value == "주문 취소"
+            app.screen.query_one("#name", Input).value = "주문 [취소]"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert [(t.name, t.manual_name) for t in store.topics() if t.id == order] == [("주문 [취소]", True)]
+            await _until(pilot, lambda: "자동 묶음: 주문 [취소] (2)" in _bundle_texts(app))
+
+            await pilot.press("ctrl+b")                               # 다른 자동 묶음으로 옮기기
+            await pilot.pause()
+            await _choose(pilot, app, "topic_move")
+            from textual.widgets import Select
+            select = app.screen.query_one("#topic", Select)
+            assert select.value == order and not app.screen.query_one("#name").display
+            select.value = login
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            assert store.job_topic(2).topic_id == login and store.job_topic(2).manual
+            await _until(pilot, lambda: "자동 묶음: 로그인 (3)" in _bundle_texts(app))
+            await _until(pilot, lambda: _notified(app, "자동 묶음 '로그인' (으)로 옮겼습니다"))
+
+            await pilot.press("ctrl+b")                               # 새 자동 묶음으로 떼어 내기
+            await pilot.pause()
+            await _choose(pilot, app, "topic_move")
+            app.screen.query_one("#topic", Select).value = 0
+            await pilot.pause()
+            name = app.screen.query_one("#name", Input)
+            assert name.display
+            name.focus()
+            name.value = "결제"
+            await pilot.press("enter")
+            await pilot.pause()
+            new = store.job_topic(2).topic_id
+            assert new not in (order, login) and [t.manual_name for t in store.topics() if t.id == new] == [True]
+            assert order in {t.id for t in store.topics()}             # '주문 [취소]' 는 #1 이 남아 있다
+            await _until(pilot, lambda: "자동 묶음: 결제 (1)" in _bundle_texts(app))   # 사람이 만든 것은 혼자여도 보인다
+
+            await _to_key(pilot, app, "1")                             # #1 도 옮기면 비게 된 '주문 [취소]' 는 사라진다
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            await _choose(pilot, app, "topic_move")
+            app.screen.query_one("#topic", Select).value = new
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            assert order not in {t.id for t in store.topics()}
+            await _until(pilot, lambda: "자동 묶음: 결제 (2)" in _bundle_texts(app))
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_ctrl_b_메뉴의_안_묶인_작업_묶기는_확인_후_spawn_pending을_부른다(env, repo, monkeypatch):
+    calls = []
+    monkeypatch.setattr(topics, "spawn_pending", lambda cfg: calls.append(cfg))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+    _auto(store, [1], "혼자")
+    running = store.create_job(prompt="실행 중", repo=str(repo), workdir=str(repo), model=None)   # 끝나지 않은 작업은 빼고 센다
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: str(running.id) in _keys(app))
+            await _to_key(pilot, app, "2")
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert "(2개)" in str(app.screen.query_one(OptionList).get_option("topic_sort").prompt)
+            await _choose(pilot, app, "topic_sort")
+            assert isinstance(app.screen, ConfirmScreen) and "2개를 팀장 모델로 묶을까요" in app.screen._question
+            await pilot.press("n")
+            await pilot.pause()
+            assert calls == []
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            await _choose(pilot, app, "topic_sort")
+            await pilot.press("y")
+            await pilot.pause()
+            assert calls == [cfg] and _notified(app, "묶음 패널에 나타납니다")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_작업_목록과_패널의_ctrl_e_ctrl_x는_TopicScreen을_열지_않는다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업"):
+        _done(store, repo, prompt)
+    topic = _auto(store, [1, 2], "주문 취소")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: "a:1" in _bundle_ids(app))
+            await _to_key(pilot, app, "2")
+            for key in ("ctrl+e", "ctrl+x", "left", "right"):          # 작업 목록: 자동 묶음 키가 없다
+                await pilot.press(key)
+                await pilot.pause()
+                assert len(app.screen_stack) == 1
+            panel = _panel(app)
+            panel.focus()
+            _highlight(app, "a:1")
+            await pilot.press("ctrl+x")                                # 패널: 그룹 줄이 아니면 안내만
+            await pilot.pause()
+            assert _notified(app, "그룹에서 뺄 작업을") and store.job_topic(1).topic_id == topic
+            await pilot.press("ctrl+e")                                # 패널: 그룹 이름 (그룹이 없으면 안내)
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and _notified(app, "그룹에 들어 있지 않습니다")
+            assert [t.name for t in store.topics()] == ["주문 취소"]
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_다른_터미널이_분류하면_다음_tick에_패널이_갱신되고_하이라이트가_유지된다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+    store.set_group([3, 1], store.create_group("결제", project=str(repo.resolve())).id)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: "m:1" in _bundle_ids(app) and app.selected_id == 3)
+            _highlight(app, "m:1")
+            _auto(store, [3, 2], "주문", "요약", lines={3: "셋째에서 한 일"})   # worker 가 분류를 마쳤다
+            await _until(pilot, lambda: "a:2" in _bundle_ids(app))
+            assert _panel(app).highlighted_option.id == "m:1"
+            assert any("#3 셋째에서 한 일" in t for t in _bundle_texts(app))
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_메뉴를_연_사이_자동_묶음이_지워지면_이름_바꾸기는_알리기만_한다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _done(store, repo, prompt)
+    topic = _auto(store, [1, 2], "주문 취소")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: "1" in _keys(app))
+            await _open_menu_on(pilot, app, "2")
+            assert store.delete_job(1) and store.delete_job(2)          # 다른 터미널에서 구성 작업을 모두 지웠다
+            assert topic not in {t.id for t in store.topics()}
+            await _choose(pilot, app, "topic_rename")
+            assert len(app.screen_stack) == 1 and _notified(app, "자동 묶음 '주문 취소' 이(가) 그사이 없어져")
+
+            await _open_menu_on(pilot, app, "3")                       # 이름 창이 열린 사이 없어져도 만들지 않는다
+            other = _auto(store, [3], "혼자")
+            store.update_topic(other, name="혼자", manual_name=True)
+            await pilot.press("escape")
+            await pilot.pause()
+            await _until(pilot, lambda: "a:3" in _bundle_ids(app))
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            await _choose(pilot, app, "topic_rename")
+            assert isinstance(app.screen, TopicScreen)
+            store._conn.execute("DELETE FROM job_topics")
+            store._conn.execute("DELETE FROM topics")
+            app.screen.query_one("#name", Input).value = "새 이름"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert store.topics() == [] and _notified(app, "자동 묶음 '혼자' 이(가) 그사이 없어져")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+# ── 이전 리뷰 [P3] 회귀 ─────────────────────────────────────────────
+
+
+def test_메뉴가_열린_사이_선택이_사라지면_메뉴를_닫은_뒤_작업_목록으로_간다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    _done(store, repo, "하나뿐인 작업")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == 1)
+            await _open_menu_on(pilot, app, "1")
+            assert app.screen_stack[0].focused is _panel(app)
+            assert store.delete_job(1)                                  # 다른 터미널에서 지웠다: 패널이 숨는다
+            await _until(pilot, lambda: app.selected_id is None)
+            assert not _panel(app).has_class("-shown")
+            await pilot.press("escape")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and app.focused is app.query_one("#jobs", DataTable)
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_다른_프로젝트의_작업이_최근_100개_밖이면_옮겼다고만_하지_않는다(env, repo, tmp_path):
+    other = _second_repo(tmp_path)
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    jobs.add_project(cfg, store, other)
+    far = _job_in(store, other, "오래된 다른 프로젝트 작업")
+    for i in range(100):
+        _job_in(store, other, f"새 작업 {i}")
+    mine = _job_in(store, repo, "이 프로젝트 작업", parent_id=far.id)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == mine.id and f"p:{far.id}" in _bundle_ids(app))
+            panel = _panel(app)
+            panel.focus()
+            _highlight(app, f"p:{far.id}")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.scope == str(other.resolve()) and app.selected_id != far.id
+            assert _notified(app, f"#{far.id} 은(는) 최근 100개 밖이라 목록에 없습니다")
+            assert not _notified(app, "프로젝트 other 로 옮겼습니다 (")
 
     try:
         _run(scenario())

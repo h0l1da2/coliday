@@ -50,6 +50,8 @@ def setup(tmp_path, monkeypatch):
     cli.chmod(0o755)
     monkeypatch.delenv(WAIT_ENV, raising=False)
     monkeypatch.delenv("FAKE_LEAD_STDERR", raising=False)
+    # 이 가짜 CLI 는 부를 때마다 call.json 을 덮어쓴다: 작업이 끝난 뒤의 자동 묶기 호출은 막아 팀장 실행 기록만 남긴다.
+    monkeypatch.setattr(worker.topics, "classify_quietly", lambda *args, **kwargs: None)
     cfg = Config(tmp_path / "home", str(cli), "auto", codex_bin=str(cli))
     store = Store(cfg.db_path)
     yield cfg, store, tmp_path

@@ -10,6 +10,15 @@ if sys.argv[1:] == ["--version"]:  # 버전 확인은 기록하지 않는다
     sys.exit(0)
 
 stdin = sys.stdin.read()
+if "--ephemeral" in sys.argv:
+    # 작업을 묶는 짧은 호출 (topics.py). 팀장·팀원 실행 기록(FAKE_CODEX_ARGS)에 섞이지 않게 따로 남긴다.
+    if os.environ.get("FAKE_CODEX_TOPIC_ARGS"):
+        with open(os.environ["FAKE_CODEX_TOPIC_ARGS"], "a") as f:
+            f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
+    Path(sys.argv[sys.argv.index("-o") + 1]).write_text(
+        os.environ.get("FAKE_CODEX_TOPIC", '{"topic": null, "name": "주문 취소", "summary": "요약", "line": "한 줄"}')
+    )
+    sys.exit(0)
 record = os.environ.get("FAKE_CODEX_ARGS")
 if record:
     with open(record, "a") as f:

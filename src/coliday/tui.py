@@ -1,8 +1,10 @@
 """coliday TUI.
 
-┌ 작업 목록 ──────────────┐┌ 변경 사항 (diff) ┐
-├ 타임라인 ───────────────┤│                  │
-└─────────────────────────┘└──────────────────┘
+┌ 프로젝트 ──────────────────────────────────────┐
+└────────────────────────────────────────────────┘
+┌ 작업 목록 ──────────────┐┌ 묶음 (선택한 작업) ┐
+├ 타임라인 ───────────────┤├ 변경 사항 (diff) ──┤
+└─────────────────────────┘└────────────────────┘
 
 DB 는 메인 스레드에서만 읽고 쓴다. git diff 만 백그라운드 스레드에서 계산한다.
 
@@ -35,24 +37,28 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from coliday import gitops, guard, joblist, jobs, prefs, projects, remote, team
+from coliday import gitops, guard, joblist, jobs, projects, remote, team, topics
 from coliday import scope as scopes
 from coliday.config import Config
 from coliday.jobs import STATUS_ICON, JobError, NotARepoError, WorktreeRemoveError
-from coliday.store import QUEUED, RESULT, EventRow, Job, Store
+from coliday.store import QUEUED, RESULT, EventRow, Job, JobTopic, Store, Topic
 
 _MAIN_ACTIONS = frozenset({
     "new_job", "focus_projects", "add_project", "rename_project", "remove_project",
     "models", "prompts", "cancel_job", "remove_job", "remove_listed_job", "timeline_scroll", "open_artifacts", "env_access",
-    "copy_timeline", "list_menu",
+    "copy_timeline", "bundle_menu", "bundle_rename_group", "bundle_ungroup",
 })
 POLL_SEC = 1.0
 DIFF_EVERY_TICKS = 2
 MAX_DIFF_CHARS = 300_000
 
-_GROUP_BY_LABEL: dict[str, str] = {"none": "없음", "status": "상태"}  # 순서가 ctrl+b 전환 순서다
 _FINISHED_LABEL = {"succeeded": "완료", "failed": "실패", "cancelled": "취소"}
 _OTHER_NAME = "기타"
+_BUNDLE_MAX_LINES = 30  # 묶음 패널에 보이는 그룹 구성·자식 줄 수 (넘으면 '… 외 N개')
+_GROUP_MARK_CHARS = 8  # 작업 목록 요청 칸 앞 ▣그룹 표시에서 그룹 이름을 자르는 길이
+_TOPIC_SUMMARY_CHARS = 80  # 묶음 패널의 자동 묶음 요약 (패널 폭으로 두 줄 남짓)
+_TOPIC_LINE_CHARS = 60  # 묶음 패널 작업 줄의 '한 일' 한 줄
+_NEW_TOPIC = 0  # 자동 묶음 선택 상자의 '새 자동 묶음' (실제 묶음 번호는 1부터)
 _OTHER_CACHE_SEC = 5.0  # 작업을 다 읽어야 하는 기타 줄 판정을 다시 하기까지 (그 사이 생긴 기타 작업은 늦게 보인다)
 
 
@@ -143,18 +149,17 @@ class NewJobScreen(ModalScreen[tuple[str, str, bool, bool, int | None] | None]):
 
 
 class ListMenuScreen(ModalScreen[str | None]):
-    """목록 정리 메뉴 (ctrl+b). 결과는 고른 항목의 id 다. 묶기 기준 항목은 창을 닫지 않고 그 자리에서 바뀐다."""
+    """묶음 메뉴 (ctrl+b): 고정·그룹·파생·자동 묶음. 결과는 고른 항목의 id 다."""
 
     BINDINGS = [Binding("escape", "close", "닫기")]
 
-    def __init__(self, items: list[tuple[str, str, bool]], cycle_group_by: Callable[[], str]) -> None:
+    def __init__(self, items: list[tuple[str, str, bool]]) -> None:
         super().__init__()
         self._items = items  # (id, 글, 쓸 수 있음)
-        self._cycle_group_by = cycle_group_by
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("목록 정리", id="dialog-title")
+            yield Label("묶음 정리", id="dialog-title")
             # 그룹 이름에 든 대괄호가 markup 으로 해석되지 않게 Text 로 넘긴다.
             yield OptionList(*(Option(Text(label), id=key, disabled=not ok) for key, label, ok in self._items),
                              id="list-menu")
@@ -165,9 +170,6 @@ class ListMenuScreen(ModalScreen[str | None]):
 
     @on(OptionList.OptionSelected, "#list-menu")
     def _chosen(self, event: OptionList.OptionSelected) -> None:
-        if event.option_id == "group_by":  # Enter 마다 다음 기준으로 (바로 저장된다)
-            event.option_list.replace_option_prompt("group_by", Text(self._cycle_group_by()))
-            return
         self.dismiss(event.option_id)
 
     def action_close(self) -> None:
@@ -205,22 +207,88 @@ class NameScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class TopicScreen(ModalScreen[tuple[int, str] | None]):
+    """자동 묶음 이름을 바꾸거나(options 없음) 작업을 다른 자동 묶음으로 옮긴다.
+
+    결과는 (묶음 번호, 이름)이고 새 자동 묶음이면 번호가 _NEW_TOPIC(0) 이다.
+    """
+
+    BINDINGS = [Binding("escape", "close", "닫기")]
+
+    def __init__(self, title: str, name: str = "", options: list[tuple[str, int]] | None = None, current: int | None = None) -> None:
+        super().__init__()
+        self._title = title
+        self._name = name
+        self._options = options
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(Text(self._title), id="dialog-title")
+            if self._options is not None:
+                # 묶음 이름에 든 대괄호가 markup 으로 해석되지 않게 Text 로 넘긴다.
+                choices = [*((Text(label), value) for label, value in self._options), (Text("새 자동 묶음 만들기"), _NEW_TOPIC)]
+                value = self._current if any(v == self._current for _, v in choices) else _NEW_TOPIC
+                yield Select(choices, value=value, allow_blank=False, id="topic")
+            yield Input(value=self._name, placeholder="자동 묶음 이름", id="name", max_length=topics.NAME_CHARS)
+            with Horizontal(id="dialog-buttons"):
+                yield Button("저장", variant="primary", id="save")
+                yield Button("취소", id="cancel")
+            yield Label("Tab 으로 칸 이동, 이름 칸에서 Enter 로 저장, Esc 로 닫기. 사람이 정한 것은 AI 가 다시 바꾸지 않습니다.", classes="hint")
+
+    def on_mount(self) -> None:
+        self._show_name()
+        (self.query_one("#topic", Select) if self._options is not None else self.query_one("#name", Input)).focus()
+
+    def _chosen(self) -> int:
+        return int(self.query_one("#topic", Select).value) if self._options is not None else _NEW_TOPIC  # type: ignore[arg-type]
+
+    def _show_name(self) -> None:
+        self.query_one("#name").display = self._chosen() == _NEW_TOPIC  # 이름은 새 자동 묶음일 때만 받는다
+
+    @on(Select.Changed, "#topic")
+    def _topic_changed(self) -> None:
+        self._show_name()
+
+    @on(Input.Submitted)
+    def _submit(self) -> None:
+        self.action_save()
+
+    def action_save(self) -> None:
+        chosen = self._chosen()
+        name = " ".join(self.query_one("#name", Input).value.split())
+        if chosen == _NEW_TOPIC and not name:
+            self.notify("자동 묶음 이름을 입력하세요.", severity="warning")
+            return
+        self.dismiss((chosen, name))
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save":
+            self.action_save()
+        else:
+            self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class JobTable(DataTable):
-    """작업 목록. 머리줄(묶음)과 작업 줄이 섞인다. 좌우 키는 접기·펴기와 부모로 이동이다 (글자 키는 채팅 입력이라 쓰지 않는다)."""
+    """작업 목록. 평평하게 늘어놓는다 (고정한 작업이 맨 위, 나머지는 최근 요청 순). 줄 키는 작업 번호다."""
+
+
+class BundlePanel(OptionList):
+    """선택한 작업과 묶인 것 (같은 그룹 작업, 같은 자동 묶음 작업, 부모·자식). Enter·클릭으로 그 작업으로 간다.
+
+    제목 줄과 안내 줄은 고를 수 없다 (disabled). 작업 줄의 id 는 '구역:번호' (m 그룹, a 자동 묶음, p 부모, c 자식),
+    마지막 줄은 'menu'.
+    단축키는 패널에 포커스가 있을 때만 동작한다 (프로젝트 목록의 ctrl+e·ctrl+x 와 겹치지 않는다).
+    """
 
     BINDINGS = [
-        Binding("left", "app.job_left", "접기", show=False),
-        Binding("right", "app.job_right", "펴기", show=False),
+        Binding("ctrl+e", "app.bundle_rename_group", "그룹 이름", key_display="E"),
+        Binding("ctrl+x", "app.bundle_ungroup", "그룹에서 빼기", key_display="X"),
     ]
-
-    async def _on_click(self, event: events.Click) -> None:
-        # DataTable 은 이미 고른 줄을 다시 눌러야 선택 이벤트를 낸다. 머리줄은 한 번 눌러도 접고 편다.
-        # (이미 고른 머리줄을 누른 것은 RowSelected 로 처리된다.) 이 처리는 DataTable 의 클릭 처리보다 먼저 불린다.
-        row = event.style.meta.get("row") if event.style else None
-        if isinstance(row, int) and 0 <= row < self.row_count and row != self.cursor_row:
-            key = self.coordinate_to_cell_key(Coordinate(row, 0)).row_key.value
-            if key and key.startswith("h:"):
-                self.call_later(self.app.toggle_section, key[2:])
 
 
 class FolderLine(Static):
@@ -729,11 +797,15 @@ class ColidayApp(App[None]):
     #env-access.-needed { background: $warning; color: $background; text-style: bold; }
     #env-access.-allowed { color: $success; }
     #env-access:hover { background: $primary; color: $text; }
-    #diff-pane { width: 2fr; border: round $accent; }
+    #right { width: 2fr; }
+    #bundle { height: auto; min-height: 3; max-height: 35%; border: round $accent; display: none; }
+    #bundle.-shown { display: block; }
+    #diff-pane { height: 1fr; border: round $accent; }
     #chat, #chat:focus { border-left: none; border-right: none; }
     #prompt, #prompt:focus { border-left: none; border-right: none; }
-    #projects:focus-within, #jobs:focus-within, #timeline:focus, #diff-pane:focus-within { border: round $warning; }
-    NewJobScreen, AddProjectScreen, ModelScreen, TeamScreen, RoleEditScreen, ConfirmScreen, ListMenuScreen, NameScreen {
+    #projects:focus-within, #jobs:focus-within, #timeline:focus, #bundle:focus, #diff-pane:focus-within { border: round $warning; }
+    NewJobScreen, AddProjectScreen, ModelScreen, TeamScreen, RoleEditScreen, ConfirmScreen, ListMenuScreen, NameScreen,
+    TopicScreen {
         align: center middle;
     }
     #list-menu { height: auto; max-height: 20; margin-top: 1; }
@@ -773,7 +845,8 @@ class ColidayApp(App[None]):
         Binding("ctrl+l", "env_access", ".env 허용", priority=True, key_display="L"),
         Binding("ctrl+y", "copy_timeline", "타임라인 복사", priority=True, key_display="Y"),
         # tmux 기본 접두 키(ctrl+b)와 겹친다: tmux 안에서는 ctrl+b 를 두 번 누르거나 접두 키를 바꾼다.
-        Binding("ctrl+b", "list_menu", "목록 정리", priority=True, key_display="B"),
+        # 선택한 작업이 있으면 묶음 패널로 포커스를 옮기고 묶음 메뉴를 연다 (메뉴를 닫으면 패널로 돌아온다).
+        Binding("ctrl+b", "bundle_menu", "묶음", priority=True, key_display="B"),
         Binding("ctrl+s", "cancel_job", "작업 취소", priority=True, key_display="S"),
         Binding("ctrl+r", "remove_job", "작업 삭제", priority=True, key_display="R"),
         # 작업 목록에서 고른 채로 누르는 Delete (맥의 delete 는 backspace 로 들어온다). 입력 칸에서는 글자를 지우는 키라 priority 가 아니다.
@@ -805,13 +878,15 @@ class ColidayApp(App[None]):
         self._other_cache: tuple[tuple, float, bool] | None = None  # 기타 줄 판정 (후보 레포, 유효 시각, 결과)
         self._projects_error: str | None = None
         self.selected_id: int | None = None
-        self._header_key: str | None = None  # 커서가 머리줄에 있으면 그 묶음 key (이때 selected_id 는 None)
-        self._row_snapshot: dict[str, tuple] = {}  # 줄 키(joblist.row_key) → 셀
-        self._lines: list[joblist.Line] = []  # 지금 그린 줄 (표의 줄 번호와 같은 순서)
+        self._row_snapshot: dict[str, tuple] = {}  # 줄 키(작업 번호) → 셀
+        self._rows: list[Job] = []  # 지금 그린 작업 (표의 줄 번호와 같은 순서)
         self._meta: dict[int, joblist.JobMeta] = {}
         self._groups: list[joblist.JobGroup] = []
-        self._job_ids: set[int] = set()  # 목록에 있는 작업 (접힌 것 포함)
-        self._prefs = prefs.load(cfg.ui_path)  # 묶기 기준과 접힘. 깨진 파일이면 기본값
+        self._topics: dict[int, Topic] = {}  # 자동 묶음 (모든 레포. 패널·메뉴가 쓴다)
+        self._links: dict[int, JobTopic] = {}  # 작업 → 자동 묶음 (있는 작업만)
+        self._job_ids: set[int] = set()  # 목록에 있는 작업
+        self._bundle_snapshot: tuple | None = None  # 묶음 패널에 그린 것 (바뀌었을 때만 다시 그린다)
+        self._bundle_job: int | None = None  # 묶음 패널을 그린 작업
         self._marked: set[int] = set()  # 작업 목록에서 Space 로 고른 작업들 (한꺼번에 삭제한다)
         self._deriving: set[int] = set()  # 지금 파생 작업을 만들고 있는 부모 (같은 부모에서 겹쳐 만들지 않게)
         self._last_event_id = 0
@@ -834,8 +909,10 @@ class ColidayApp(App[None]):
                 yield VerticalScroll(id="timeline")
                 yield ArtifactBar(id="artifacts")
                 yield EnvBar(id="env-access")
-            with VerticalScroll(id="diff-pane"):
-                yield Static("작업을 선택하세요.", id="diff")
+            with Vertical(id="right"):
+                yield BundlePanel(id="bundle")
+                with VerticalScroll(id="diff-pane"):
+                    yield Static("작업을 선택하세요.", id="diff")
         # 입력 칸은 화면 너비를 다 쓰고 좌우 테두리가 없다: 한글을 조합하는 동안 터미널(macOS 터미널 등)이 조합 중인 글자를
         # 커서 자리에 끼워 넣어 그 줄의 오른쪽을 밀어내는데, 오른쪽에 테두리나 다른 패널이 있으면 그것이 튀어나와 보인다.
         # select_on_focus 를 끄지 않으면 포커스를 받을 때 전체 선택돼 다음 글자가 쓴 내용을 지운다.
@@ -868,8 +945,8 @@ class ColidayApp(App[None]):
         self._watch_others()
         self.refresh_jobs()
         self._update_chat_hint()
-        # 작업 위치부터 고르게 한다. 연결된 프로젝트가 없으면 고를 것이 없으니 작업 목록에서 시작한다.
-        (ptable if self._projects else table).focus()
+        # 늘 프로젝트부터 고르게 한다 (프로젝트가 없어도: 제목이 'Ctrl+G 로 추가' 를 알리고, 기타 줄만 있으면 Enter 로 들어간다).
+        ptable.focus()
         self.set_interval(POLL_SEC, self._tick)
         self._check_update()
         self.set_timer(20, self._check_update)  # 방금 시작한 백그라운드 확인이 끝났을 즈음 한 번 더 본다
@@ -1013,7 +1090,7 @@ class ColidayApp(App[None]):
         chat = self.query_one("#chat", Input)
         if chat.value.strip():  # 글이 있으면 입력 칸의 안내(placeholder)가 보이지 않는다: 보낼 곳이 바뀐 것을 한 번 알린다
             name = self._scope_name(key)
-            if self._header_key is not None or (self.selected_id is None and key == scopes.OTHER):
+            if self.selected_id is None and key == scopes.OTHER:
                 where = f"아직 보낼 곳이 없습니다 ({name}). 작업을 고르세요"
             elif self.selected_id is not None:
                 where = f"이제 #{self.selected_id}({name})에 보냅니다"
@@ -1117,41 +1194,40 @@ class ColidayApp(App[None]):
         return scopes.scope_jobs(self.store, self.scope, self.store.repos(), self._project_paths(),
                                  worktrees=self._worktrees)
 
-    def refresh_jobs(self, reveal: int | None = None) -> None:
-        """보는 프로젝트의 작업 목록을 묶기 기준대로 다시 그린다. reveal 작업(기본: 보고 있는 작업)은 접힌 곳에 있어도 이번만 펼친다.
+    def refresh_jobs(self, select: int | None = None) -> None:
+        """보는 프로젝트의 작업 목록을 다시 그린다: 고정한 작업이 맨 위, 나머지는 최근 요청 순.
 
         줄 구성이 같으면 바뀐 셀만 고친다 (1초마다 다시 그리면 깜빡인다).
-        보는 프로젝트가 바뀐 뒤 처음 그릴 때는 그 프로젝트에서 전에 보던 작업 → 첫 작업 줄 → 비움 순으로 고른다.
+        보는 프로젝트가 바뀐 뒤 처음 그릴 때는 select → 그 프로젝트에서 전에 보던 작업 → 첫 줄 → 비움 순으로 고른다.
+        그 밖에는 select → 보던 작업 → (보던 작업이 사라졌으면) 같은 자리 근처의 작업을 고른다.
         """
         table = self.query_one("#jobs", DataTable)
         first_draw = self._shown_scope != self.scope
         self._shown_scope = self.scope
-        rows = [jobs.reconcile(self.store, j) for j in self._scope_jobs()]
+        listed = [jobs.reconcile(self.store, j) for j in self._scope_jobs()]
         real = self.scope not in (None, scopes.OTHER)
         self._groups = self.store.list_groups(project=self.scope) if real else []
         visible = {g.id for g in self._groups}
-        # 다른 프로젝트의 그룹에 든 작업이 여기 보이면 그룹이 없는 것으로 다룬다 (머리줄·메뉴 모두 보이는 그룹 기준).
+        # 다른 프로젝트의 그룹에 든 작업이 여기 보이면 그룹이 없는 것으로 다룬다 (표시·패널·메뉴 모두 보이는 그룹 기준).
         self._meta = {  # 기록이 없는 작업은 빠져 있다 (joblist 는 기본값으로 본다)
             job_id: item if item.group_id is None or item.group_id in visible else dataclasses.replace(item, group_id=None)
             for job_id, item in self.store.job_meta().items()
         }
+        # 자동 묶음은 목록에 표시하지 않는다 (끝난 작업 거의 전부가 들어간다). 묶음 패널과 메뉴만 쓴다.
+        self._links = self.store.job_topics()
+        self._topics = {t.id: t for t in self.store.topics()}
+        rows = joblist.ordered(listed, self._meta)
+        self._rows = rows
         self._job_ids = {j.id for j in rows}
         now = time.time()
         self._marked &= self._job_ids  # 다른 곳에서 지워졌거나 다른 프로젝트로 옮긴 작업은 선택에서도 뺀다
-        if first_draw and reveal is None:
-            remembered = self._remembered.get(self.scope or "")
-            reveal = remembered if remembered in self._job_ids else None
-        # 상태가 바뀌어 접힌 묶음으로 옮겨간 작업도 커서와 타임라인을 잃지 않게 펼친다 (접힘 설정은 그대로).
-        self._lines = joblist.build(
-            rows, self._meta, self._groups, group_by=self._prefs.group_by, collapsed=self._prefs.collapsed,
-            reveal=self.selected_id if reveal is None and not first_draw else reveal,
-        )
         self._update_marks_hint()
-        snapshot = {joblist.row_key(line): self._line_cells(line, now) for line in self._lines}
+        names = {g.id: g.name for g in self._groups}
+        snapshot = {str(j.id): self._row(j, now, j.id in self._marked, self._meta, names) for j in rows}
         redrawn = list(snapshot) != list(self._row_snapshot)
         old_row = table.cursor_row
         if redrawn:
-            # 줄이 늘거나 줄었다 (작업 추가·삭제, 접기·펴기, 묶음 이동, 프로젝트 바꿈): 다시 그리고 커서 위치를 유지한다.
+            # 줄이 늘거나 줄거나 순서가 바뀌었다 (작업 추가·삭제, 고정, 이어서 시킴, 프로젝트 바꿈): 다시 그린다.
             table.clear()
             for key, cells in snapshot.items():
                 table.add_row(*cells, key=key)
@@ -1164,39 +1240,33 @@ class ColidayApp(App[None]):
                         table.update_cell(key, col, b)
         self._row_snapshot = snapshot
         keys = list(snapshot)
-        job_rows = [i for i, line in enumerate(self._lines) if isinstance(line, joblist.JobLine)]
         if first_draw:
-            # 다른 프로젝트로 왔다: 전에 보던 작업, 없으면 첫 작업 줄. 머리줄 커서는 이어받지 않는다.
-            self._header_key = None
-            if reveal is not None and str(reveal) in snapshot:
-                self._move_to_row(keys.index(str(reveal)))
-            elif job_rows:
-                self._move_to_row(job_rows[0])
-            elif self._lines:  # 모든 묶음이 접혀 머리줄만 있다
+            target = select
+            if target is None:
+                remembered = self._remembered.get(self.scope or "")
+                target = remembered if remembered in self._job_ids else None
+            if target is not None and str(target) in snapshot:
+                self._move_to_row(keys.index(str(target)))
+            elif keys:
                 self._move_to_row(0)
             else:
                 self._clear_selection()
-        elif redrawn:
-            if reveal is not None:
-                target = str(reveal)
-            elif self.selected_id is not None:
-                target = str(self.selected_id)
-            else:
-                target = f"h:{self._header_key}" if self._header_key is not None else None
-            if target in snapshot:
-                table.move_cursor(row=keys.index(target))
-            else:
-                # 보던 작업(또는 머리줄)이 사라졌다 (다른 터미널에서 지운 경우 포함): 같은 자리 근처의 작업을 보여준다.
-                self._header_key = None
-                self._clear_selection()
-                if job_rows:
-                    start = min(old_row, len(keys) - 1)  # 지운 자리의 작업 (마지막이었으면 그 위). 머리줄은 건너뛴다
-                    row = next((i for i in job_rows if i >= start), job_rows[-1])
+        else:
+            target = select if select is not None and str(select) in snapshot else self.selected_id
+            key = str(target) if target is not None else None
+            if key in snapshot:
+                row = keys.index(key)
+                if redrawn or table.cursor_row != row:
                     table.move_cursor(row=row)
-                    self.select_job(self._lines[row].job.id)
-                elif self._lines:  # 모든 묶음이 접혀 머리줄만 있다
-                    table.move_cursor(row=0)
-                    self._enter_header(self._lines[0].key)
+                if target != self.selected_id:
+                    self.select_job(target)
+            elif redrawn:
+                # 보던 작업이 사라졌다 (다른 터미널에서 지운 경우 포함): 같은 자리 근처의 작업을 보여준다.
+                self._clear_selection()
+                if keys:
+                    row = min(old_row, len(keys) - 1)  # 지운 자리의 작업 (마지막이었으면 그 위)
+                    table.move_cursor(row=row)
+                    self.select_job(rows[row].id)
         if not rows:
             # 문자열은 markup 으로 해석돼 [n] 이 사라진다
             if self.scope == scopes.OTHER or self.scope is None:
@@ -1204,29 +1274,30 @@ class ColidayApp(App[None]):
             else:
                 text = f"이 프로젝트({self._scope_name(self.scope)})에는 아직 작업이 없습니다. 아래 입력창에 시킬 일을 쓰고 Enter 를 누르세요."
             self.query_one("#diff", Static).update(Text(text))
-
-    def _line_cells(self, line: joblist.Line, now: float) -> tuple:
-        if isinstance(line, joblist.Header):
-            arrow = "▸" if line.collapsed else "▾"
-            return ("", "", "", "", Text(f"{arrow} {line.label} ({line.count})", style="bold"), "")
-        return self._row(line.job, now, line.job.id in self._marked, line)
+        self.refresh_bundle()
 
     @staticmethod
-    def _row(job: Job, now: float, marked: bool = False, line: joblist.JobLine | None = None) -> tuple:
+    def _row(
+        job: Job, now: float, marked: bool = False,
+        meta: dict[int, joblist.JobMeta] | None = None, group_names: dict[int, str] | None = None,
+    ) -> tuple:
+        """작업 목록 한 줄. 요청 칸 앞에 📌 고정, ↳#부모, ▣그룹 표시를 붙인다 (group_names 는 보이는 그룹만)."""
         style = _STATUS_STYLE.get(job.status, "")
         status = Text("✔" if marked else " ", style="bold yellow")  # 선택 표시는 늘 한 칸을 차지한다 (열 너비가 변하지 않게)
         status.append(STATUS_ICON.get(job.status, "?"), style=style)
         prompt: str | Text = jobs.one_line(job.prompt, 40)
-        if line is not None and (line.depth or line.child_count or line.detached_parent is not None):
-            tree = Text("  " * (line.depth - 1) + "└ " if line.depth else "", style="dim")
-            if line.child_count:
-                tree.append("▸ " if line.collapsed else "▾ ", style="bold")
-            if line.detached_parent is not None:  # 부모가 다른 묶음에 있거나 목록 밖에 있다
-                tree.append(f"↳#{line.detached_parent} ", style="dim")
-            tree.append(prompt)
-            if line.child_count:
-                tree.append(f" (+{line.child_count})", style="dim")
-            prompt = tree
+        item = (meta or {}).get(job.id)
+        marks: list[str] = []
+        if item is not None:
+            if item.pinned:
+                marks.append("📌")
+            if item.parent_id is not None:
+                marks.append(f"↳#{item.parent_id}")
+            name = (group_names or {}).get(item.group_id) if item.group_id is not None else None
+            if name is not None:
+                marks.append("▣" + (name[:_GROUP_MARK_CHARS] + "…" if len(name) > _GROUP_MARK_CHARS else name))
+        if marks:
+            prompt = Text(" ".join(marks) + " ", style="dim").append(prompt)
         return (
             status,
             str(job.id),
@@ -1236,14 +1307,6 @@ class ColidayApp(App[None]):
             Text(jobs.one_line(job.phase, 60), style=style),
         )
 
-    def _cursor_line(self) -> joblist.Line | None:
-        """커서가 있는 줄. 표의 줄은 self._lines 와 같은 순서로 그린다."""
-        table = self.query_one("#jobs", DataTable)
-        row = table.cursor_row
-        if not table.row_count or not 0 <= row < len(self._lines):
-            return None
-        return self._lines[row]
-
     def _row_of(self, key: str) -> int | None:
         keys = list(self._row_snapshot)
         return keys.index(key) if key in keys else None
@@ -1252,30 +1315,16 @@ class ColidayApp(App[None]):
     @_while_open
     def _on_highlight(self, event: DataTable.RowHighlighted) -> None:
         # 목록을 다시 그리면 하이라이트 이벤트가 여러 번 쌓인다. 현재 커서와 다른 오래된 이벤트는 무시하고,
-        # 줄은 이벤트가 아니라 지금 커서에서 읽는다 (다시 그린 뒤 같은 줄 번호에 머리줄이 올 수 있다).
+        # 작업은 이벤트가 아니라 지금 커서에서 읽는다 (다시 그린 뒤 같은 줄 번호에 다른 작업이 올 수 있다).
         if event.row_key.value is None or event.cursor_row != event.data_table.cursor_row:
             return
-        line = self._cursor_line()
-        if isinstance(line, joblist.Header):
-            self._enter_header(line.key)
-        elif line is not None:
-            self.select_job(line.job.id)
+        row = event.data_table.cursor_row
+        if 0 <= row < len(self._rows):
+            self.select_job(self._rows[row].id)
 
     def _move_to_row(self, row: int) -> None:
         self.query_one("#jobs", DataTable).move_cursor(row=row)
-        line = self._lines[row]
-        if isinstance(line, joblist.Header):
-            self._enter_header(line.key)
-        else:
-            self.select_job(line.job.id)
-
-    def _enter_header(self, key: str) -> None:
-        """커서가 머리줄에 왔다: 보던 작업이 없는 상태가 된다 (작업 대상 단축키는 '선택된 작업이 없습니다')."""
-        self._header_key = key
-        if self.selected_id is not None:
-            self._clear_selection()
-        else:
-            self._update_chat_hint()
+        self.select_job(self._rows[row].id)
 
     def _clear_selection(self) -> None:
         self.selected_id = None
@@ -1287,9 +1336,9 @@ class ColidayApp(App[None]):
         self.query_one("#diff", Static).update("작업을 선택하세요.")
         self._update_chat_hint()
         self._update_artifacts()
+        self.refresh_bundle()
 
     def select_job(self, job_id: int) -> None:
-        self._header_key = None
         if job_id == self.selected_id:
             return
         self.selected_id = job_id
@@ -1314,6 +1363,7 @@ class ColidayApp(App[None]):
         self._poll_selected(force_diff=True)
         self._update_chat_hint()
         self._update_artifacts()
+        self.refresh_bundle()
 
     def _poll_selected(self, force_diff: bool = False) -> None:
         if self.selected_id is None:
@@ -1657,7 +1707,7 @@ class ColidayApp(App[None]):
         self.notify(started)
         self._remembered[where] = launched.job.id  # 그 프로젝트로 옮기면 처음부터 이 작업을 고른다
         self.refresh_projects(select=where)
-        self.refresh_jobs(reveal=launched.job.id)  # 접힌 묶음에 들어가도 그 줄이 보이게 먼저 펼쳐 그린다
+        self.refresh_jobs(select=launched.job.id)
         row = self._row_of(str(launched.job.id))
         if row is not None:
             self.query_one("#jobs", DataTable).move_cursor(row=row)
@@ -1670,7 +1720,7 @@ class ColidayApp(App[None]):
             return  # 대화 상자가 떠 있을 때는 그쪽 입력이다
         chat = self.query_one("#chat", Input)
         table = self.query_one("#jobs", DataTable)
-        if event.key == "escape" and self.focused is chat:
+        if event.key == "escape" and (self.focused is chat or self.focused is self.query_one("#bundle", BundlePanel)):
             table.focus()
             event.stop()
         elif event.key == "space" and self.focused is table:
@@ -1688,19 +1738,12 @@ class ColidayApp(App[None]):
     @on(DataTable.RowSelected, "#jobs")
     @_while_open
     def _on_job_chosen(self, event: DataTable.RowSelected) -> None:
-        key = event.row_key.value or ""
-        if key.startswith("h:"):  # 머리줄: 접고 편다
-            self.toggle_section(key[2:])
-            return
         self.query_one("#chat", Input).focus()
 
     @on(Input.Submitted, "#chat")
     def _chat_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         if not prompt:
-            return
-        if self._header_key is not None:  # 머리줄은 작업이 아니다: 쓴 글은 남겨 둔다
-            self.notify("작업을 고르세요. 작업 목록의 커서가 머리줄(묶음)에 있습니다 (새 작업은 ctrl+n).", severity="warning")
             return
         if self.selected_id is None and self.scope == scopes.OTHER:  # 기타는 위치가 아니다: 어디에 만들지 모른다
             self.notify("기타에서는 새 작업을 시작할 수 없습니다. 프로젝트를 고르거나 ctrl+n 으로 위치를 정하세요.",
@@ -1736,9 +1779,7 @@ class ColidayApp(App[None]):
 
     def _update_chat_hint(self) -> None:
         chat = self.query_one("#chat", Input)
-        if self._header_key is not None:
-            hint = "머리줄(묶음)에서는 보낼 수 없습니다 — 작업 목록에서 작업을 고르세요   ·   새 작업은 ctrl+n"
-        elif self.selected_id is None and self.scope == scopes.OTHER:
+        if self.selected_id is None and self.scope == scopes.OTHER:
             hint = "기타에서는 새 작업을 시작할 수 없습니다 — 작업을 고르거나 프로젝트를 고르세요   ·   새 작업은 ctrl+n"
         elif self.selected_id is None:
             where = dict(self._projects or []).get(self.project_dir or "", Path(self.default_dir).name)
@@ -1834,17 +1875,8 @@ class ColidayApp(App[None]):
         self.notify(f"작업 {names} 의 타임라인을 복사했습니다 ({len(text.splitlines())}줄)", timeout=3)
 
     def _toggle_mark(self) -> None:
-        """커서가 있는 작업을 선택하거나 선택을 푼다. 이어서 고르기 쉽게 커서를 한 줄 내린다.
-
-        머리줄이면 그 묶음의 작업 전체(접힌 것 포함)를 고른다. 이미 모두 골랐으면 모두 푼다.
-        """
+        """커서가 있는 작업을 선택하거나 선택을 푼다. 이어서 고르기 쉽게 커서를 한 줄 내린다."""
         table = self.query_one("#jobs", DataTable)
-        line = self._cursor_line()
-        if isinstance(line, joblist.Header):
-            ids = set(line.job_ids)
-            self._marked = self._marked - ids if ids and ids <= self._marked else self._marked | ids
-            self.refresh_jobs()
-            return
         if self.selected_id is None or not table.row_count:
             return
         self._marked ^= {self.selected_id}
@@ -1854,164 +1886,291 @@ class ColidayApp(App[None]):
     def _update_marks_hint(self) -> None:
         table = self.query_one("#jobs", DataTable)
         if self._marked:
-            shown = {line.job.id for line in self._lines if isinstance(line, joblist.JobLine)}
-            hidden = len(self._marked - shown)  # 접힌 곳에 있어 보이지 않는 선택
-            table.border_subtitle = (
-                f"{len(self._marked)}개 선택" + (f" (접힌 곳 {hidden}개)" if hidden else "")
-                + " · Delete 로 함께 삭제 · Esc 선택 해제 · Ctrl+B 정리"
-            )
+            table.border_subtitle = f"{len(self._marked)}개 선택 · Delete 로 함께 삭제 · Esc 선택 해제 · Ctrl+B 묶음"
         else:
-            table.border_subtitle = "Space 로 여러 개 선택 · Delete 삭제 · ←→ 접기 · Ctrl+B 정리"
+            table.border_subtitle = "Space 로 여러 개 선택 · Delete 삭제 · Ctrl+B 묶음"
 
     def _update_jobs_title(self) -> None:
-        group_by = self._prefs.group_by
         title = "작업 목록"
         if self.scope is not None:
             title += f" · {self._scope_name(self.scope)}"
-        if group_by != "none":
-            title += f" · 묶기: {_GROUP_BY_LABEL[group_by]}"
         self.query_one("#jobs", DataTable).border_title = Text(title).markup  # 이름의 대괄호가 markup 으로 읽히지 않게
 
-    # ── 목록 정리: 묶기·접기·고정·그룹 ─────────────────────────
-    def _save_prefs(
-        self, *, group_by: joblist.GroupBy | None = None, add: frozenset[str] = frozenset(),
-        remove: frozenset[str] = frozenset(),
-    ) -> None:
-        """이번에 바꾼 것만 파일의 최신 설정에 적용해 저장한다 (다른 화면이 저장한 변경을 되돌리지 않게).
+    # ── 묶음: 고정·그룹·파생 (오른쪽 위 묶음 패널과 ctrl+b 메뉴) ─────────────
+    def refresh_bundle(self) -> None:
+        """선택한 작업의 묶음 패널을 그린다. 그린 내용이 같으면 손대지 않는다 (매 초 다시 그리면 깜빡이고 커서를 잃는다).
 
-        저장한 결과(다른 화면의 변경 포함)를 이 화면의 설정으로 삼는다. 없어진 작업·그룹의 접힘 키는 함께 지운다.
+        포커스는 패널을 숨길 때 패널에 있었던 경우에만 작업 목록으로 옮긴다 (숨긴 위젯의 포커스가 엉뚱한 곳으로 가지 않게).
         """
-        group_ids = {g.id for g in self.store.list_groups()}
-        stale = frozenset(key for key in self._prefs.collapsed | add if not self._key_alive(key, group_ids))
-        remove = remove | stale
-        try:
-            self._prefs = prefs.update(self.cfg.ui_path, group_by=group_by, add=add, remove=remove)
-        except OSError as exc:  # 저장하지 못해도 이번 화면에는 적용한다
-            self._prefs = prefs.Prefs(
-                self._prefs.group_by if group_by is None else group_by, (self._prefs.collapsed - remove) | (add - remove),
-            )
-            self.notify(f"화면 설정을 저장하지 못했습니다: {exc}", severity="warning", timeout=6)
-        self._update_jobs_title()
-
-    def _key_alive(self, key: str, group_ids: set[int]) -> bool:
-        """접힘 키가 가리키는 작업·그룹이 아직 있는가. 목록(최근 100개) 밖이나 다른 화면이 방금 만든 것도 있는 것으로 본다."""
-        kind, _, value = key.partition(":")
-        if kind == "project":  # 없어진 '프로젝트로 묶기' 의 접힘 키
-            return False
-        if kind not in ("job", "group"):
-            return True
-        if not value.isdigit():
-            return False
-        if kind == "group":
-            return int(value) in group_ids
-        try:
-            self.store.get_job(int(value))
-        except KeyError:
-            return False
-        return True
-
-    def _set_collapsed(self, key: str, collapsed: bool) -> None:
-        if collapsed:
-            self._save_prefs(add=frozenset({key}))
+        if not self.is_running:
+            return
+        panel = self.query_one("#bundle", BundlePanel)
+        job_id = self.selected_id
+        if job_id is None:
+            # 메뉴(모달)가 떠 있으면 self.focused 는 메뉴 안의 위젯이다. 패널이 놓인 화면의 포커스를 보고 옮긴다
+            # (그래야 메뉴를 닫은 뒤 숨은 패널 대신 엉뚱한 창으로 가지 않고 작업 목록으로 돌아온다).
+            screen = panel.screen
+            if screen.focused is panel:
+                screen.set_focus(self.query_one("#jobs", DataTable))
+            panel.remove_class("-shown")
+            self._bundle_snapshot = None
+            self._bundle_job = None
+            return
+        options = self._bundle_options(job_id)
+        pinned = self._meta.get(job_id, joblist.JobMeta()).pinned
+        title = f"묶음 #{job_id}" + (" · 📌 고정" if pinned else "")
+        subtitle = "Enter 이동 · Ctrl+B 메뉴 · Ctrl+E 그룹 이름 · Ctrl+X 그룹에서 빼기"
+        if self._marked:
+            subtitle = f"고른 {len(self._marked)}개에 적용(메뉴) · " + subtitle
+        snapshot = (job_id, tuple(options), title, subtitle)
+        panel.add_class("-shown")
+        if snapshot == self._bundle_snapshot:
+            return
+        self._bundle_snapshot = snapshot
+        panel.border_title = title
+        panel.border_subtitle = subtitle
+        same_job = self._bundle_job == job_id
+        self._bundle_job = job_id
+        old_index = panel.highlighted
+        old_id = panel.get_option_at_index(old_index).id if old_index is not None and old_index < panel.option_count else None
+        panel.clear_options()
+        panel.add_options([Option(text, id=key, disabled=not enabled) for key, text, enabled in options])
+        ids = [key for key, _, _ in options]
+        enabled = [i for i, (_, _, ok) in enumerate(options) if ok]
+        if same_job and old_id is not None and old_id in ids:
+            index = ids.index(old_id)
+        elif same_job and old_index is not None:
+            start = min(old_index, len(options) - 1)  # 그 줄이 사라졌다: 같은 자리 근처
+            index = next((i for i in enabled if i >= start), enabled[-1])
+        elif f"m:{job_id}" in ids:
+            index = ids.index(f"m:{job_id}")
+        elif f"a:{job_id}" in ids:
+            index = ids.index(f"a:{job_id}")
         else:
-            self._save_prefs(remove=frozenset({key}))
+            index = enabled[0]
+        panel.highlighted = index
+
+    def _visible_topic(self, job_id: int) -> tuple[Topic, list[int]] | None:
+        """작업이 든 자동 묶음과 구성 작업. 비슷한 작업이 둘 이상 모였거나 사람이 이름을 정한 묶음만 (혼자인 묶음은 None)."""
+        link = self._links.get(job_id)
+        topic = self._topics.get(link.topic_id) if link is not None else None
+        if topic is None:
+            return None
+        members = [i for i, item in self._links.items() if item.topic_id == topic.id]
+        if len(members) >= 2 or topic.manual_name:
+            return topic, members
+        return None
+
+    def _bundle_options(self, job_id: int) -> list[tuple[str | None, Text, bool]]:
+        """묶음 패널의 줄: (option id, 글, 고를 수 있음). 그룹 구역 → 자동 묶음 구역 → 파생 구역 → 메뉴 줄."""
+        b = joblist.bundle(job_id, self._meta, self._groups)
+        auto = self._visible_topic(job_id)
+        auto_members = tuple(auto[1]) if auto is not None else ()
+        listed = {j.id: j for j in self._rows}
+        wanted = {job_id, *b.members, *auto_members, *b.children, *([b.parent] if b.parent is not None else [])}
+        found: dict[int, Job] = {i: listed[i] for i in wanted if i in listed}
+        # 목록(최근 100개) 밖이거나 다른 프로젝트의 작업만 DB 에서 한 번에 읽는다 (그사이 지워진 것은 빠진다)
+        found.update(self.store.get_jobs([i for i in wanted if i not in listed]))
+
+        def recent(ids: tuple[int, ...]) -> list[Job]:
+            return sorted((found[i] for i in ids if i in found), key=lambda j: (j.last_asked, j.id), reverse=True)
+
+        def line(job: Job, lead: str, suffix: str = "", bold: bool = False) -> Text:
+            text = Text(lead)
+            text.append(STATUS_ICON.get(job.status, "?"), style=_STATUS_STYLE.get(job.status, ""))
+            # 자동 묶기가 남긴 '이 작업이 한 일' 한 줄이 있으면 그것을, 없으면 요청 앞부분을 보인다.
+            link = self._links.get(job.id)
+            what = jobs.one_line(link.line, _TOPIC_LINE_CHARS) if link is not None and link.line else jobs.one_line(job.prompt, 40)
+            text.append(f" #{job.id} {what}", style="bold" if bold else "")
+            if self._meta.get(job.id, joblist.JobMeta()).pinned:
+                text.append(" 📌")
+            if suffix:
+                text.append(suffix)
+            if job.id not in listed:
+                where = scopes.scope_of(job, self._project_paths(), self._worktrees)
+                if where == self.scope:
+                    tail = " (목록 밖)"
+                elif where == scopes.OTHER:
+                    tail = f" ({_OTHER_NAME})"
+                else:
+                    tail = f" (프로젝트 {self._scope_name(where)})"
+                text.append(tail, style="dim")
+            return text
+
+        def capped(items: list[Job], make: Callable[[Job], tuple[str | None, Text, bool]]) -> list:
+            out = [make(job) for job in items[:_BUNDLE_MAX_LINES]]
+            if len(items) > _BUNDLE_MAX_LINES:
+                out.append((None, Text(f"  … 외 {len(items) - _BUNDLE_MAX_LINES}개", style="dim"), False))
+            return out
+
+        options: list[tuple[str | None, Text, bool]] = []
+        if b.group is not None:
+            # 그룹 이름에 든 대괄호가 markup 으로 해석되지 않게 Text 로 만든다.
+            options.append((None, Text(f"그룹: {b.group.name} ({len(b.members)})", style="bold"), False))
+            options += capped(recent(b.members), lambda j: (
+                f"m:{j.id}", line(j, "▶ " if j.id == job_id else "  ", bold=j.id == job_id), True))
+        if auto is not None:
+            topic, _ = auto
+            options.append((None, Text(f"자동 묶음: {topic.name} ({len(auto_members)})", style="bold"), False))
+            summary = jobs.one_line(topic.summary, _TOPIC_SUMMARY_CHARS) or "아직 요약이 없습니다"
+            options.append((None, Text(f"  {summary}", style="dim"), False))
+            options += capped(recent(auto_members), lambda j: (
+                f"a:{j.id}", line(j, "▶ " if j.id == job_id else "  ", bold=j.id == job_id), True))
+        gone_parent: int | None = None
+        if b.parent is None:
+            origin = self.store.origin(job_id)
+            if origin is not None and origin != job_id and not self._existing([origin]):
+                gone_parent = origin
+        parent = found.get(b.parent) if b.parent is not None else None
+        children = recent(b.children)
+        if parent is not None or gone_parent is not None or children:
+            options.append((None, Text("파생", style="bold"), False))
+            if parent is not None:
+                options.append((f"p:{parent.id}", line(parent, "  ↑ ", " (부모)"), True))
+            elif gone_parent is not None:
+                options.append((None, Text(f"  ↑ #{gone_parent} (지워짐)", style="dim"), False))
+            options += capped(children, lambda j: (f"c:{j.id}", line(j, "  ↓ "), True))
+        if not options:
+            options.append((None, Text("묶인 작업 없음 — Ctrl+B 로 그룹·고정·파생", style="dim"), False))
+        options.append(("menu", Text("⋯ 묶음 메뉴 (Ctrl+B)", style="italic"), True))
+        return options
+
+    @on(OptionList.OptionSelected, "#bundle")
+    @_while_open
+    def _on_bundle_chosen(self, event: OptionList.OptionSelected) -> None:
+        key = event.option_id or ""
+        if key == "menu":
+            self.action_bundle_menu()
+            return
+        _, _, number = key.partition(":")
+        if number.isdigit():
+            self._jump_to(int(number))
+
+    def _jump_to(self, job_id: int) -> None:
+        """묶음 패널에서 고른 작업으로 간다. 포커스는 패널에 둔다 (묶인 작업을 차례로 훑어볼 수 있게).
+
+        다른 프로젝트(또는 기타)의 작업이면 그 프로젝트로 옮겨 고른다.
+        """
+        if job_id in self._job_ids:
+            row = self._row_of(str(job_id))
+            if row is not None:
+                self.query_one("#jobs", DataTable).move_cursor(row=row)
+            self.select_job(job_id)
+            return
+        try:
+            job = self.store.get_job(job_id)
+        except KeyError:
+            self.notify(f"작업 #{job_id} 은(는) 그사이 지워졌습니다.", severity="warning")
+            self.refresh_jobs()
+            return
+        where = scopes.scope_of(job, self._project_paths(), self._worktrees)
+        if where == self.scope:
+            self.notify(f"#{job_id} 은(는) 최근 100개 밖이라 목록에 없습니다.", severity="warning")
+            return
+        self._remembered[where] = job_id  # 그 프로젝트로 옮기면 처음부터 이 작업을 고른다
+        self.refresh_projects(select=where)
+        if self.scope != where:  # 목록에 그 줄이 없다 (기타 줄이 아직 생기지 않음 등)
+            self.notify(f"작업 #{job_id} 이(가) 있는 {self._scope_name(where)} 을(를) 열 수 없습니다.", severity="warning",
+                        markup=False)
+            return
+        self.refresh_jobs(select=job_id)
+        if self.selected_id == job_id:
+            self.notify(f"프로젝트 {self._scope_name(where)} 로 옮겼습니다 (#{job_id}).", markup=False)
+        else:  # 그 프로젝트의 최근 100개 밖이라 목록에 없다
+            self.notify(f"프로젝트 {self._scope_name(where)} 로 옮겼지만 #{job_id} 은(는) 최근 100개 밖이라 목록에 없습니다.",
+                        severity="warning", markup=False)
+
+    def _selected_group(self) -> joblist.JobGroup | None:
+        """선택한 작업이 든 (보이는) 그룹."""
+        if self.selected_id is None:
+            return None
+        group_id = self._meta.get(self.selected_id, joblist.JobMeta()).group_id
+        return next((g for g in self._groups if g.id == group_id), None)
+
+    def action_bundle_rename_group(self) -> None:
+        """묶음 패널의 ctrl+e: 선택한 작업이 든 그룹의 이름을 바꾼다."""
+        if self.selected_id is None:
+            self.notify("선택된 작업이 없습니다.", severity="warning")
+            return
+        group = self._selected_group()
+        if group is None:
+            self.notify(f"작업 #{self.selected_id} 은(는) 그룹에 들어 있지 않습니다.", severity="warning")
+            return
+        if self._group_left(group):
+            self.push_screen(NameScreen("그룹 이름 바꾸기", group.name), lambda name: self._rename_group(group, name))
+
+    def action_bundle_ungroup(self) -> None:
+        """묶음 패널의 ctrl+x: 패널에서 하이라이트한 그룹 구성 작업을 그룹에서 뺀다."""
+        panel = self.query_one("#bundle", BundlePanel)
+        option = panel.highlighted_option
+        key = option.id if option is not None else None
+        if not key or not key.startswith("m:"):
+            self.notify("그룹에서 뺄 작업을 묶음 패널의 그룹 줄에서 고르세요.", severity="warning")
+            return
+        targets = self._targets_left([int(key[2:])])
+        if targets:
+            self._put_in_group(targets, None)
         self.refresh_jobs()
-
-    def toggle_section(self, key: str) -> None:
-        """머리줄을 접거나 편다 (Enter·클릭). 커서는 그 머리줄에 둔다."""
-        row = self._row_of(f"h:{key}")
-        if row is None:
-            return
-        line = self._lines[row]
-        self._move_to_row(row)  # 보던 작업이 그 묶음 안에 있어도 펼친 채로 남지 않게 먼저 머리줄로 옮긴다
-        if isinstance(line, joblist.Header):
-            self._set_collapsed(key, not line.collapsed)  # 보이는 그대로 뒤집는다
-
-    def action_job_left(self) -> None:
-        """펼친 부모나 머리줄이면 접고, 자식이면 부모로, 뿌리면 머리줄로 간다."""
-        line = self._cursor_line()
-        if line is None:
-            return
-        if isinstance(line, joblist.Header):
-            if not line.collapsed:
-                self._set_collapsed(line.key, True)
-            return
-        if line.child_count and not line.collapsed:
-            self._set_collapsed(joblist.tree_key(line.job.id), True)
-            return
-        row = self.query_one("#jobs", DataTable).cursor_row
-        for i in range(row - 1, -1, -1):
-            above = self._lines[i]
-            if line.depth > 0 and isinstance(above, joblist.JobLine) and above.depth == line.depth - 1:
-                self._move_to_row(i)
-                return
-            if line.depth == 0 and isinstance(above, joblist.Header) and above.key == line.section:
-                self._move_to_row(i)
-                return
-
-    def action_job_right(self) -> None:
-        """접힌 머리줄이나 접힌 부모를 편다."""
-        line = self._cursor_line()
-        if isinstance(line, joblist.Header) and line.collapsed:
-            self._set_collapsed(line.key, False)
-        elif isinstance(line, joblist.JobLine) and line.collapsed:
-            self._set_collapsed(joblist.tree_key(line.job.id), False)
-
-    def _cycle_group_by(self) -> str:
-        order = list(_GROUP_BY_LABEL)
-        group_by = order[(order.index(self._prefs.group_by) + 1) % len(order)]
-        self._save_prefs(group_by=group_by)
-        self.refresh_jobs()
-        return self._group_by_item()
-
-    def _group_by_item(self) -> str:
-        return f"묶기: 없음 / 상태 (지금: {_GROUP_BY_LABEL[self._prefs.group_by]})"
 
     def _targets(self) -> list[int]:
-        """목록 정리의 대상: Space 로 고른 작업들, 없으면 커서가 있는 작업."""
+        """묶음 메뉴의 대상: Space 로 고른 작업들, 없으면 선택한 작업."""
         if self._marked:
             return sorted(self._marked)
         return [self.selected_id] if self.selected_id is not None else []
 
-    def action_list_menu(self) -> None:
+    def action_bundle_menu(self) -> None:
+        """ctrl+b: 묶음 패널로 포커스를 옮기고 묶음 메뉴를 연다 (메뉴를 닫으면 패널로 돌아온다)."""
+        if self.selected_id is None:
+            self.notify("선택된 작업이 없습니다.", severity="warning")
+            return
+        self.refresh_bundle()  # 패널이 보이게 (보통 이미 보인다)
+        self.screen.set_focus(self.query_one("#bundle", BundlePanel))
         targets = self._targets()
-        what = (f"#{targets[0]}" if len(targets) == 1 else f"고른 {len(targets)}개") if targets else "작업을 고르세요"
+        what = f"#{targets[0]}" if len(targets) == 1 else f"고른 {len(targets)}개"
         metas = [self._meta.get(i, joblist.JobMeta()) for i in targets]
-        items: list[tuple[str, str, bool]] = [("group_by", self._group_by_item(), True)]
-        if not targets or not all(m.pinned for m in metas):
-            items.append(("pin", f"고정 ({what})", bool(targets)))
+        items: list[tuple[str, str, bool]] = []
+        if not all(m.pinned for m in metas):
+            items.append(("pin", f"고정 ({what})", True))
         if any(m.pinned for m in metas):
             items.append(("unpin", f"고정 해제 ({what})", True))
         # 그룹은 프로젝트마다 따로다. 기타는 프로젝트가 아니라 그룹을 만들거나 넣을 수 없다.
         project = self.scope if self.scope not in (None, scopes.OTHER) else None
         for group in self._groups:
-            items.append((f"group:{group.id}", f"그룹에 넣기 → {group.name} ({what})", bool(targets)))
+            items.append((f"group:{group.id}", f"그룹에 넣기 → {group.name} ({what})", True))
         if project is None:
             items.append(("group_new", "그룹에 넣기 (기타에서는 그룹을 쓸 수 없습니다 — 프로젝트를 고르세요)", False))
         else:
-            items.append(("group_new", f"그룹에 넣기 → 새 그룹… ({what})", bool(targets)))
+            items.append(("group_new", f"그룹에 넣기 → 새 그룹… ({what})", True))
         if any(m.group_id is not None for m in metas):  # 보이는 그룹 기준 (refresh_jobs 가 다른 프로젝트 그룹은 지웠다)
             items.append(("ungroup", f"그룹에서 빼기 ({what})", True))
-        if self.selected_id is not None:
-            items.append(("derive", f"파생 작업 만들기 (#{self.selected_id} 에서)", True))
-        else:
-            items.append(("derive", "파생 작업 만들기 (작업을 고르세요)", False))
-        group = self._cursor_group()
+        items.append(("derive", f"파생 작업 만들기 (#{self.selected_id} 에서)", True))
+        group = self._selected_group()
         if group is not None:
             items.append(("rename_group", f"그룹 이름 바꾸기 ({group.name})", True))
             items.append(("delete_group", f"그룹 삭제 ({group.name}, 작업은 남음)", True))
+        # 평평한 목록에서는 빈 그룹으로 갈 길이 없다: 메뉴에서 지울 수 있게 한다. 개수는 모든 작업 기준 (목록 밖 포함).
+        used = {m.group_id for m in self._meta.values() if m.group_id is not None}
+        empty = {g.id: g for g in self._groups if g.id not in used}
+        for g in empty.values():
+            items.append((f"delete_empty:{g.id}", f"빈 그룹 삭제 → {g.name}", True))
+        # 자동 묶음은 프로젝트가 아니라 레포 기준이라 기타를 보는 중에도 된다. 대상은 선택한 작업 하나 (Space 선택은 무시).
+        items.append(("topic_move", f"자동 묶음 옮기기 → 다른 자동 묶음·새 자동 묶음… (#{self.selected_id})", True))
+        auto = self._visible_topic(self.selected_id)
+        topic = auto[0] if auto is not None else None
+        if topic is not None:
+            items.append(("topic_rename", f"자동 묶음 이름 바꾸기 ({topic.name})", True))
+        waiting = len(topics.pending(self.store))
+        if waiting:
+            items.append(("topic_sort", f"안 묶인 끝난 작업 자동으로 묶기 ({waiting}개)", True))
+        else:
+            items.append(("topic_sort", "안 묶인 끝난 작업 없음", False))
         # 대상은 메뉴를 연 지금 정한다: 메뉴가 열려 있는 동안 다른 화면에서 지워 1초 새로고침이 커서를 옮겨도
-        # 메뉴에 적힌 작업·그룹에만 적용한다.
+        # 메뉴에 적힌 작업·그룹·자동 묶음에만 적용한다.
         derive_from = self.selected_id
         self.push_screen(
-            ListMenuScreen(items, self._cycle_group_by),
-            lambda choice: self._menu_chosen(choice, targets, derive_from, group, project),
+            ListMenuScreen(items),
+            lambda choice: self._menu_chosen(choice, targets, derive_from, group, project, empty, topic, waiting),
         )
-
-    def _cursor_group(self) -> joblist.JobGroup | None:
-        """커서가 사용자 그룹 머리줄에 있으면 그 그룹."""
-        key = self._header_key or ""
-        return next((g for g in self._groups if key == f"group:{g.id}"), None)
 
     def _existing(self, job_ids: list[int]) -> list[int]:
         """아직 있는 작업만 (메뉴·이름 창이 열려 있는 동안 다른 화면에서 지웠을 수 있다)."""
@@ -2042,10 +2201,17 @@ class ColidayApp(App[None]):
 
     def _menu_chosen(
         self, choice: str | None, targets: list[int], derive_from: int | None, group: joblist.JobGroup | None,
-        project: str | None = None,
+        project: str | None = None, empty: dict[int, joblist.JobGroup] | None = None,
+        topic: Topic | None = None, waiting: int = 0,
     ) -> None:
-        """메뉴를 열 때 정한 대상(targets·derive_from·group)에 적용한다. 그사이 지워졌으면 바꾸지 않고 알린다."""
+        """메뉴를 열 때 정한 대상(targets·derive_from·group·topic)에 적용한다. 그사이 지워졌으면 바꾸지 않고 알린다.
+
+        derive_from 은 메뉴를 연 때 선택한 작업이다 (파생과 자동 묶음 옮기기의 대상).
+        """
         if not choice:
+            return
+        if choice.startswith("topic_"):
+            self._topic_menu_chosen(choice, derive_from, topic, waiting)
             return
         if choice in ("pin", "unpin", "group_new", "ungroup") or choice.startswith("group:"):
             targets = self._targets_left(targets)
@@ -2080,8 +2246,80 @@ class ColidayApp(App[None]):
             jobs.delete_group(self.store, group.id)
             self.notify(f"그룹 '{group.name}' 을(를) 지웠습니다. 들어 있던 작업은 그대로 남습니다.", markup=False)
             self.refresh_jobs()
-            self._save_prefs()  # 지운 그룹의 접힘 키를 지운다
             return
+        elif choice.startswith("delete_empty:"):
+            target = (empty or {}).get(int(choice.removeprefix("delete_empty:")))
+            if target is None or not self._group_left(target):
+                return
+            if any(m.group_id == target.id for m in self.store.job_meta().values()):
+                self.notify(f"그룹 '{target.name}' 에 그사이 작업이 들어가 지우지 않았습니다.", severity="warning",
+                            timeout=6, markup=False)
+                self.refresh_jobs()
+                return
+            jobs.delete_group(self.store, target.id)
+            self.notify(f"빈 그룹 '{target.name}' 을(를) 지웠습니다.", markup=False)
+            self.refresh_jobs()
+            return
+        self.refresh_jobs()
+
+    # ── 자동 묶음 (모델이 묶은 것): 메뉴에서만 고친다 ────────────────────────
+    def _topic_menu_chosen(self, choice: str, job_id: int | None, topic: Topic | None, waiting: int) -> None:
+        if choice == "topic_move":
+            if job_id is None or not self._targets_left([job_id]):
+                self.refresh_jobs()
+                return
+            job = self.store.get_job(job_id)
+            link = self.store.job_topic(job_id)
+            counts: dict[int, int] = {}
+            for item in self.store.job_topics().values():
+                counts[item.topic_id] = counts.get(item.topic_id, 0) + 1
+            options = [(f"{t.name} ({counts.get(t.id, 0)})", t.id) for t in self.store.topics(job.repo)]
+            self.push_screen(
+                TopicScreen(f"작업 #{job_id} 을(를) 넣을 자동 묶음 (같은 레포 안에서)", options=options,
+                            current=link.topic_id if link else None),
+                lambda answer: self._move_topic(job_id, answer),
+            )
+        elif choice == "topic_rename" and topic is not None:
+            if self._topic_left(topic):
+                self.push_screen(TopicScreen("자동 묶음 이름 바꾸기", topic.name), lambda answer: self._rename_topic(topic, answer))
+        elif choice == "topic_sort" and waiting:
+            def confirmed(ok: bool | None) -> None:
+                if ok:
+                    topics.spawn_pending(self.cfg)
+                    self.notify(f"끝난 작업 {waiting}개를 자동으로 묶는 중입니다. "
+                                "비슷한 작업이 둘 이상 모이면 묶음 패널에 나타납니다.")
+
+            self.push_screen(
+                ConfirmScreen(f"안 묶인 끝난 작업 {waiting}개를 팀장 모델로 묶을까요? (작업마다 짧은 호출 한 번)"), confirmed
+            )
+
+    def _topic_left(self, topic: Topic) -> bool:
+        if any(t.id == topic.id for t in self.store.topics()):
+            return True
+        self.notify(f"자동 묶음 '{topic.name}' 이(가) 그사이 없어져 아무것도 바꾸지 않았습니다.", severity="warning",
+                    timeout=6, markup=False)
+        self.refresh_jobs()
+        return False
+
+    def _move_topic(self, job_id: int, answer: tuple[int, str] | None) -> None:
+        if answer is None:
+            return
+        chosen, name = answer
+        moved = self.store.assign_topic(job_id, chosen or None, name=name, manual=True)
+        if moved is None:
+            self.notify("옮기지 못했습니다: 작업이나 자동 묶음이 그사이 없어졌습니다.", severity="error", timeout=8)
+        else:
+            target = next((t.name for t in self.store.topics() if t.id == moved), name)
+            self.notify(f"작업 #{job_id} 을(를) 자동 묶음 '{target}' (으)로 옮겼습니다.", markup=False)
+        self.refresh_jobs()
+
+    def _rename_topic(self, topic: Topic, answer: tuple[int, str] | None) -> None:
+        if not answer or not answer[1] or answer[1] == topic.name:
+            return
+        if not self._topic_left(topic):  # 이름을 쓰는 동안 없어졌을 수 있다
+            return
+        self.store.update_topic(topic.id, name=answer[1], manual_name=True)
+        self.notify(f"자동 묶음 이름을 '{answer[1]}' (으)로 바꿨습니다.", markup=False)
         self.refresh_jobs()
 
     def _put_in_group(self, targets: list[int], group_id: int | None) -> None:
@@ -2125,10 +2363,7 @@ class ColidayApp(App[None]):
 
     def action_remove_job(self) -> None:
         """고른 작업을 삭제한다. Space 로 선택해 둔 작업이 있으면 그것들을 한꺼번에, 없으면 보고 있는 작업 하나를."""
-        ids = sorted(self._marked, reverse=True)  # 접힌 곳에 있는 선택도 함께
-        if not ids and self._header_key is not None:
-            self.notify("머리줄은 지울 수 없습니다. 지울 작업을 고르거나 Space 로 묶음 전체를 고르세요.", severity="warning")
-            return
+        ids = sorted(self._marked, reverse=True)
         if not ids:
             job = self._selected_job()
             if job is None:

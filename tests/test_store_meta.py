@@ -394,6 +394,122 @@ def test_옛_형태의_그룹_표를_두_프로세스가_함께_열어도_한_�
     s.close()
 
 
+# ── 자동 묶음 (topics) 과 함께 쓰는 DB ─────────────────────────────────────
+
+_B_SCHEMA_EXTRA = """
+CREATE TABLE topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, name TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '', manual_name INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE job_topics (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id), topic_id INTEGER NOT NULL REFERENCES topics(id),
+    manual INTEGER NOT NULL DEFAULT 0, line TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+def _tables(s: Store) -> set[str]:
+    return {r[0] for r in s._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def test_자동_묶음만_있는_DB를_열면_그룹_표가_생기고_자동_묶음은_그대로다(tmp_path):
+    path = tmp_path / "b.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(_OLD_SCHEMA + _B_SCHEMA_EXTRA)
+    for prompt in ("취소 API", "환불"):
+        conn.execute("INSERT INTO jobs(prompt, repo, workdir, status, created_at) VALUES (?, '/r', '/r', 'succeeded', 1.0)", (prompt,))
+    conn.execute("INSERT INTO topics(repo, name, summary, manual_name) VALUES ('/r', '주문 취소', '요약', 1)")
+    conn.executemany("INSERT INTO job_topics(job_id, topic_id, manual, line) VALUES (?, 1, 0, ?)", [(1, "한 일"), (2, "")])
+    conn.commit()
+    conn.close()
+
+    s = Store(path)
+    assert {"job_meta", "job_groups", "topics", "job_topics"} <= _tables(s)
+    assert "project" in {r["name"] for r in s._conn.execute("PRAGMA table_info(job_groups)")}
+    [topic] = s.topics()
+    assert (topic.name, topic.summary, topic.manual_name) == ("주문 취소", "요약", True)
+    assert s.job_topic(1).line == "한 일" and s.job_topic(2).topic_id == 1
+    assert s.job_meta() == {} and s.list_groups() == []
+    s.close()
+    again = Store(path)                                       # 두 번 열어도 같다
+    assert len(again.topics()) == 1 and len(again.job_topics()) == 2
+    again.close()
+
+
+def test_자동_묶음_표가_없는_DB를_열면_표가_생긴다(tmp_path):
+    path = tmp_path / "a.db"
+    s = Store(path)
+    a = _job(s)
+    s.set_pinned([a], True)
+    s._conn.executescript("DROP TABLE job_topics; DROP TABLE topics;")
+    s.close()
+
+    s = Store(path)
+    assert {"topics", "job_topics"} <= _tables(s)
+    assert s.topics() == [] and s.job_topics() == {} and s.job_meta()[a].pinned
+    s.close()
+    Store(path).close()
+
+
+def test_옛_그룹_표와_자동_묶음_표가_같이_있어도_그룹_표를_다시_만든다(tmp_path):
+    # 그룹 표를 다시 만드는 문장(_GROUPS_TABLE)에 다른 표의 문장이 섞이면 execute 가 실패한다 (회귀 방지).
+    path = tmp_path / "dev.db"
+    a, b = _old_groups_db(path)
+    s = Store(path)
+    s.assign_topic(a, None, name="주문 취소", line="한 일")
+    s._conn.executescript(
+        "DROP TABLE job_groups;"
+        "CREATE TABLE job_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);"
+    )
+    s.close()
+
+    s = Store(path)
+    assert "project" in {r["name"] for r in s._conn.execute("PRAGMA table_info(job_groups)")}
+    assert [t.name for t in s.topics()] == ["주문 취소"] and s.job_topic(a).line == "한 일"
+    assert s.create_group("새 그룹", project="/r").name == "새 그룹"
+    s.close()
+
+
+def test_작업을_지우면_파생은_조부모로_올리고_자동_묶음에서도_빼고_빈_묶음은_지운다(store):
+    a = _job(store)
+    b = _job(store, parent_id=a)
+    c = _job(store, parent_id=b)
+    alone = store.assign_topic(b, None, name="혼자")
+    shared = store.assign_topic(a, None, name="함께")
+    store.assign_topic(c, shared)
+
+    assert store.delete_job(b)
+    assert store.job_meta()[c].parent_id == a
+    assert store.job_topic(b) is None
+    assert [t.id for t in store.topics()] == [shared]          # 비게 된 '혼자' 는 지워졌다
+    assert alone not in {t.id for t in store.topics()}
+    assert store.delete_job(a)
+    assert [t.id for t in store.topics()] == [shared] and set(store.job_topics()) == {c}
+
+
+def test_이전_버전이_작업만_지워_남은_자동_묶음_줄은_보이지_않는다(store):
+    a = _job(store)
+    b = _job(store)
+    topic = store.assign_topic(a, None, name="주문")
+    store.assign_topic(b, topic)
+    store._conn.execute("DELETE FROM jobs WHERE id = ?", (a,))  # job_topics 를 모르는 이전 버전의 삭제
+
+    assert set(store.job_topics()) == {b} and store.job_topic(a) is None
+    c = _job(store)
+    assert c != a                                              # 번호를 다시 쓰지 않아 고아 줄이 새 작업에 붙지 않는다
+    store.assign_topic(c, topic)                               # 다음 쓰기에서 고아 줄이 정리된다
+    assert store._conn.execute("SELECT COUNT(*) FROM job_topics WHERE job_id = ?", (a,)).fetchone()[0] == 0
+
+
+def test_다른_레포의_자동_묶음에는_넣지_않고_get_jobs는_한_번에_읽는다(store):
+    a = _job(store)
+    other = store.create_job(prompt="q", repo="/other", workdir="/other", model=None).id
+    topic = store.assign_topic(a, None, name="주문")
+    assert store.assign_topic(other, topic) is None and store.job_topic(other) is None
+    assert store.assign_topic(999, topic) is None
+    assert set(store.get_jobs([a, other, 999])) == {a, other} and store.get_jobs([]) == {}
+
+
 # ── 파생 작업 실행 ─────────────────────────────────────────────────────────
 
 

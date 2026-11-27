@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from coliday import guard, members, remote, team
+from coliday import guard, members, remote, team, topics
 from coliday.jobs import one_line, organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
@@ -71,6 +71,8 @@ def run_job(cfg: Config, store: Store, job_id: int) -> int:
         # 실행 중에 사용자가 보낸 요청이 대기하고 있으면 끝내지 않고 같은 세션으로 한 번 더 실행한다.
         code = _run_turn(cfg, store, job_id)
         if code is not None:
+            # 작업은 이미 끝난 상태다 (사용자는 결과를 본다). 그 뒤에 비슷한 작업끼리 자동 묶음으로 묶는다.
+            topics.classify_quietly(cfg, store, job_id)
             return code
 
 

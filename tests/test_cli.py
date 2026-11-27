@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import pytest
 
-from coliday import cli, config, jobs, members, team, worker
+from coliday import cli, config, jobs, members, team, topics, worker
 from coliday.store import Store
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_claude.py"
@@ -1100,7 +1100,7 @@ def test_prompt는_codex_팀장이면_셸로_맡기는_지시문을_보여준다
     assert "모델: codex" in out and "## 팀원에게 맡기는 방법" in out and "## 직접 처리하는 일" in out
 
 
-def _wait(cond, timeout=10.0):
+def _wait(cond, timeout=15.0):
     import time
     end = time.time() + timeout
     while time.time() < end:
@@ -1593,3 +1593,216 @@ def test_rm은_하위_작업을_어디로_옮겼는지_알린다(env, tmp_path, 
     assert "하위 작업 #3, #4 은(는) 최상위로 옮겼습니다." in capsys.readouterr().out
     assert cli.main(["rm", "3"]) == 0
     assert "하위 작업" not in capsys.readouterr().out
+
+
+# ── 자동 묶음: 비슷한 작업끼리 묶기 (topics) ─────────────────────────────────────
+def _topic_answer(monkeypatch, **answer):
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", json.dumps(answer, ensure_ascii=False))
+
+
+def test_작업이_끝나면_팀장_모델로_묶음을_만들고_도구_없이_한_번만_묻는다(env, repo, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo)]) == 0
+    store = _store()
+    _wait(lambda: store.job_topic(1) is not None)
+
+    [topic] = store.topics()
+    assert (topic.name, topic.summary, topic.repo) == ("주문 취소", "주문 취소 API 를 만들었다.", str(repo))
+    assert store.job_topic(1).line == "취소 API 추가" and not store.job_topic(1).manual
+    [call] = [json.loads(line) for line in (env / "topic.jsonl").read_text().splitlines()]
+    argv = call["argv"]
+    assert argv[argv.index("--tools") + 1] == "" and "--no-session-persistence" in argv   # 파일을 읽거나 명령을 실행하지 않는다
+    assert argv[argv.index("--model") + 1] == store.get_job(1).model                        # 팀장이 쓴 모델
+    assert Path(call["cwd"]).resolve() == (config.load().home / "topics").resolve()         # 프로젝트 밖에서 실행한다
+    assert "주문 취소 API 추가" in call["stdin"] and "최종 보고: 완료" in call["stdin"]
+    assert "(없음: 새 묶음을 만든다)" in call["stdin"]
+    assert json.loads((env / "args.json").read_text())["stdin"] == "주문 취소 API 추가"      # 팀장 실행 기록은 그대로다
+
+
+def test_기존_묶음을_고르면_거기에_넣고_요약을_고쳐_쓰며_없는_번호면_새로_만든다(env, repo, monkeypatch):
+    cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
+    store = _store()
+    _wait(lambda: store.job_topic(1) is not None)
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _topic_answer(monkeypatch, topic=1, name="다른 이름", summary="취소 API 와 환불을 만들었다.", line="환불 추가")
+    cli.main(["run", "환불 처리", "-C", str(repo), "--no-worktree"])
+    _wait(lambda: store.job_topic(2) is not None)
+    [topic] = store.topics()
+    assert (topic.name, topic.summary) == ("주문 취소", "취소 API 와 환불을 만들었다.")   # 이름은 처음 정한 그대로
+    assert store.job_topic(2).topic_id == 1
+    asked = json.loads((env / "topic.jsonl").read_text().splitlines()[-1])["stdin"]
+    assert '"topic": 1' in asked and "주문 취소 API 를 만들었다." in asked                 # 기존 묶음을 보여 주고 고르게 한다
+
+    _topic_answer(monkeypatch, topic=99, name="로그인", summary="로그인을 고쳤다.", line="로그인 수정")
+    cli.main(["run", "로그인 버그", "-C", str(repo), "--no-worktree"])
+    _wait(lambda: store.job_topic(3) is not None)
+    assert [t.name for t in store.topics()] == ["주문 취소", "로그인"]
+    assert store.job_topic(3).topic_id == 2
+
+
+def test_다른_프로젝트의_묶음은_보여_주지도_않고_넣지도_않는다(env, repo, tmp_path, monkeypatch):
+    other = tmp_path / "other"
+    other.mkdir()
+    cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
+    store = _store()
+    _wait(lambda: store.job_topic(1) is not None)
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _topic_answer(monkeypatch, topic=1, name="배포 설정", summary="배포를 고쳤다.", line="배포 수정")
+    cli.main(["run", "배포 설정", "-C", str(other), "--no-worktree"])
+    _wait(lambda: store.job_topic(2) is not None)
+
+    asked = json.loads((env / "topic.jsonl").read_text().splitlines()[-1])["stdin"]
+    assert '"topic": 1' not in asked and "(없음: 새 묶음을 만든다)" in asked
+    assert store.job_topic(2).topic_id == 2 and [t.repo for t in store.topics()] == [str(repo), str(other)]
+    assert store.assign_topic(2, 1, manual=True) is None            # 손으로도 다른 프로젝트의 묶음에는 못 넣는다
+    assert store.job_topic(2).topic_id == 2
+
+
+def test_묶기가_실패해도_작업은_성공이고_나중에_다시_묶을_수_있다(env, repo, monkeypatch, capsys):
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "fail")
+    assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"]) == 0
+    store = _store()
+    log = config.load().job_dir(1) / "topic.log"
+    _wait(log.is_file)
+    assert store.get_job(1).status == "succeeded" and store.job_topic(1) is None
+    assert "topic boom" in log.read_text()
+    assert not [e for e in store.events(1) if "묶" in e.message]      # 타임라인에는 남기지 않는다
+
+    capsys.readouterr()
+    assert cli.main(["topics", "--sort"]) == 1                        # 아직 실패한다: 이유를 알린다
+    assert "작업 #1 을(를) 묶지 못했습니다" in capsys.readouterr().err
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "설명을 붙인 답\n```json\n{\"topic\": null, \"name\": \"주문 취소\", \"summary\": \"요약\", \"line\": \"한 줄\"}\n```")
+    assert cli.main(["topics", "--sort"]) == 0
+    out = capsys.readouterr().out
+    assert store.job_topic(1).topic_id == 1                           # 설명이나 코드 울타리가 붙어 와도 읽는다
+    assert "■ 자동 묶음 없음  (-, 1개)" in out and "#1    한 줄" in out   # 하나뿐인 묶음은 묶음으로 보여 주지 않는다
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", '{"topic": 1, "name": "x", "summary": "둘을 했다.", "line": "둘째"}')
+    cli.main(["run", "주문 취소 버그", "-C", str(repo), "--no-worktree"])
+    _wait(lambda: store.job_topic(2) is not None)
+    capsys.readouterr()
+    assert cli.main(["topics"]) == 0
+    assert "■ 주문 취소  (myrepo, 2개)" in capsys.readouterr().out          # 둘이 모이면 묶음이 된다
+
+
+def test_사람이_옮긴_작업과_정한_이름은_다시_묶어도_바뀌지_않고_빈_묶음은_사라진다(env, repo, monkeypatch):
+    cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
+    store = _store()
+    _wait(lambda: store.job_topic(1) is not None)
+
+    moved = store.assign_topic(1, None, name="결제", manual=True)     # 새 묶음으로 옮긴다
+    assert [t.name for t in store.topics()] == ["결제"]                # 비게 된 '주문 취소'는 지워진다
+    assert store.job_topic(1).line == "취소 API 추가"                  # 한 줄 요약은 그대로
+
+    _topic_answer(monkeypatch, topic=None, name="AI 가 붙인 이름", summary="이어서 한 일까지.", line="이어서 함")
+    cli.main(["continue", "1", "테스트도 추가"])
+    _wait(lambda: store.job_topic(1).line == "이어서 함")
+    [topic] = store.topics()
+    assert topic.id == moved and topic.name == "결제" and topic.summary == "이어서 한 일까지."
+    assert store.job_topic(1).manual
+
+    store.update_topic(moved, name="AI 이름")                          # AI 는 사람이 정한 이름을 못 바꾼다
+    assert store.topics()[0].name == "결제"
+    assert cli.main(["rm", "1"]) == 0
+    assert store.topics() == [] and store.job_topics() == {}
+
+
+def test_묶기는_작업_결과를_기록한_뒤에_돈다(env, repo, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_DELAY", "1.5")
+    assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"]) == 0
+    store = _store()
+    _wait((env / "topic.jsonl").is_file)                               # 모델에게 묻기 시작했다 (아직 답은 안 왔다)
+    job, link = store.get_job(1), store.job_topic(1)
+    assert job.status == "succeeded" and job.result and job.finished_at   # 묶기가 도는 중에도 작업은 이미 끝났고 결과도 있다
+    assert link is None                                                # 묶기는 아직 끝나지 않았다 (답을 기다리는 중)
+    _wait(lambda: store.job_topic(1) is not None)
+
+
+def _two_jobs(store, repo):
+    return [store.create_job(prompt=p, repo=str(repo), workdir=str(repo), model=None).id for p in ("주문 취소", "환불")]
+
+
+def test_모델의_답을_기다리는_사이_사람이_옮긴_작업은_답이_와도_되돌리지_않는다(env, repo, monkeypatch):
+    store = _store()
+    first, job = _two_jobs(store, repo)
+    target = store.assign_topic(first, None, name="결제", line="결제 정리")
+    asked = []
+
+    def ask(cfg, question, j):
+        asked.append(j.id)
+        assert _store().assign_topic(job, target, manual=True) == target   # 답을 기다리는 사이 TUI 에서 옮긴다
+        return {"topic": None, "name": "AI 묶음", "summary": "AI 가 쓴 요약", "line": "AI 한 줄"}
+
+    monkeypatch.setattr(topics, "_ask", ask)
+    assert topics.classify(config.load(), store, job) == target
+    assert asked == [job]
+    link = store.job_topic(job)
+    assert (link.topic_id, link.manual, link.line) == (target, True, "AI 한 줄")   # 옮긴 묶음·표시는 그대로, 한 줄만 새로
+    assert [(t.name, t.summary) for t in store.topics()] == [("결제", "")]           # 빈 'AI 묶음'이 남지 않고 요약도 안 덮는다
+
+
+def test_이미_묶인_작업을_답을_기다리는_사이_옮겨도_옛_묶음으로_되돌리지_않는다(env, repo, monkeypatch):
+    store = _store()
+    first, job = _two_jobs(store, repo)
+    third = store.create_job(prompt="환불 버그", repo=str(repo), workdir=str(repo), model=None).id
+    old = store.assign_topic(job, None, name="환불", line="환불 처음")
+    store.assign_topic(third, old)                                     # 옛 묶음에는 다른 작업도 남아 있다
+    target = store.assign_topic(first, None, name="결제")
+
+    def ask(cfg, question, j):
+        assert _store().assign_topic(job, target, manual=True) == target
+        return {"topic": old, "name": "환불", "summary": "환불 요약", "line": "환불 이어서"}
+
+    monkeypatch.setattr(topics, "_ask", ask)
+    assert topics.classify(config.load(), store, job) == target
+    link = store.job_topic(job)
+    assert (link.topic_id, link.manual, link.line) == (target, True, "환불 이어서")
+    assert store.job_topic(third).topic_id == old
+    assert {t.name: t.summary for t in store.topics()} == {"환불": "", "결제": ""}
+
+
+def test_묶기는_시간_초과나_실행_실패면_다시_묻지_않고_답을_못_읽을_때만_한_번_더_묻는다(env, repo, monkeypatch):
+    store = _store()
+    job = store.create_job(prompt="주문 취소", repo=str(repo), workdir=str(repo), model=None)
+    calls = []
+
+    def timeout(*args):
+        calls.append("timeout")
+        raise topics.TopicError("180초 안에 답이 오지 않았습니다")
+
+    with monkeypatch.context() as m:
+        m.setattr(topics, "_answer", timeout)
+        with pytest.raises(topics.TopicError, match="180초"):
+            topics._ask(config.load(), "질문", job)
+    assert calls == ["timeout"]
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "fail")                    # 0 이 아닌 종료 코드
+    with pytest.raises(topics.TopicError, match="topic boom"):
+        topics._ask(config.load(), "질문", job)
+    assert len((env / "topic.jsonl").read_text().splitlines()) == 1
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "JSON 이 아닌 답")           # 답을 읽지 못했을 때만 한 번 더 묻는다
+    with pytest.raises(topics.TopicError, match="JSON 이 없는"):
+        topics._ask(config.load(), "질문", job)
+    assert len((env / "topic.jsonl").read_text().splitlines()) == 3
+
+
+def test_Codex_팀장이면_묶기도_Codex로_하고_env_읽기를_막는다(env, repo, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_TOPIC_ARGS", str(env / "codex-topic.jsonl"))
+    assert cli.main(["model", "lead", "codex:gpt-6.1-sol"]) == 0
+    cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
+    store = _store()
+    _wait(lambda: store.job_topic(1) is not None)
+
+    [call] = [json.loads(line) for line in (env / "codex-topic.jsonl").read_text().splitlines()]
+    argv = call["argv"]
+    assert argv[:2] == ["exec", "--skip-git-repo-check"] and "--ephemeral" in argv
+    assert argv[argv.index("-m") + 1] == "gpt-6.1-sol"
+    profile = " ".join(argv)
+    assert f'{repo.resolve()}/**/.env*"="none"' in profile and '"."="read"' in profile   # 읽기 전용, .env 는 못 읽는다
+    assert store.topics()[0].name == "주문 취소"

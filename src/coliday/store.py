@@ -61,17 +61,36 @@ CREATE TABLE IF NOT EXISTS job_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_job_meta_parent ON job_meta(parent_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo);
-CREATE TABLE IF NOT EXISTS job_groups (
+"""
+
+# 그룹은 프로젝트(projects.json 의 정규화된 경로)에 속한다. 이름은 같은 프로젝트 안에서만 겹치지 않으면 된다.
+# _upgrade_groups 가 이 문장 하나만 다시 실행하므로 다른 표와 섞지 않고 따로 둔다.
+_GROUPS_TABLE = """CREATE TABLE IF NOT EXISTS job_groups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     project    TEXT    NOT NULL,
     name       TEXT    NOT NULL,
     created_at REAL    NOT NULL,
     UNIQUE(project, name)
+)"""
+
+# 자동 묶음: 작업이 끝날 때 팀장 모델이 비슷한 작업끼리 묶는다 (topics.py). 묶음은 레포(job.repo)에 속하고 작업 하나는 묶음 하나.
+_TOPICS_TABLES = """
+CREATE TABLE IF NOT EXISTS topics (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo        TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    summary     TEXT    NOT NULL DEFAULT '',
+    manual_name INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS job_topics (
+    job_id   INTEGER PRIMARY KEY REFERENCES jobs(id),
+    topic_id INTEGER NOT NULL REFERENCES topics(id),
+    manual   INTEGER NOT NULL DEFAULT 0,
+    line     TEXT    NOT NULL DEFAULT ''
 );
 """
 
-# 그룹은 프로젝트(projects.json 의 정규화된 경로)에 속한다. 이름은 같은 프로젝트 안에서만 겹치지 않으면 된다.
-_GROUPS_TABLE = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS job_groups"):]
+_SCHEMA += _TOPICS_TABLES + _GROUPS_TABLE + ";\n"
 
 # 실행 중에 보낸 요청(QUEUED)은 전달될 때 FOLLOW_UP 으로 바뀐다. 둘 다 사용자가 이어서 시킨 것이다.
 _SELECT_JOBS = (
@@ -118,6 +137,25 @@ class Job:
 
 
 @dataclass(frozen=True)
+class Topic:
+    """자동 묶음: 작업이 끝날 때 팀장 모델이 비슷한 작업끼리 묶은 것. 같은 레포(job.repo) 안에서만 묶는다."""
+
+    id: int
+    repo: str
+    name: str
+    summary: str
+    manual_name: bool  # 사람이 이름을 정했다: AI 가 다시 바꾸지 않는다
+
+
+@dataclass(frozen=True)
+class JobTopic:
+    job_id: int
+    topic_id: int
+    manual: bool  # 사람이 이 자동 묶음으로 옮겼다
+    line: str  # 이 작업이 한 일 한 줄 (모델이 쓴다)
+
+
+@dataclass(frozen=True)
 class EventRow:
     id: int
     job_id: int
@@ -125,6 +163,9 @@ class EventRow:
     actor: str
     kind: str
     message: str
+
+
+ANY_TOPIC = object()  # assign_topic(expect=…) 를 주지 않았다: 지금 어느 묶음에 있든 옮긴다
 
 
 class Store:
@@ -162,7 +203,7 @@ class Store:
                 return
             self._conn.execute("UPDATE job_meta SET group_id = NULL")
             self._conn.execute("DROP TABLE job_groups")
-            self._conn.execute(_GROUPS_TABLE.strip().rstrip(";"))
+            self._conn.execute(_GROUPS_TABLE)
 
     def _group_columns(self) -> set[str]:
         return {r["name"] for r in self._conn.execute("PRAGMA table_info(job_groups)")}
@@ -387,6 +428,8 @@ class Store:
                     (job_id, job_id),
                 )
                 self._conn.execute("DELETE FROM job_meta WHERE job_id = ?", (job_id,))
+                self._conn.execute("DELETE FROM job_topics WHERE job_id = ?", (job_id,))
+                self._drop_empty_topics()
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
@@ -507,6 +550,103 @@ class Store:
             self._conn.execute("UPDATE job_meta SET group_id = NULL WHERE group_id = ?", (group_id,))
             cur = self._conn.execute("DELETE FROM job_groups WHERE id = ?", (group_id,))
         return cur.rowcount == 1
+
+    # ── 자동 묶음 (topics.py 가 채운다) ─────────────────────────
+    def topics(self, repo: str | None = None) -> list[Topic]:
+        rows = self._conn.execute(
+            "SELECT * FROM topics WHERE (? IS NULL OR repo = ?) ORDER BY id", (repo, repo)
+        ).fetchall()
+        return [Topic(r["id"], r["repo"], r["name"], r["summary"], bool(r["manual_name"])) for r in rows]
+
+    def job_topics(self) -> dict[int, JobTopic]:
+        """있는 작업의 자동 묶음. 이전 버전이 작업만 지우고 남긴 줄은 빠진다 (job_meta 와 같은 원칙)."""
+        rows = self._conn.execute(
+            "SELECT jt.* FROM job_topics jt JOIN jobs j ON j.id = jt.job_id"
+        ).fetchall()
+        return {r["job_id"]: JobTopic(r["job_id"], r["topic_id"], bool(r["manual"]), r["line"]) for r in rows}
+
+    def job_topic(self, job_id: int) -> JobTopic | None:
+        row = self._conn.execute(
+            "SELECT jt.* FROM job_topics jt JOIN jobs j ON j.id = jt.job_id WHERE jt.job_id = ?", (job_id,)
+        ).fetchone()
+        return JobTopic(row["job_id"], row["topic_id"], bool(row["manual"]), row["line"]) if row else None
+
+    def assign_topic(
+        self, job_id: int, topic_id: int | None, *, name: str = "", line: str | None = None, manual: bool = False,
+        expect: int | None | object = ANY_TOPIC, summary: str | None = None,
+    ) -> int | None:
+        """작업을 자동 묶음에 넣는다. topic_id 가 None 이면 name 으로 새 묶음을 만든다. 넣은 묶음의 id (작업·묶음이 없으면 None).
+
+        묶음 만들기와 넣기, 비게 된 묶음 지우기를 한 트랜잭션으로 묶는다 (그사이 작업이 삭제돼 빈 묶음만 남지 않게).
+        다른 레포의 묶음에는 넣지 않는다. line 을 주지 않으면 이전 한 줄 요약을 그대로 둔다. summary 를 주면 넣은 묶음의 요약도 바꾼다.
+
+        expect 는 모델에게 묻기 전에 읽어 둔 이 작업의 묶음 id 다 (아직 안 묶였으면 None). 모델의 답을 기다리는 사이 사람이
+        작업을 다른 묶음으로 옮겼으면(지금 묶음이 expect 와 다르면) 묶음과 사람이 옮겼다는 표시는 건드리지 않고 line 만 고친 뒤
+        지금 든 묶음의 id 를 돌려준다. 새 묶음도 만들지 않고 summary 도 쓰지 않는다 (다른 묶음을 두고 쓴 요약이다).
+        expect 를 주면 사람이 옮겼다는 표시(manual)는 지우지 않는다.
+        """
+        with self._transaction():
+            job = self._conn.execute("SELECT repo FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                return None
+            if expect is not ANY_TOPIC:
+                row = self._conn.execute(
+                    "SELECT topic_id, manual FROM job_topics WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if (row["topic_id"] if row else None) != expect:
+                    if row is None:
+                        return None
+                    if line is not None:
+                        self._conn.execute("UPDATE job_topics SET line = ? WHERE job_id = ?", (line, job_id))
+                    return int(row["topic_id"])
+                manual = manual or bool(row and row["manual"])
+            if topic_id is None:
+                cur = self._conn.execute(
+                    "INSERT INTO topics(repo, name, manual_name) VALUES (?, ?, ?)", (job["repo"], name, int(manual))
+                )
+                topic_id = int(cur.lastrowid)
+            elif not self._conn.execute(
+                "SELECT 1 FROM topics WHERE id = ? AND repo = ?", (topic_id, job["repo"])
+            ).fetchone():
+                return None  # 없어졌거나 다른 레포의 묶음
+            self._conn.execute(
+                "INSERT INTO job_topics(job_id, topic_id, manual, line) VALUES (?, ?, ?, COALESCE(?, '')) "
+                "ON CONFLICT(job_id) DO UPDATE SET topic_id = excluded.topic_id, manual = excluded.manual, "
+                "line = COALESCE(?, line)",
+                (job_id, topic_id, int(manual), line, line),
+            )
+            if summary is not None:
+                self._conn.execute("UPDATE topics SET summary = ? WHERE id = ?", (summary, topic_id))
+            self._drop_empty_topics()
+        return topic_id
+
+    def update_topic(
+        self, topic_id: int, *, name: str | None = None, summary: str | None = None, manual_name: bool = False,
+    ) -> None:
+        """자동 묶음의 이름·요약을 바꾼다. 사람이 정한 이름은 manual_name 으로 바꿀 때만 바뀐다."""
+        if summary is not None:
+            self._conn.execute("UPDATE topics SET summary = ? WHERE id = ?", (summary, topic_id))
+        if name and manual_name:
+            self._conn.execute("UPDATE topics SET name = ?, manual_name = 1 WHERE id = ?", (name, topic_id))
+        elif name:
+            self._conn.execute("UPDATE topics SET name = ? WHERE id = ? AND manual_name = 0", (name, topic_id))
+
+    def _drop_empty_topics(self) -> None:
+        # 이전 버전이 작업만 지우고 남긴 줄도 함께 치운다 (트랜잭션 안에서 부른다).
+        self._conn.execute("DELETE FROM job_topics WHERE job_id NOT IN (SELECT id FROM jobs)")
+        self._conn.execute("DELETE FROM topics WHERE id NOT IN (SELECT topic_id FROM job_topics)")
+
+    def get_jobs(self, job_ids: Collection[int]) -> dict[int, Job]:
+        """여러 작업을 한 번에 읽는다 (없는 번호는 빠진다)."""
+        ids = list(dict.fromkeys(job_ids))
+        found: dict[int, Job] = {}
+        for start in range(0, len(ids), 500):  # SQLite 의 변수 개수 한도 안에서 나눠 읽는다
+            chunk = ids[start:start + 500]
+            rows = self._conn.execute(
+                f"{_SELECT_JOBS} WHERE j.id IN ({', '.join('?' * len(chunk))})", chunk
+            ).fetchall()
+            found.update({r["id"]: Job(**dict(r)) for r in rows})
+        return found
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
