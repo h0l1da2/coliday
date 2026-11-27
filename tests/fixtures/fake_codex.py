@@ -16,7 +16,8 @@ if "--ephemeral" in sys.argv:
         with open(os.environ["FAKE_CODEX_TOPIC_ARGS"], "a") as f:
             f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
     Path(sys.argv[sys.argv.index("-o") + 1]).write_text(
-        os.environ.get("FAKE_CODEX_TOPIC", '{"topic": null, "name": "주문 취소", "summary": "요약", "line": "한 줄"}')
+        os.environ.get("FAKE_CODEX_TOPIC", '{"turns": [{"turn": 1, "bundle": null, "name": "주문 취소", "line": "한 줄"}], '
+                       '"summaries": [{"bundle": null, "name": "주문 취소", "summary": "요약"}]}')
     )
     sys.exit(0)
 record = os.environ.get("FAKE_CODEX_ARGS")

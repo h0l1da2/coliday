@@ -12,7 +12,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import config, gitops, jobs, members, projects, remote, team, topics, worker
+from coliday import config, gitops, jobs, members, projects, remote, team, topics, turns, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
@@ -135,8 +135,16 @@ def _parser() -> argparse.ArgumentParser:
     envp.add_argument("action", nargs="?", choices=["allow", "deny"], help="생략하면 지금 상태 보기")
     envp.set_defaults(func=_cmd_env)
 
-    tp = sub.add_parser("topics", help="자동 묶음(모델이 비슷한 작업끼리 묶은 것) 보기 (--sort: 아직 묶이지 않은 끝난 작업을 지금 묶기)")
-    tp.add_argument("--sort", action="store_true", help="자동 묶음이 없는 끝난 작업을 팀장 모델로 차례로 묶는다")
+    tp = sub.add_parser(
+        "topics", help="자동 묶음(모델이 채팅의 차례를 일 단위로 묶은 것) 보기 (--sort: 아직 안 묶인 끝난 차례를 지금 묶기)",
+    )
+    tp.add_argument(
+        "--sort", action="store_true",
+        help="안 묶인 끝난 차례(옛 채팅 단위로 묶인 차례 포함)를 팀장 모델로 묶는다",
+    )
+    tp.add_argument("--max-calls", type=int, default=60, metavar="N", help="--sort 의 모델 호출 상한 (기본 60, 남은 것은 다음 실행)")
+    tp.add_argument("--all", action="store_true", help="묶음의 모든 차례를 보여 준다 (기본은 묶음당 최근 5차례)")
+    tp.add_argument("--full", action="store_true", help="요청 전문을 보여 준다 (기본은 한 줄)")
     tp.set_defaults(func=_cmd_topics)
 
     cancel = sub.add_parser("cancel", help="실행 중인 작업 취소")
@@ -368,28 +376,70 @@ def _cmd_ls(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
 
 
 def _cmd_topics(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:
-    if args.sort:
-        failed = 0
-        for job_id in topics.pending(store):
-            try:
-                topics.classify(cfg, store, job_id, only_new=True)
-            except topics.TopicError as exc:
-                failed += 1
-                print(f"작업 #{job_id} 을(를) 묶지 못했습니다: {exc}", file=sys.stderr)
-        if failed:
-            return 1
+    if args.sort and _sort_topics(cfg, store, args.max_calls):
+        return 1
     rows = store.list_jobs(100)
     if not rows:
         print("아직 작업이 없습니다.")
         return 0
-    lines = {job_id: link.line for job_id, link in store.job_topics().items()}
-    for topic, members_ in topics.grouped(store, rows):
-        print(f"■ {topic.name if topic else topics.UNSORTED}  ({remote.name(topic.repo) if topic else '-'}, {len(members_)}개)")
-        if topic and topic.summary:
-            print(f"  {topic.summary}")
-        for j in members_:
-            print(f"  {STATUS_ICON.get(j.status, '?')} #{j.id:<4} {jobs.one_line(lines.get(j.id) or j.prompt, 70)}")
+    store.sync_legacy()
+    view = topics.cli_bundles(store, rows, per_bundle=None if args.all else 5)
+    for item in view.bundles:
+        chats = " ".join(f"#{i}" for i in item.job_ids)
+        print(f"■ {item.bundle.name}  ({remote.name(item.bundle.repo)} · 차례 {item.turn_count} · 채팅 {chats})")
+        if item.bundle.summary:
+            print(f"  요약: {item.bundle.summary}")
+        for turn in item.turns:
+            _print_turn(turn, full=args.full)
+        if item.hidden:
+            print(f"  … 이전 차례 {item.hidden}개 (--all 로 모두)")
+    if view.loose:
+        print(f"◌ {topics.UNSORTED} (차례 {len(view.loose)})")
+        for turn in view.loose:
+            _print_turn(turn, full=args.full)
     return 0
+
+
+def _sort_topics(cfg: config.Config, store: Store, max_calls: int) -> int:
+    """안 묶인 차례를 묶는다. 묶지 못한 채팅 수 (이유는 stderr)."""
+    failed: set[int] = set()
+    budget = topics.CallBudget(max_calls)
+    for item in topics.pending(store):
+        if not budget.available:
+            break
+        try:
+            topics.classify_job(cfg, store, item.job_id, legacy=True, max_calls=budget)
+        except topics.TopicError as exc:
+            failed.add(item.job_id)
+            which = ", ".join(map(str, exc.turns)) or "?"
+            print(f"채팅 #{item.job_id} 차례 {which} 을(를) 묶지 못했습니다: {exc}", file=sys.stderr)
+    if not budget.available:
+        # 실패한 채팅은 위에서 실패 사유와 차례 번호를 이미 알렸다.
+        remaining = [item for item in topics.pending(store) if item.job_id not in failed]
+        if remaining:
+            remaining_turns = sum(item.turns for item in remaining)
+            print(
+                f"모델 호출 상한({max_calls}번)에 닿아 차례 {remaining_turns}개가 남아 "
+                f"채팅 {len(remaining)}개는 다음에 묶습니다 (--max-calls 로 늘릴 수 있습니다)."
+            )
+    return len(failed)
+
+
+def _print_turn(view: topics.TurnView, *, full: bool) -> None:
+    turn = view.turn
+    when = time.strftime("%m-%d %H:%M", time.localtime(turn.asked_at))
+    state = f"  ({topics.STATE_WORD.get(turn.state, turn.state)})" if turn.active else ""
+    head = f"  ▌나 #{turn.job_id}-{turn.index}  {when}"
+    if full:
+        print(head + state)
+        for line in turn.question.splitlines() or [""]:
+            print(f"  ▌{line}")
+    else:
+        print(f"{head}  {turns.clip(turn.question, 70)}{state}")
+    if turn.active:
+        return
+    did = (view.link.line if view.link else "") or turns.clip(turn.report, 70) or "보고가 남지 않은 옛 차례"
+    print(f"      ◆ AI {topics.STATE_MARK.get(turn.state, '?')}  {did}")
 
 
 def _cmd_show(cfg: config.Config, store: Store, args: argparse.Namespace) -> int:

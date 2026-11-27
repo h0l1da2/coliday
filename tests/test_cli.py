@@ -1595,50 +1595,80 @@ def test_rm은_하위_작업을_어디로_옮겼는지_알린다(env, tmp_path, 
     assert "하위 작업" not in capsys.readouterr().out
 
 
-# ── 자동 묶음: 비슷한 작업끼리 묶기 (topics) ─────────────────────────────────────
-def _topic_answer(monkeypatch, **answer):
-    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", json.dumps(answer, ensure_ascii=False))
+# ── 자동 묶음: 채팅의 차례를 일 단위로 묶기 (topics) ─────────────────────────────────────
+def _answer(monkeypatch, *items, summaries=None, var="FAKE_CLAUDE_TOPIC"):
+    """모델의 답. items 는 (차례 번호, 기존 묶음 번호 또는 None, 새 묶음 이름, 한 줄)."""
+    turns_ = [{"turn": n, "bundle": b, "name": name, "line": line} for n, b, name, line in items]
+    if summaries is None:
+        summaries = [{"bundle": b, "name": name, "summary": f"{name or b} 요약"} for _, b, name, _ in items]
+    monkeypatch.setenv(var, json.dumps({"turns": turns_, "summaries": summaries}, ensure_ascii=False))
 
 
-def test_작업이_끝나면_팀장_모델로_묶음을_만들고_도구_없이_한_번만_묻는다(env, repo, monkeypatch):
+def _old_topic(store, job_id, name="", topic_id=None, line=""):
+    """옛 버전(채팅 단위 자동 묶음)이 쓰던 대로 topics·job_topics 에 쓴다 (이 버전에는 이 표에 쓰는 코드가 없다)."""
+    if topic_id is None:
+        topic_id = store._conn.execute(
+            "INSERT INTO topics(repo, name) VALUES ((SELECT repo FROM jobs WHERE id = ?), ?)", (job_id, name)
+        ).lastrowid
+    store._conn.execute("INSERT OR REPLACE INTO job_topics(job_id, topic_id, manual, line) VALUES (?, ?, 0, ?)",
+                        (job_id, topic_id, line))
+    return topic_id
+
+
+def _old_names(store):
+    return [r[0] for r in store._conn.execute("SELECT name FROM topics ORDER BY id")]
+
+
+def _link(store, job_id, turn_id=0):
+    return store.turn_links([job_id]).get((job_id, turn_id))
+
+
+def _asked(env, index=-1):
+    return json.loads((env / "topic.jsonl").read_text().splitlines()[index])["stdin"]
+
+
+def test_작업이_끝나면_차례_하나를_팀장_모델로_묶고_도구_없이_한_번만_묻는다(env, repo, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
     assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo)]) == 0
     store = _store()
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
-    [topic] = store.topics()
-    assert (topic.name, topic.summary, topic.repo) == ("주문 취소", "주문 취소 API 를 만들었다.", str(repo))
-    assert store.job_topic(1).line == "취소 API 추가" and not store.job_topic(1).manual
+    [bundle] = store.bundles()
+    assert (bundle.name, bundle.summary, bundle.repo) == ("주문 취소", "주문 취소 API 를 만들었다.", str(repo))
+    link = _link(store, 1)
+    assert (link.bundle_id, link.line, link.source, link.manual) == (bundle.id, "취소 API 추가", "model", False)
+    assert _old_names(store) == [] and store._conn.execute("SELECT COUNT(*) FROM job_topics").fetchone()[0] == 0   # 옛 표에는 쓰지 않는다
     [call] = [json.loads(line) for line in (env / "topic.jsonl").read_text().splitlines()]
     argv = call["argv"]
     assert argv[argv.index("--tools") + 1] == "" and "--no-session-persistence" in argv   # 파일을 읽거나 명령을 실행하지 않는다
     assert argv[argv.index("--model") + 1] == store.get_job(1).model                        # 팀장이 쓴 모델
     assert Path(call["cwd"]).resolve() == (config.load().home / "topics").resolve()         # 프로젝트 밖에서 실행한다
+    assert "[1] 채팅 #1 · 1번째 요청" in call["stdin"] and "[2]" not in call["stdin"]
     assert "주문 취소 API 추가" in call["stdin"] and "최종 보고: 완료" in call["stdin"]
-    assert "(없음: 새 묶음을 만든다)" in call["stdin"]
+    assert "(없음: 새 묶음을 만든다)" in call["stdin"] and "이전 차례 —" not in call["stdin"]
     assert json.loads((env / "args.json").read_text())["stdin"] == "주문 취소 API 추가"      # 팀장 실행 기록은 그대로다
 
 
-def test_기존_묶음을_고르면_거기에_넣고_요약을_고쳐_쓰며_없는_번호면_새로_만든다(env, repo, monkeypatch):
+def test_기존_묶음을_고르면_거기에_넣고_요약만_고쳐_쓰며_없는_번호면_새로_만든다(env, repo, monkeypatch):
     cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
     store = _store()
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
     monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
-    _topic_answer(monkeypatch, topic=1, name="다른 이름", summary="취소 API 와 환불을 만들었다.", line="환불 추가")
+    _answer(monkeypatch, (1, 1, "다른 이름", "환불 추가"), summaries=[{"bundle": 1, "summary": "취소 API 와 환불을 만들었다."}])
     cli.main(["run", "환불 처리", "-C", str(repo), "--no-worktree"])
-    _wait(lambda: store.job_topic(2) is not None)
-    [topic] = store.topics()
-    assert (topic.name, topic.summary) == ("주문 취소", "취소 API 와 환불을 만들었다.")   # 이름은 처음 정한 그대로
-    assert store.job_topic(2).topic_id == 1
-    asked = json.loads((env / "topic.jsonl").read_text().splitlines()[-1])["stdin"]
-    assert '"topic": 1' in asked and "주문 취소 API 를 만들었다." in asked                 # 기존 묶음을 보여 주고 고르게 한다
+    _wait(lambda: _link(store, 2) is not None)
+    [bundle] = store.bundles()
+    assert (bundle.name, bundle.summary) == ("주문 취소", "취소 API 와 환불을 만들었다.")   # 이름은 처음 정한 그대로
+    assert _link(store, 2).bundle_id == 1 and _link(store, 2).line == "환불 추가"
+    asked = _asked(env)
+    assert '"bundle": 1,' in asked and "주문 취소 API 를 만들었다." in asked                 # 기존 묶음을 보여 주고 고르게 한다
 
-    _topic_answer(monkeypatch, topic=99, name="로그인", summary="로그인을 고쳤다.", line="로그인 수정")
+    _answer(monkeypatch, (1, 99, "로그인", "로그인 수정"))
     cli.main(["run", "로그인 버그", "-C", str(repo), "--no-worktree"])
-    _wait(lambda: store.job_topic(3) is not None)
-    assert [t.name for t in store.topics()] == ["주문 취소", "로그인"]
-    assert store.job_topic(3).topic_id == 2
+    _wait(lambda: _link(store, 3) is not None)
+    assert [b.name for b in store.bundles()] == ["주문 취소", "로그인"]
+    assert _link(store, 3).bundle_id == 2 and store.bundles()[1].summary == "로그인 요약"
 
 
 def test_다른_프로젝트의_묶음은_보여_주지도_않고_넣지도_않는다(env, repo, tmp_path, monkeypatch):
@@ -1646,68 +1676,210 @@ def test_다른_프로젝트의_묶음은_보여_주지도_않고_넣지도_않�
     other.mkdir()
     cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
     store = _store()
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
     monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
-    _topic_answer(monkeypatch, topic=1, name="배포 설정", summary="배포를 고쳤다.", line="배포 수정")
+    _answer(monkeypatch, (1, 1, "배포 설정", "배포 수정"))
     cli.main(["run", "배포 설정", "-C", str(other), "--no-worktree"])
-    _wait(lambda: store.job_topic(2) is not None)
+    _wait(lambda: _link(store, 2) is not None)
 
-    asked = json.loads((env / "topic.jsonl").read_text().splitlines()[-1])["stdin"]
-    assert '"topic": 1' not in asked and "(없음: 새 묶음을 만든다)" in asked
-    assert store.job_topic(2).topic_id == 2 and [t.repo for t in store.topics()] == [str(repo), str(other)]
-    assert store.assign_topic(2, 1, manual=True) is None            # 손으로도 다른 프로젝트의 묶음에는 못 넣는다
-    assert store.job_topic(2).topic_id == 2
+    asked = _asked(env)
+    assert '"bundle": 1,' not in asked and "(없음: 새 묶음을 만든다)" in asked
+    assert _link(store, 2).bundle_id == 2 and [b.repo for b in store.bundles()] == [str(repo), str(other)]
+    assert store.move_turns(2, [0], 1) is None                       # 손으로도 다른 프로젝트의 묶음에는 못 넣는다
+    assert _link(store, 2).bundle_id == 2
 
 
-def test_묶기가_실패해도_작업은_성공이고_나중에_다시_묶을_수_있다(env, repo, monkeypatch, capsys):
+def test_이어서_시키면_새_차례만_묻고_앞_차례는_참고로_주며_다른_일이면_다른_묶음이_된다(env, repo, monkeypatch):
+    cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
+    store = _store()
+    _wait(lambda: _link(store, 1) is not None)
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _answer(monkeypatch, (1, None, "로그인 버그 수정", "로그인 고침"))
+    assert cli.main(["continue", "1", "그리고 로그인 버그도 고쳐줘"]) == 0
+    turn = store.last_follow_up(1).id
+    _wait(lambda: _link(store, 1, turn) is not None)
+
+    asked = _asked(env)
+    assert "[1] 채팅 #1 · 2번째 요청" in asked and "[2]" not in asked                          # 새 차례만 묻는다
+    new_part, context = asked.split("# (참고) 이전 차례")
+    assert "그리고 로그인 버그도 고쳐줘" in new_part and "주문 취소 API 추가" not in new_part
+    assert '1번째 요청 → 묶음 1 "주문 취소"' in context and "취소 API 추가" in context          # 앞 차례는 참고로만
+    assert {b.name: b.id for b in store.bundles()} == {"주문 취소": 1, "로그인 버그 수정": 2}
+    assert (_link(store, 1).bundle_id, _link(store, 1, turn).bundle_id) == (1, 2)             # 한 채팅이 두 묶음에 걸친다
+    assert store.bundle(1).summary == "주문 취소 API 를 만들었다."                            # 묻지 않은 묶음의 요약은 그대로
+
+
+def test_대기_요청으로_한_실행에_차례가_둘_생기면_한_번에_둘_다_묻는다(env, repo, monkeypatch):
+    store = _store()
+    job = store.create_job(prompt="주문 취소 API 추가", repo=str(repo), workdir=str(repo), model=None)
+    assert store.queue_message(job.id, "환불도 같이 해줘")                     # 실행 중에 보낸 요청
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _answer(monkeypatch, (1, None, "주문 취소 API", "취소 추가"), (2, None, "주문 취소 API", "환불 추가"))
+
+    assert worker.run_job(config.load(), store, job.id) == 0
+    [asked] = [json.loads(line)["stdin"] for line in (env / "topic.jsonl").read_text().splitlines()]
+    assert "[1] 채팅 #1 · 1번째 요청" in asked and "[2] 채팅 #1 · 2번째 요청" in asked and "환불도 같이 해줘" in asked
+    turn = store.last_follow_up(job.id).id
+    [bundle] = store.bundles()                                                   # 같은 답 안의 같은 이름은 묶음 하나
+    assert {k: (v.bundle_id, v.line) for k, v in store.turn_links().items()} == {
+        (job.id, 0): (bundle.id, "취소 추가"), (job.id, turn): (bundle.id, "환불 추가"),
+    }
+
+
+def test_묶기가_실패해도_작업은_성공이고_나중에_topics_sort로_다시_묶는다(env, repo, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "fail")
     assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"]) == 0
     store = _store()
     log = config.load().job_dir(1) / "topic.log"
     _wait(log.is_file)
-    assert store.get_job(1).status == "succeeded" and store.job_topic(1) is None
-    assert "topic boom" in log.read_text()
+    assert store.get_job(1).status == "succeeded" and _link(store, 1) is None
+    assert "topic boom" in log.read_text() and "주문 취소 API 추가" not in log.read_text()   # 요청 원문은 남기지 않는다
     assert not [e for e in store.events(1) if "묶" in e.message]      # 타임라인에는 남기지 않는다
 
     capsys.readouterr()
     assert cli.main(["topics", "--sort"]) == 1                        # 아직 실패한다: 이유를 알린다
-    assert "작업 #1 을(를) 묶지 못했습니다" in capsys.readouterr().err
+    assert "채팅 #1 차례 1 을(를) 묶지 못했습니다" in capsys.readouterr().err
 
-    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", "설명을 붙인 답\n```json\n{\"topic\": null, \"name\": \"주문 취소\", \"summary\": \"요약\", \"line\": \"한 줄\"}\n```")
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", '설명을 붙인 답\n```json\n{"turns": [{"turn": 1, "bundle": null, "name": "주문 취소", '
+                       '"line": "한 줄"}], "summaries": [{"bundle": null, "name": "주문 취소", "summary": "요약"}]}\n```')
     assert cli.main(["topics", "--sort"]) == 0
     out = capsys.readouterr().out
-    assert store.job_topic(1).topic_id == 1                           # 설명이나 코드 울타리가 붙어 와도 읽는다
-    assert "■ 자동 묶음 없음  (-, 1개)" in out and "#1    한 줄" in out   # 하나뿐인 묶음은 묶음으로 보여 주지 않는다
+    assert _link(store, 1).bundle_id == 1                             # 설명이나 코드 울타리가 붙어 와도 읽는다
+    assert "■ 주문 취소  (myrepo · 차례 1 · 채팅 #1)" in out             # 혼자여도 묶음이다
+    assert "  요약: 요약" in out and "  ▌나 #1-1  " in out and "주문 취소 API 추가" in out
+    assert "      ◆ AI ✓  한 줄" in out and "◌" not in out
 
-    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", '{"topic": 1, "name": "x", "summary": "둘을 했다.", "line": "둘째"}')
+    _answer(monkeypatch, (1, 1, "", "둘째"))
     cli.main(["run", "주문 취소 버그", "-C", str(repo), "--no-worktree"])
-    _wait(lambda: store.job_topic(2) is not None)
+    _wait(lambda: _link(store, 2) is not None)
     capsys.readouterr()
     assert cli.main(["topics"]) == 0
-    assert "■ 주문 취소  (myrepo, 2개)" in capsys.readouterr().out          # 둘이 모이면 묶음이 된다
+    out = capsys.readouterr().out
+    assert "■ 주문 취소  (myrepo · 차례 2 · 채팅 #2 #1)" in out
+    assert out.index("#2-1") < out.index("#1-1")                       # 최근 차례부터
 
 
-def test_사람이_옮긴_작업과_정한_이름은_다시_묶어도_바뀌지_않고_빈_묶음은_사라진다(env, repo, monkeypatch):
+def test_topics_sort는_옛_채팅_단위_묶음을_차례로_나누고_호출_상한을_지킨다(env, repo, monkeypatch, capsys):
+    store = _store()
+    chats = []
+    for prompt in ("주문 취소 API", "결제 화면"):
+        job = store.create_job(prompt=prompt, repo=str(repo), workdir=str(repo), model=None).id
+        store.add_event(job, "팀장", "result", f"{prompt} 완료")
+        store.finish_job(job, "succeeded")
+        assert store.requeue_job(job, f"{prompt} 와 상관없는 로그 정리")
+        store.add_event(job, "팀장", "result", "로그 정리 완료")
+        store.finish_job(job, "succeeded")
+        chats.append((job, store.last_follow_up(job).id))
+    old = _old_topic(store, chats[0][0], "옛 묶음", line="옛 한 줄")       # 옛 버전이 채팅 통째로 묶었다
+    _old_topic(store, chats[1][0], topic_id=old)
+    assert [(p.job_id, p.turns, p.calls) for p in topics.pending(store)] == [(chats[0][0], 2, 1), (chats[1][0], 2, 1)]
+    legacy = _link(store, chats[0][0])
+    assert legacy.source == "legacy"
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _answer(monkeypatch, (1, legacy.bundle_id, "", "취소 API 만듦"), (2, None, "로그 정리", "로그 정리함"))
+    capsys.readouterr()
+    assert cli.main(["topics", "--sort", "--max-calls", "1"]) == 0
+    out = capsys.readouterr().out
+    assert len((env / "topic.jsonl").read_text().splitlines()) == 1
+    assert "차례 2개가 남아 채팅 1개는 다음에 묶습니다" in out
+    asked = _asked(env)
+    assert f'"bundle": {legacy.bundle_id},' in asked and "[2] 채팅 #1 · 2번째 요청" in asked   # 옛 묶음도 후보로 준다
+    first, second = chats[0]
+    assert (_link(store, first, 0).source, _link(store, first, 0).bundle_id) == ("model", legacy.bundle_id)
+    assert store.bundle(_link(store, first, second).bundle_id).name == "로그 정리"
+    assert [p.job_id for p in topics.pending(store)] == [chats[1][0]]
+
+    _answer(monkeypatch, (1, None, "결제 화면", "결제 화면 만듦"), (2, _link(store, first, second).bundle_id, "", "로그 정리함"))
+    assert cli.main(["topics", "--sort"]) == 0
+    assert topics.pending(store) == []
+    names = {b.name for b in store.bundles()}
+    assert names == {"옛 묶음", "로그 정리", "결제 화면"}                        # 옛 묶음에는 #1 의 첫 차례가 남았다
+    assert store.bundle_counts()[_link(store, first, second).bundle_id] == (2, 2)   # 두 채팅의 같은 일이 모였다
+    assert _old_names(store) == ["옛 묶음"]                                       # 옛 표는 그대로다
+
+
+@pytest.mark.parametrize("turn_count", [8, 10])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_topics_sort는_호출_상한에_닿은_채팅의_남은_차례를_알린다(env, monkeypatch, capsys, turn_count, legacy):
+    store = _store()
+    job_id = store.create_job(prompt="첫 요청", repo=str(env), workdir=str(env), model=None).id
+    store.finish_job(job_id, "succeeded")
+    for n in range(2, turn_count + 1):
+        assert store.requeue_job(job_id, f"후속 요청 {n}")
+        store.finish_job(job_id, "succeeded")
+    if legacy:
+        _old_topic(store, job_id, "옛 묶음")
+
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _answer(monkeypatch, *((n, None, "새 묶음", f"요약 {n}") for n in range(1, 9)))
+    assert cli.main(["topics", "--sort", "--max-calls", "1"]) == 0
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert len((env / "topic.jsonl").read_text().splitlines()) == 1
+    assert sum(link.source == "model" for link in store.turn_links([job_id]).values()) == 8
+
+    if turn_count == 8:
+        assert "다음에 묶습니다" not in out and topics.pending(store) == []
+    else:
+        assert "차례 2개가 남아 채팅 1개는 다음에 묶습니다" in out
+        last = _link(store, job_id, store.last_follow_up(job_id).id)
+        assert (last.source if last else None) == ("legacy" if legacy else None)
+        assert topics.pending(store) == [topics.PendingJob(job_id, 2, 1)]
+        _answer(monkeypatch, (1, None, "후속 묶음", "요약 9"), (2, None, "후속 묶음", "요약 10"))
+        assert cli.main(["topics", "--sort", "--max-calls", "1"]) == 0
+        assert "다음에 묶습니다" not in capsys.readouterr().out
+        assert topics.pending(store) == []
+    store.close()
+
+
+def test_topics는_묶음당_최근_5차례만_보이고_all이면_모두(env, repo, capsys):
+    store = _store()
+    job = store.create_job(prompt="첫 요청", repo=str(repo), workdir=str(repo), model=None).id
+    store.finish_job(job, "succeeded")
+    for n in range(2, 7):
+        assert store.requeue_job(job, f"{n}번째 요청\n둘째 줄")
+        store.add_event(job, "팀장", "result", f"{n}번째 보고")
+        store.finish_job(job, "succeeded")
+    found = [t for t in store.turn_links([job])]
+    assert found == []
+    ids = [0, *(e.id for e in store.events(job) if e.kind == "prompt")]
+    bundle = store.move_turns(job, ids, None, "긴 일")
+    capsys.readouterr()
+    assert cli.main(["topics"]) == 0
+    out = capsys.readouterr().out
+    assert "■ 긴 일  (myrepo · 차례 6 · 채팅 #1)" in out and "#1-6" in out and "#1-1 " not in out
+    assert "  … 이전 차례 1개 (--all 로 모두)" in out and "6번째 요청 둘째 줄" in out
+    assert "      ◆ AI ✓  6번째 보고" in out
+    assert cli.main(["topics", "--all", "--full"]) == 0
+    out = capsys.readouterr().out
+    assert "#1-1 " in out and "이전 차례" not in out and "  ▌둘째 줄" in out
+    assert "◆ AI ?  보고가 남지 않은 옛 차례" in out and bundle == store.bundles()[0].id
+
+
+def test_사람이_옮긴_차례와_정한_이름은_다시_묶어도_바뀌지_않고_빈_묶음은_사라진다(env, repo, monkeypatch):
     cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
     store = _store()
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
-    moved = store.assign_topic(1, None, name="결제", manual=True)     # 새 묶음으로 옮긴다
-    assert [t.name for t in store.topics()] == ["결제"]                # 비게 된 '주문 취소'는 지워진다
-    assert store.job_topic(1).line == "취소 API 추가"                  # 한 줄 요약은 그대로
+    moved = store.move_turns(1, [0], None, "결제")                   # 새 묶음으로 옮긴다
+    assert [b.name for b in store.bundles()] == ["결제"]               # 비게 된 '주문 취소'는 지워진다
+    assert _link(store, 1).line == "취소 API 추가" and _link(store, 1).manual   # 한 줄 요약은 그대로
 
-    _topic_answer(monkeypatch, topic=None, name="AI 가 붙인 이름", summary="이어서 한 일까지.", line="이어서 함")
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC_ARGS", str(env / "topic.jsonl"))
+    _answer(monkeypatch, (1, moved, "AI 이름", "이어서 함"), summaries=[{"bundle": moved, "summary": "이어서 한 일까지."}])
     cli.main(["continue", "1", "테스트도 추가"])
-    _wait(lambda: store.job_topic(1).line == "이어서 함")
-    [topic] = store.topics()
-    assert topic.id == moved and topic.name == "결제" and topic.summary == "이어서 한 일까지."
-    assert store.job_topic(1).manual
+    turn = store.last_follow_up(1).id
+    _wait(lambda: _link(store, 1, turn) is not None)
+    assert "[1] 채팅 #1 · 2번째 요청" in _asked(env)                    # 사람이 옮긴 차례는 다시 묻지 않는다
+    [bundle] = store.bundles()
+    assert (bundle.id, bundle.name, bundle.summary) == (moved, "결제", "이어서 한 일까지.")   # 이름은 그대로, 요약만
+    assert _link(store, 1).manual and _link(store, 1, turn).line == "이어서 함"
 
-    store.update_topic(moved, name="AI 이름")                          # AI 는 사람이 정한 이름을 못 바꾼다
-    assert store.topics()[0].name == "결제"
     assert cli.main(["rm", "1"]) == 0
-    assert store.topics() == [] and store.job_topics() == {}
+    assert store.bundles() == [] and store.turn_links() == {}
 
 
 def test_묶기는_작업_결과를_기록한_뒤에_돈다(env, repo, monkeypatch):
@@ -1716,53 +1888,183 @@ def test_묶기는_작업_결과를_기록한_뒤에_돈다(env, repo, monkeypat
     assert cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"]) == 0
     store = _store()
     _wait((env / "topic.jsonl").is_file)                               # 모델에게 묻기 시작했다 (아직 답은 안 왔다)
-    job, link = store.get_job(1), store.job_topic(1)
+    job, link = store.get_job(1), _link(store, 1)
     assert job.status == "succeeded" and job.result and job.finished_at   # 묶기가 도는 중에도 작업은 이미 끝났고 결과도 있다
     assert link is None                                                # 묶기는 아직 끝나지 않았다 (답을 기다리는 중)
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
 
 def _two_jobs(store, repo):
-    return [store.create_job(prompt=p, repo=str(repo), workdir=str(repo), model=None).id for p in ("주문 취소", "환불")]
+    ids = [store.create_job(prompt=p, repo=str(repo), workdir=str(repo), model=None).id for p in ("주문 취소", "환불")]
+    for job in ids:
+        store.finish_job(job, "succeeded")
+    return ids
 
 
-def test_모델의_답을_기다리는_사이_사람이_옮긴_작업은_답이_와도_되돌리지_않는다(env, repo, monkeypatch):
+def test_모델의_답을_기다리는_사이_사람이_옮긴_차례는_답이_와도_되돌리지_않는다(env, repo, monkeypatch):
     store = _store()
     first, job = _two_jobs(store, repo)
-    target = store.assign_topic(first, None, name="결제", line="결제 정리")
+    target = store.move_turns(first, [0], None, "결제")
     asked = []
 
-    def ask(cfg, question, j):
+    def ask(cfg, question, j, *, budget):
         asked.append(j.id)
-        assert _store().assign_topic(job, target, manual=True) == target   # 답을 기다리는 사이 TUI 에서 옮긴다
-        return {"topic": None, "name": "AI 묶음", "summary": "AI 가 쓴 요약", "line": "AI 한 줄"}
+        assert _store().move_turns(job, [0], target) == target          # 답을 기다리는 사이 TUI 에서 옮긴다
+        return {"turns": [{"turn": 1, "bundle": None, "name": "AI 묶음", "line": "AI 한 줄"}],
+                "summaries": [{"bundle": None, "name": "AI 묶음", "summary": "AI 가 쓴 요약"}]}
 
     monkeypatch.setattr(topics, "_ask", ask)
-    assert topics.classify(config.load(), store, job) == target
+    assert topics.classify_job(config.load(), store, job) == {0: target}
     assert asked == [job]
-    link = store.job_topic(job)
-    assert (link.topic_id, link.manual, link.line) == (target, True, "AI 한 줄")   # 옮긴 묶음·표시는 그대로, 한 줄만 새로
-    assert [(t.name, t.summary) for t in store.topics()] == [("결제", "")]           # 빈 'AI 묶음'이 남지 않고 요약도 안 덮는다
+    link = _link(store, job)
+    assert (link.bundle_id, link.manual, link.line) == (target, True, "AI 한 줄")   # 옮긴 묶음·표시는 그대로, 한 줄만 새로
+    assert [(b.name, b.summary) for b in store.bundles()] == [("결제", "")]           # 빈 'AI 묶음'이 남지 않고 요약도 안 덮는다
 
 
-def test_이미_묶인_작업을_답을_기다리는_사이_옮겨도_옛_묶음으로_되돌리지_않는다(env, repo, monkeypatch):
+def test_옛_묶음의_차례를_나누는_사이_사람이_옮겨도_옛_묶음으로_되돌리지_않는다(env, repo, monkeypatch):
     store = _store()
     first, job = _two_jobs(store, repo)
-    third = store.create_job(prompt="환불 버그", repo=str(repo), workdir=str(repo), model=None).id
-    old = store.assign_topic(job, None, name="환불", line="환불 처음")
-    store.assign_topic(third, old)                                     # 옛 묶음에는 다른 작업도 남아 있다
-    target = store.assign_topic(first, None, name="결제")
+    assert store.requeue_job(job, "환불 이어서")
+    store.finish_job(job, "succeeded")
+    second = store.last_follow_up(job).id
+    third = _two_jobs(store, repo)[0]
+    old = _old_topic(store, job, "환불", line="환불 처음")
+    _old_topic(store, third, topic_id=old)                             # 옛 묶음에는 다른 채팅도 남아 있다
+    target = store.move_turns(first, [0], None, "결제")
+    store.sync_legacy()
+    legacy = _link(store, job).bundle_id
 
-    def ask(cfg, question, j):
-        assert _store().assign_topic(job, target, manual=True) == target
-        return {"topic": old, "name": "환불", "summary": "환불 요약", "line": "환불 이어서"}
+    def ask(cfg, question, j, *, budget):
+        assert _store().move_turns(job, [0], target) == target
+        return {"turns": [{"turn": 1, "bundle": legacy, "line": "환불 처음 다시"}, {"turn": 2, "bundle": legacy, "line": "환불 이어서"}],
+                "summaries": [{"bundle": legacy, "summary": "환불 요약"}]}
 
     monkeypatch.setattr(topics, "_ask", ask)
-    assert topics.classify(config.load(), store, job) == target
-    link = store.job_topic(job)
-    assert (link.topic_id, link.manual, link.line) == (target, True, "환불 이어서")
-    assert store.job_topic(third).topic_id == old
-    assert {t.name: t.summary for t in store.topics()} == {"환불": "", "결제": ""}
+    assert topics.classify_job(config.load(), store, job, legacy=True) == {0: target, second: legacy}
+    link = _link(store, job)
+    assert (link.bundle_id, link.manual, link.line) == (target, True, "환불 처음 다시")
+    assert (_link(store, job, second).bundle_id, _link(store, job, second).source) == (legacy, "model")
+    assert _link(store, third).bundle_id == legacy
+    assert {b.name: b.summary for b in store.bundles()} == {"결제": "", "환불": "환불 요약"}
+
+
+def test_묻는_사이_이어서_시킨_새_차례는_실행_중이라_묻지_않는다(env, repo, monkeypatch):
+    store = _store()
+    job = _two_jobs(store, repo)[0]
+    asked = []
+
+    def ask(cfg, question, j, *, budget):
+        asked.append(question)
+        assert _store().requeue_job(job, "그사이 보낸 요청")              # 답을 기다리는 사이 이어서 시킨다
+        return {"turns": [{"turn": 1, "bundle": None, "name": "주문", "line": "한 일"}],
+                "summaries": [{"bundle": None, "name": "주문", "summary": "요약"}]}
+
+    monkeypatch.setattr(topics, "_ask", ask)
+    assert list(topics.classify_job(config.load(), store, job)) == [0]
+    assert len(asked) == 1 and _link(store, job, store.last_follow_up(job).id) is None
+
+
+def test_분류는_이벤트_조회_직후_끝난_후속_실행의_상태를_앞_차례에_붙이지_않는다(env, monkeypatch):
+    store = _store()
+    job, _ = _two_jobs(store, env)
+    writer = _store()
+    store.add_event(job, "팀장", "result", "첫 보고")
+    turn_events = store.turn_events
+
+    def read_then_finish(job_id):
+        rows = turn_events(job_id)
+        assert writer.requeue_job(job, "그사이 보낸 요청")
+        assert writer.finish_job(job, "failed")
+        return rows
+
+    def reply(cfg, question, snapshot, cwd):
+        assert not store._conn.in_transaction
+        assert snapshot.status == "succeeded" and snapshot.asked_at is None
+        assert "1번째 요청 · 상태 완료" in question and "첫 보고" in question
+        assert "그사이 보낸 요청" not in question
+        return json.dumps({"turns": [{"turn": 1, "name": "주문", "line": "한 일"}],
+                           "summaries": [{"name": "주문", "summary": "요약"}]})
+
+    monkeypatch.setattr(store, "turn_events", read_then_finish)
+    monkeypatch.setattr(topics, "_answer", reply)
+    assert list(topics.classify_job(config.load(), store, job, max_calls=1)) == [0]
+    assert _link(store, job, store.last_follow_up(job).id) is None
+    writer.close()
+
+
+@pytest.mark.parametrize("max_calls", [1, 3])
+def test_topics_sort는_재질문까지_포함해_채팅_전체의_모델_호출을_제한한다(env, monkeypatch, capsys, max_calls):
+    store = _store()
+    first, second = _two_jobs(store, env)
+    third = store.create_job(prompt="로그 정리", repo=str(env), workdir=str(env), model=None).id
+    store.finish_job(third, "succeeded")
+    calls = []
+
+    def reply(cfg, question, job, cwd):
+        calls.append(job.id)
+        if len(calls) == 1:
+            return "JSON 없는 답"
+        return json.dumps({"turns": [{"turn": 1, "name": job.prompt, "line": "한 일"}],
+                           "summaries": [{"name": job.prompt, "summary": "요약"}]})
+
+    monkeypatch.setattr(topics, "_answer", reply)
+    result = cli.main(["topics", "--sort", "--max-calls", str(max_calls)])
+    out, err = capsys.readouterr()
+    if max_calls == 1:
+        assert result == 1 and calls == [first]
+        assert f"채팅 #{first} 차례 1 을(를) 묶지 못했습니다" in err
+        assert "차례 2개가 남아 채팅 2개는 다음에 묶습니다" in out and "■" not in out
+        assert not store.turn_links()
+    else:
+        assert result == 0 and calls == [first, first, second]
+        assert err == "" and "차례 1개가 남아 채팅 1개는 다음에 묶습니다" in out
+        assert set(store.turn_links()) == {(first, 0), (second, 0)}
+    assert _link(store, third) is None
+
+
+def test_topics_sort는_재질문의_summaries가_숫자여도_차례를_저장하고_다음_채팅을_묶는다(env, monkeypatch):
+    store = _store()
+    first, second = _two_jobs(store, env)
+    calls = []
+
+    def reply(cfg, question, job, cwd):
+        calls.append(job.id)
+        summaries = 42 if job.id == first else [{"name": job.prompt, "summary": "다음 채팅 요약"}]
+        return json.dumps({"turns": [{"turn": 1, "name": job.prompt, "line": "한 일"}], "summaries": summaries})
+
+    monkeypatch.setattr(topics, "_answer", reply)
+    assert cli.main(["topics", "--sort", "--max-calls", "3"]) == 0
+    assert calls == [first, first, second]
+    assert [(bundle.name, bundle.summary) for bundle in store.bundles()] == [("주문 취소", ""), ("환불", "다음 채팅 요약")]
+
+
+def test_모델을_기다리는_사이_마지막_채팅이_삭제된_묶음은_재사용하지_않는다(env, monkeypatch):
+    store = _store()
+    first, job = _two_jobs(store, env)
+    target = store.move_turns(first, [0], None, "이전 묶음")
+    writer = _store()
+
+    def reply(cfg, question, j, cwd):
+        assert f'"bundle": {target},' in question
+        writer._conn.execute("DELETE FROM jobs WHERE id = ?", (first,))  # 옛 버전은 차례 링크를 남긴다
+        return json.dumps({"turns": [{"turn": 1, "bundle": target, "name": "새 묶음", "line": "한 일"}],
+                           "summaries": [{"bundle": target, "summary": "새 요약"}]})
+
+    monkeypatch.setattr(topics, "_answer", reply)
+    got = topics.classify_job(config.load(), store, job)
+    [bundle] = store.bundles()
+    assert got == {0: bundle.id} and bundle.id != target
+    assert (bundle.name, bundle.summary) == ("새 묶음", "새 요약")
+    writer.close()
+
+
+def test_실행_중인_차례는_묶지_않는다(env, repo, monkeypatch):
+    store = _store()
+    job = store.create_job(prompt="주문 취소", repo=str(repo), workdir=str(repo), model=None).id
+    monkeypatch.setattr(topics, "_ask", lambda *a, **kw: pytest.fail("실행 중인 차례를 물으면 안 된다"))
+    assert topics.classify_job(config.load(), store, job) == {}
+    store._conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job,))
+    assert topics.classify_job(config.load(), store, job) == {} and topics.pending(store) == []
 
 
 def test_묶기는_시간_초과나_실행_실패면_다시_묻지_않고_답을_못_읽을_때만_한_번_더_묻는다(env, repo, monkeypatch):
@@ -1791,13 +2093,17 @@ def test_묶기는_시간_초과나_실행_실패면_다시_묻지_않고_답을
         topics._ask(config.load(), "질문", job)
     assert len((env / "topic.jsonl").read_text().splitlines()) == 3
 
+    monkeypatch.setenv("FAKE_CLAUDE_TOPIC", '{"turns": [{"turn": 1, "bundle": null, "name": "주문"}], "summaries": []}')
+    answer = topics._ask(config.load(), "질문", job)                     # 한 줄·요약이 빠지면 한 번 더 묻고, 그래도 빠지면 받는다
+    assert answer["turns"][0]["name"] == "주문" and len((env / "topic.jsonl").read_text().splitlines()) == 5
+
 
 def test_Codex_팀장이면_묶기도_Codex로_하고_env_읽기를_막는다(env, repo, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_TOPIC_ARGS", str(env / "codex-topic.jsonl"))
     assert cli.main(["model", "lead", "codex:gpt-6.1-sol"]) == 0
     cli.main(["run", "주문 취소 API 추가", "-C", str(repo), "--no-worktree"])
     store = _store()
-    _wait(lambda: store.job_topic(1) is not None)
+    _wait(lambda: _link(store, 1) is not None)
 
     [call] = [json.loads(line) for line in (env / "codex-topic.jsonl").read_text().splitlines()]
     argv = call["argv"]
@@ -1805,4 +2111,4 @@ def test_Codex_팀장이면_묶기도_Codex로_하고_env_읽기를_막는다(en
     assert argv[argv.index("-m") + 1] == "gpt-6.1-sol"
     profile = " ".join(argv)
     assert f'{repo.resolve()}/**/.env*"="none"' in profile and '"."="read"' in profile   # 읽기 전용, .env 는 못 읽는다
-    assert store.topics()[0].name == "주문 취소"
+    assert store.bundles()[0].name == "주문 취소"

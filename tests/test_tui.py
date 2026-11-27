@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import time
@@ -786,7 +787,7 @@ def test_타임라인과_diff를_드래그하면_클립보드에_복사된다(en
                     break
             assert timeline.scroll_y == 0
 
-            await drag(pilot, "#timeline", (1, 0), (60, 10))
+            await drag(pilot, "#timeline", (1, 0), (60, 14))   # 내 질문 머리 줄(나 · 시각) 만큼 더
             await _until(pilot, lambda: bool(copied))  # 복사는 드래그가 끝난 뒤에 처리된다 (느린 컴퓨터에서 0.3초를 넘긴다)
             assert "주문 취소 API 추가" in copied[-1]
             assert "architect에게 분배: 주문 취소 설계" in copied[-1]
@@ -1266,10 +1267,11 @@ def test_Ctrl_Y는_보이지_않는_부분까지_타임라인_전체를_복사�
             await pilot.pause()
             text = copied[-1]
             lines = text.splitlines()
-            assert lines[0] == "요청: 주문 취소 API 추가" and lines[1].startswith("위치: ") and "브랜치" in lines[1]
-            assert "architect에게 분배: 주문 취소 설계" in text and "최종 보고: 완료" in text and "── 팀장 보고 (" in text
+            assert lines[0].startswith("▌나 · ") and lines[1] == "▌주문 취소 API 추가"     # 내 질문은 ▌ 막대
+            assert lines[2].startswith("위치: ") and "브랜치" in lines[2]
+            assert "architect에게 분배: 주문 취소 설계" in text and "최종 보고: 완료" in text and "◆ AI 보고 (" in text
+            assert re.search(r"^◆ AI 보고 \(\d\d:\d\d:\d\d\)\n    ", text, re.M)              # AI 보고는 들여쓴다
             assert "Bash step-0" in text and "Bash step-299" in text
-            import re
             assert re.search(r"^\d\d:\d\d:\d\d architect  Bash step-7$", text, re.M)   # 화면의 줄 모양 그대로
             assert "succeeded" in text and "첫 작업" not in text
             assert any("타임라인을 복사했습니다" in n.message for n in app._notifications)
@@ -1279,7 +1281,9 @@ def test_Ctrl_Y는_보이지_않는_부분까지_타임라인_전체를_복사�
             await pilot.press("space")
             await pilot.press("ctrl+y")
             await pilot.pause()
-            assert copied[-1].startswith("요청: 첫 작업") and "\n\n요청: 주문 취소 API 추가" in copied[-1]
+            both = copied[-1]
+            assert both.startswith("▌나 · ") and both.splitlines()[1] == "▌첫 작업"
+            assert "\n\n▌나 · " in both and both.index("▌첫 작업") < both.index("▌주문 취소 API 추가")
 
     try:
         _run(scenario())
@@ -1325,6 +1329,30 @@ def _bundle_ids(app) -> list:
 
 def _bundle_texts(app) -> list[str]:
     return [str(o.prompt) for o in _panel(app)._options]
+
+
+def _gd_part(app) -> tuple[list, list[str]]:
+    """묶음 패널 아래 그룹·파생 구역(gd 머리 다음부터 메뉴 줄 앞까지)의 (id, 글)."""
+    ids, texts = _bundle_ids(app), _bundle_texts(app)
+    if "gd" not in ids:
+        return [], []
+    start, end = ids.index("gd") + 1, ids.index("menu")
+    return ids[start:end], texts[start:end]
+
+
+def _gd_ids(app) -> list:
+    return _gd_part(app)[0]
+
+
+def _gd_texts(app) -> list[str]:
+    return _gd_part(app)[1]
+
+
+def _app(cfg, store, default_dir, gd_open=True):
+    """화면. gd_open: 그룹·파생 구역을 → 로 펼친 상태로 시작한다 (펼치기·접기 자체는 따로 검증한다)."""
+    app = ColidayApp(cfg, store, default_dir=str(default_dir))
+    app._gd_open = gd_open
+    return app
 
 
 def _highlight(app, option_id: str) -> None:
@@ -1406,7 +1434,7 @@ def test_그룹을_만들고_넣고_빼고_이름을_바꾸고_지워도_작업�
         await pilot.pause()
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             table = app.query_one("#jobs", DataTable)
             await _until(pilot, lambda: table.row_count == 3)
@@ -1422,8 +1450,8 @@ def test_그룹을_만들고_넣고_빼고_이름을_바꾸고_지워도_작업�
             assert _cell(app, "3").startswith("▣결제 ") and _cell(app, "2").startswith("▣결제 ") and "▣" not in _cell(app, "1")
 
             await _to_key(pilot, app, "3")
-            assert _bundle_texts(app)[0] == "그룹: 결제 (2)" and _bundle_ids(app) == [None, "m:3", "m:2", "menu"]
-            assert _bundle_texts(app)[1].startswith("▶ ")
+            assert _gd_texts(app)[0] == "그룹: 결제 (2)" and _gd_ids(app) == [None, "m:3", "m:2"]
+            assert _gd_texts(app)[1].startswith("▶ ")
 
             await pilot.press("escape")               # 선택을 풀고 선택한 작업 하나로
             await _menu(pilot, app, "group_new")
@@ -1432,15 +1460,15 @@ def test_그룹을_만들고_넣고_빼고_이름을_바꾸고_지워도_작업�
 
             await _to_key(pilot, app, "2")
             await _menu(pilot, app, "ungroup")
-            assert store.job_meta()[2].group_id is None and "그룹:" not in " ".join(_bundle_texts(app))
+            assert store.job_meta()[2].group_id is None and "그룹:" not in " ".join(_bundle_texts(app)) and "gd" not in _bundle_ids(app)
             await _to_key(pilot, app, "3")
-            assert _bundle_texts(app)[0] == "그룹: 결제 (1)"
+            assert _gd_texts(app)[0] == "그룹: 결제 (1)"
 
             await _menu(pilot, app, "rename_group")   # 그룹에 든 작업을 고른 채 메뉴로
             assert app.screen.query_one("#name", Input).value == "결제"
             await name(pilot, app, "결제 v2")
             assert store.list_groups()[0].name == "결제 v2" and _cell(app, "3").startswith("▣결제 v2 ")
-            assert _bundle_texts(app)[0] == "그룹: 결제 v2 (1)"
+            assert _gd_texts(app)[0] == "그룹: 결제 v2 (1)"
             spare = store.create_group("기타", project=str(repo.resolve()))
             await _menu(pilot, app, "rename_group")
             await name(pilot, app, "기타")
@@ -1482,7 +1510,7 @@ def test_새_작업_창에서_파생하면_목록에_부모_표시가_보이고_
     parent = jobs.launch(cfg, store, "부모 작업", repo).job
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: store.get_job(parent.id).is_terminal)
             await _until(pilot, lambda: app.selected_id == parent.id)
@@ -1511,7 +1539,7 @@ def test_새_작업_창에서_파생하면_목록에_부모_표시가_보이고_
             assert _keys(app) == [str(child.id), str(parent.id)]                 # 최근 순 (트리 없음)
             assert _cell(app, str(child.id)).startswith(f"↳#{parent.id} ") and "↳" not in _cell(app, str(parent.id))
             assert app.selected_id == child.id and app.project_dir == project   # 프로젝트 선택은 바뀌지 않는다
-            assert f"p:{parent.id}" in _bundle_ids(app) and "파생" in _bundle_texts(app)
+            assert f"p:{parent.id}" in _bundle_ids(app) and "파생" in _gd_texts(app)
             assert any(t.endswith("(부모)") and f"#{parent.id}" in t for t in _bundle_texts(app))
             await _until(pilot, lambda: store.get_job(child.id).is_terminal)
 
@@ -1595,7 +1623,7 @@ def test_묶음_메뉴는_연_때의_작업에만_적용하고_그사이_지워�
         await _until(pilot, lambda: str(job_id) not in _keys(app))
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: "1" in _keys(app))
 
@@ -2034,13 +2062,13 @@ def test_그룹은_만든_프로젝트에서만_보이고_다른_프로젝트는
         await pilot.pause()
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: _keys(app) == ["1"])
             await _menu(pilot, app, "group_new")
             await name(pilot, app, "결제")
             [ga] = store.list_groups(project=a)
-            assert _keys(app) == ["1"] and _bundle_texts(app)[0] == "그룹: 결제 (1)"
+            assert _keys(app) == ["1"] and _gd_texts(app)[0] == "그룹: 결제 (1)"
 
             await _to_project(pilot, app, b)
             assert _keys(app) == ["2"]                                 # A 의 그룹은 보이지 않는다
@@ -2054,7 +2082,7 @@ def test_그룹은_만든_프로젝트에서만_보이고_다른_프로젝트는
             assert not _notified(app, "이미 있는 그룹 이름")
             [gb] = store.list_groups(project=b)
             assert gb.name == "결제" and gb.id != ga.id and _keys(app) == ["2"]
-            assert _bundle_texts(app)[0] == "그룹: 결제 (1)" and _bundle_ids(app)[1] == "m:2"
+            assert _gd_texts(app)[0] == "그룹: 결제 (1)" and _gd_ids(app)[1] == "m:2"
 
             store.set_group([1], gb.id)                                # 다른 프로젝트의 그룹에 든 작업은 그룹 없이 보인다
             await _to_project(pilot, app, a)
@@ -2190,7 +2218,7 @@ def test_프로젝트가_없어도_프로젝트_목록에서_시작한다(env, r
         store.close()
 
 
-def test_묶음_패널은_선택한_작업의_그룹과_파생을_보이고_없으면_안내한다(env, repo):
+def test_묶음_패널은_혼자인_채팅도_묶음으로_보이고_그룹과_파생은_접힌_구역에_있다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
@@ -2201,31 +2229,53 @@ def test_묶음_패널은_선택한_작업의_그룹과_파생을_보이고_없�
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.selected_id == 3)
             panel = _panel(app)
-            assert panel.has_class("-shown") and str(panel.border_title) == "묶음 #3"
-            assert _bundle_ids(app) == [None, "menu"] and _bundle_texts(app)[0].startswith("묶인 작업 없음")
+            assert panel.has_class("-shown") and str(panel.border_title) == "묶음 · #3 의 일 1개"
+            # 아직 안 묶인 차례도 임시 묶음(◌)으로 보이고 안에 내 질문과 AI 가 한 일이 있다
+            assert _bundle_ids(app) == ["u:3:0", None, "menu"]
+            text = _bundle_texts(app)[0]
+            assert text.startswith('◌ 묶기 전 · "셋째 작업"') and "\n  ▌나 #3 · 1번째 요청 · " in text
+            assert "\n      ◆ AI ✓ 완료" in text
 
-            group = store.create_group("결제 [v1]", project=str(repo.resolve()))   # 다른 터미널에서 그룹에 넣었다
+            bundle = _bind(store, 3, 0, name="셋째 일", line="셋째에서 한 일")   # 다른 터미널(worker)이 묶었다
+            await _until(pilot, lambda: f"b:{bundle}" in _bundle_ids(app))
+            assert _bundle_ids(app) == [f"b:{bundle}", None, "t:3:0", None, "menu"]        # 혼자인 묶음도 보인다
+            assert _bundle_texts(app)[0].startswith("▼ 셋째 일  · 차례 1 · 채팅 #3")
+            assert "셋째에서 한 일" in _bundle_texts(app)[2]
+
+            group = store.create_group("결제 [v1]", project=str(repo.resolve()))   # 그룹·파생은 아래 접힌 구역 하나로
             store.set_group([3, 1], group.id)
-            await _until(pilot, lambda: "m:1" in _bundle_ids(app))
-            assert _bundle_ids(app) == [None, "m:3", "m:1", "menu"]
-            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (2)"           # 대괄호도 그대로 보인다
-            assert _bundle_texts(app)[1].startswith("▶ ") and "#3 셋째 작업" in _bundle_texts(app)[1]
-            assert panel.highlighted_option.id == "menu"                 # 같은 작업이면 하이라이트한 줄을 지킨다
+            await _until(pilot, lambda: "gd" in _bundle_ids(app))
+            assert _bundle_ids(app)[-2:] == ["gd", "menu"] and "m:3" not in _bundle_ids(app)
+            assert _bundle_texts(app)[-2] == '▸ 그룹 "결제 [v1]" (2)'                     # 대괄호도 그대로 보인다
+            panel.focus()
+            await pilot.pause()
+            _highlight(app, "gd")
+            await pilot.press("right")                                    # → 로 펼친다
+            await pilot.pause()
+            assert _gd_ids(app) == [None, "m:3", "m:1"] and _gd_texts(app)[0] == "그룹: 결제 [v1] (2)"
+            assert _gd_texts(app)[1].startswith("▶ ") and "#3 셋째 작업" in _gd_texts(app)[1]
+            assert _bundle_texts(app)[_bundle_ids(app).index("gd")].startswith("▾ ")
+            _highlight(app, "m:1")
+            await pilot.press("left")                                     # 구성 줄에서 ← 는 구역을 접는다
+            await pilot.pause()
+            assert "m:1" not in _bundle_ids(app) and panel.highlighted_option.id == "gd"
+            await pilot.press("enter")                                    # Enter 도 펼친다
+            await pilot.pause()
+            assert "m:1" in _bundle_ids(app)
 
-            await _to_key(pilot, app, "1")                                # 다른 작업을 고르면 자신 줄에서 시작
-            assert str(panel.border_title) == "묶음 #1" and panel.highlighted_option.id == "m:1"
-            assert _bundle_texts(app)[2].startswith("▶ ")
+            await _to_key(pilot, app, "1")                                # 다른 채팅: 맨 위 줄에서 시작, 구역은 펼친 채
+            assert str(panel.border_title) == "묶음 · #1 의 일 1개" and panel.highlighted_option.id == "u:1:0"
+            assert _gd_ids(app) == [None, "m:3", "m:1"]
             _highlight(app, "m:3")
             await pilot.pause(1.5)                                        # 바뀐 것이 없으면 다시 그리지 않는다
             assert panel.highlighted_option.id == "m:3"
             store.set_group([2], group.id)                                # 바뀌어도 하이라이트한 줄은 그대로
             await _until(pilot, lambda: "m:2" in _bundle_ids(app))
-            assert _bundle_ids(app) == [None, "m:3", "m:2", "m:1", "menu"] and panel.highlighted_option.id == "m:3"
-            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (3)"
+            assert _gd_ids(app) == [None, "m:3", "m:2", "m:1"] and panel.highlighted_option.id == "m:3"
 
             assert store.delete_job(3)                                    # 구성 작업이 지워지면 사라진다
             await _until(pilot, lambda: "m:3" not in _bundle_ids(app))
-            assert _bundle_texts(app)[0] == "그룹: 결제 [v1] (2)" and app.selected_id == 1
+            assert _gd_texts(app)[0] == "그룹: 결제 [v1] (2)" and app.selected_id == 1
 
             panel.focus()
             await pilot.pause()
@@ -2250,11 +2300,11 @@ def test_묶음_패널에서_Enter로_묶인_작업으로_이동한다(env, repo
     a, b = str(repo.resolve()), str(other.resolve())
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.selected_id == child.id)
-            assert _bundle_ids(app) == [None, f"p:{parent.id}", f"c:{far.id}", "menu"]
-            assert _bundle_texts(app)[2].endswith("(프로젝트 other)")
+            assert _gd_ids(app) == [None, f"p:{parent.id}", f"c:{far.id}"]
+            assert _gd_texts(app)[2].endswith("(프로젝트 other)")
             panel = _panel(app)
             panel.focus()
             await pilot.pause()
@@ -2332,7 +2382,7 @@ def test_묶음_패널의_ctrl_e와_ctrl_x는_패널에서만_동작하고_프�
     store.set_group([3, 2], group.id)
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: "m:2" in _bundle_ids(app))
             panel = _panel(app)
@@ -2379,60 +2429,103 @@ def test_묶음_패널의_ctrl_e와_ctrl_x는_패널에서만_동작하고_프�
         store.close()
 
 
-# ── 자동 묶음 (모델이 묶은 것): 묶음 패널의 한 구역과 ctrl+b 메뉴 ─────────────────
+# ── 묶음 (모델이 채팅의 차례를 일 단위로 묶은 것): 묶음 패널과 ctrl+b 메뉴 ─────────────────
 from coliday import topics  # noqa: E402
-from coliday.tui import TopicScreen  # noqa: E402
+from coliday.store import TurnAnswer  # noqa: E402
+from coliday.tui import BundleScreen, TopicScreen, TurnBlock  # noqa: E402
 
 
-def _auto(store, job_ids, name, summary="", lines=None):
-    """worker 없이 작업들을 자동 묶음 하나로 묶는다 (모델이 묶은 것처럼)."""
-    topic_id = None
-    for job_id in job_ids:
-        topic_id = store.assign_topic(job_id, topic_id, name=name, line=(lines or {}).get(job_id))
-    if summary:
-        store.update_topic(topic_id, summary=summary)
-    return topic_id
+def _reported(store, repo, prompt, report="보고", status="succeeded", members=()):
+    """첫 차례가 끝난 채팅 (보고 이벤트와 일한 팀원이 있는)."""
+    job = store.create_job(prompt=prompt, repo=str(repo), workdir=str(repo), model=None)
+    for member in members:
+        store.add_event(job.id, member, "start", "")
+    store.add_event(job.id, "팀장", RESULT, report)
+    store.finish_job(job.id, status, phase=status)
+    return job.id
+
+
+def _follow(store, job_id, prompt, report="보고", status="succeeded", members=()):
+    """끝난 채팅에 이어서 시킨 차례 하나 (worker 없이). 그 차례 id."""
+    assert store.requeue_job(job_id, prompt)
+    turn_id = store.last_follow_up(job_id).id
+    for member in members:
+        store.add_event(job_id, member, "start", "")
+    if status == "failed":
+        store.add_event(job_id, "팀장", "error", "실패")
+    store.add_event(job_id, "팀장", RESULT, report)
+    store.finish_job(job_id, status, phase=status)
+    return turn_id
+
+
+def _bind(store, job_id, turn_id, bundle=None, name="", line=""):
+    """모델이 묶은 것처럼 차례 하나를 묶음에 넣는다. 묶음 id."""
+    got = store.assign_turns(job_id, [TurnAnswer(turn_id, bundle, name, line)], expect={})
+    return got[turn_id]
 
 
 def _menu_ids(app) -> list[str]:
     return [o.id for o in app.screen.query_one(OptionList)._options]
 
 
-def test_묶음_패널에_자동_묶음_구역이_그룹_다음_파생_앞에_나오고_한_일_한_줄을_보인다(env, repo):
+def _menu_text(app, option_id: str) -> str:
+    return str(app.screen.query_one(OptionList).get_option(option_id).prompt)
+
+
+def _two_bundles(store, repo):
+    """채팅 #2 가 두 묶음(주문 취소·세션)에 걸치고, 주문 취소 묶음에는 채팅 #1 의 차례도 있다."""
+    a = _reported(store, repo, "주문 취소 API [v2] 만들어 줘", "## 결과\n- 취소 API 추가\n- 테스트 6개", members=("architect",))
+    b = _reported(store, repo, "환불 계산 고쳐 줘", "쿠폰 이중 차감 수정", members=("coder",))
+    t2 = _follow(store, b, "로그인 세션도 봐 줘", "세션 연장")
+    long_report = "\n".join(f"- 목록 스타일 {n}번째 줄" for n in range(40))
+    t3 = _follow(store, b, "취소 주문은 회색으로\n상세 [취소] 버튼은 숨기고\n목록도 고치고\n넷째 줄 요청", long_report,
+                 status="failed", members=("coder", "reviewer"))
+    cancel = _bind(store, a, 0, name="주문 취소", line="취소 API 와 테스트 추가")
+    _bind(store, b, 0, cancel, line="환불 계산 수정")
+    session = _bind(store, b, t2, name="세션", line="세션 연장")
+    _bind(store, b, t3, cancel, line="회색 표시 시도, 테스트 실패로 멈춤")
+    return a, b, t2, t3, cancel, session
+
+
+def test_한_채팅이_두_묶음에_걸치면_맨_위만_펼치고_나와_AI가_기호로_구분된다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
-    parent = _done(store, repo, "주문 API 초안")
-    _done(store, repo, "배포 스크립트 정리")
-    mine = _done(store, repo, "주문 취소 API 만들어 줘", parent_id=parent.id)
-    _done(store, repo, "결제 테스트 추가", parent_id=mine.id)
-    group = store.create_group("결제 [v1]", project=str(repo.resolve()))
-    store.set_group([mine.id, 2], group.id)
-    _auto(store, [parent.id, mine.id], "주문 취소 [API]", "주문 취소 API 와 환불을 만들었다. " * 5,
-          lines={mine.id: "취소 API 와 테스트 추가"})
+    a, b, t2, t3, cancel, session = _two_bundles(store, repo)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.selected_id == 4)
-            await _to_key(pilot, app, str(mine.id))
-            assert _bundle_ids(app) == [
-                None, f"m:{mine.id}", "m:2",                          # 그룹
-                None, None, f"a:{mine.id}", f"a:{parent.id}",         # 자동 묶음: 제목·요약·구성
-                None, f"p:{parent.id}", "c:4",                        # 파생
-                "menu",
-            ]
-            texts = _bundle_texts(app)
-            assert texts[3] == "자동 묶음: 주문 취소 [API] (2)"       # 대괄호도 그대로
-            assert texts[4].strip().startswith("주문 취소 API 와 환불을") and texts[4].endswith("…")
-            assert len(texts[4].strip()) <= 80                       # 요약은 두 줄 남짓에서 자른다
-            assert "#3 취소 API 와 테스트 추가" in texts[5] and texts[5].startswith("▶ ")   # 한 일 한 줄이 있으면 그것
-            assert "#3 취소 API 와 테스트 추가" in texts[1]           # 그룹 구역도 같은 글
-            assert "#1 주문 API 초안" in texts[6]                     # 없으면 요청
-            assert _panel(app).highlighted_option.id == f"m:{mine.id}"   # 그룹이 있으면 그룹의 자기 줄부터
+            await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
+            ids, texts = _bundle_ids(app), _bundle_texts(app)
+            assert str(_panel(app).border_title) == f"묶음 · #{b} 의 일 2개"
+            # 이 채팅의 가장 최근 차례가 든 묶음이 위에 펼쳐지고, 그 안에 다른 채팅(#1)의 차례도 섞여 있다
+            assert ids[0] == f"b:{cancel}" and ids.index(f"b:{session}") > ids.index(f"t:{a}:0")
+            assert [i for i in ids if i and i.startswith("t:")] == [f"t:{b}:{t3}", f"t:{b}:0", f"t:{a}:0"]
+            assert texts[0].startswith(f"▼ 주문 취소  · 차례 3 · 채팅 #{b} #{a}")
+            folded = texts[ids.index(f"b:{session}")]
+            assert folded.startswith("▶ 세션  · 차례 1") and "마지막: 세션 연장" in folded   # 접힌 묶음은 마지막 한 일
+            assert f"t:{b}:{t2}" not in ids
 
-            await _to_key(pilot, app, str(parent.id))                 # 그룹이 없으면 자동 묶음의 자기 줄부터
-            assert _panel(app).highlighted_option.id == f"a:{parent.id}"
-            assert _cell(app, str(mine.id)).endswith("주문 취소 API 만들어 줘")   # 목록은 계속 요청을 보인다
+            turn = texts[ids.index(f"t:{b}:{t3}")].split("\n")
+            assert turn[0].startswith(f"  ▌나 #{b} · 3번째 요청 · ")
+            assert turn[1:4] == ["  ▌취소 주문은 회색으로", "  ▌상세 [취소] 버튼은 숨기고", "  ▌목록도 고치고…"]   # 질문은 3줄
+            assert turn[4].startswith("      ◆ AI ✗ 실패 · 팀원 coder·reviewer · 오류 1")
+            assert turn[5] == "      회색 표시 시도, 테스트 실패로 멈춤"
+            other = texts[ids.index(f"t:{a}:0")]
+            assert other.startswith(f"  ▌나 #{a} · 1번째 요청") and "(다른 채팅)" in other.split("\n")[0]
+            assert "\n  ▌주문 취소 API [v2] 만들어 줘\n" in other                              # 대괄호도 그대로
+            # 색이 없어도 구분된다: 차례 칸의 줄은 모두 '  ▌'(내 질문) 아니면 6칸 들여쓰기(AI) 로 시작한다
+            for key in (f"t:{b}:{t3}", f"t:{b}:0", f"t:{a}:0"):
+                lines = texts[ids.index(key)].split("\n")
+                assert all(line.startswith("  ▌") or line.startswith("      ") for line in lines)
+                assert sum(line.startswith("      ◆ AI ") for line in lines) == 1
+            # 차례 사이에는 빈 줄 (고를 수 없다)
+            assert ids[ids.index(f"t:{b}:{t3}") + 1] is None and texts[ids.index(f"t:{b}:{t3}") + 1] == ""
+            assert _panel(app).highlighted_option.id == f"b:{cancel}"
+
+            await _to_key(pilot, app, str(a))                             # 다른 채팅에서도 같은 묶음이 보인다
+            assert _bundle_ids(app)[0] == f"b:{cancel}" and f"b:{session}" not in _bundle_ids(app)
+            assert "(다른 채팅)" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t3}")]
 
     try:
         _run(scenario())
@@ -2440,23 +2533,51 @@ def test_묶음_패널에_자동_묶음_구역이_그룹_다음_파생_앞에_�
         store.close()
 
 
-def test_혼자인_자동_묶음은_보이지_않고_사람이_이름을_정하면_보인다(env, repo):
+def test_다른_채팅의_차례에서_Enter는_그_채팅으로_이_채팅의_차례는_펼치고_방향키로_접는다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
-    _done(store, repo, "첫 작업")
-    _done(store, repo, "둘째 작업")
-    alone = _auto(store, [2], "혼자", "요약")
+    a, b, t2, t3, cancel, session = _two_bundles(store, repo)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.selected_id == 2)
-            assert _bundle_ids(app) == [None, "menu"] and _bundle_texts(app)[0].startswith("묶인 작업 없음")
-            store.update_topic(alone, name="내가 정함", manual_name=True)
-            await _until(pilot, lambda: "a:2" in _bundle_ids(app))
-            assert _bundle_texts(app)[0] == "자동 묶음: 내가 정함 (1)"
-            store.update_topic(alone, summary="")
-            await _until(pilot, lambda: "아직 요약이 없습니다" in _bundle_texts(app)[1])
+            await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
+            panel = _panel(app)
+            panel.focus()
+            await pilot.pause()
+
+            _highlight(app, f"t:{a}:0")
+            await pilot.press("enter")                                   # 다른 채팅의 차례: 그 채팅으로, 같은 차례에 커서
+            await pilot.pause()
+            assert app.selected_id == a and _cursor_key(app) == str(a) and app.focused is panel
+            assert panel.highlighted_option.id == f"t:{a}:0"
+            _highlight(app, f"t:{b}:{t3}")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.selected_id == b and panel.highlighted_option.id == f"t:{b}:{t3}"
+
+            short = _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t3}")]
+            await pilot.press("enter")                                   # 이 채팅의 차례: 펼친다 (질문 전문 + 보고 앞부분)
+            await pilot.pause()
+            opened = _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t3}")]
+            assert "  ▌넷째 줄 요청" in opened and "넷째 줄" not in short
+            assert "      · 목록 스타일 24번째 줄" in opened and "25번째 줄" not in opened   # 보고는 25줄까지
+            assert opened.endswith("… 전문은 묶음 제목 줄에서 Enter (전체 보기)")
+            await pilot.press("left")                                    # ← : 펼친 차례를 접는다
+            await pilot.pause()
+            assert _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t3}")] == short
+            await pilot.press("left")                                    # 한 번 더: 그 묶음을 접고 제목 줄로
+            await pilot.pause()
+            assert f"t:{b}:{t3}" not in _bundle_ids(app) and panel.highlighted_option.id == f"b:{cancel}"
+            assert _bundle_texts(app)[0].startswith("▶ 주문 취소")
+            _highlight(app, f"b:{session}")
+            await pilot.press("right")                                   # → : 묶음을 펼친다
+            await pilot.pause()
+            assert f"t:{b}:{t2}" in _bundle_ids(app) and panel.highlighted_option.id == f"b:{session}"
+
+            await pilot.press("escape")                                  # Esc 는 작업 목록으로
+            await pilot.pause()
+            assert app.focused is app.query_one("#jobs", DataTable)
 
     try:
         _run(scenario())
@@ -2464,28 +2585,7 @@ def test_혼자인_자동_묶음은_보이지_않고_사람이_이름을_정하�
         store.close()
 
 
-def test_작업_목록에는_자동_묶음_표시가_없다(env, repo):
-    cfg = config.load()
-    store = Store(cfg.db_path)
-    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
-        _done(store, repo, prompt)
-    _auto(store, [1, 3], "주문 취소", "요약", lines={1: "한 일"})
-
-    async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
-        async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: _keys(app) == ["3", "2", "1"])     # 순서는 그대로 (자동 묶음으로 모으지 않는다)
-            for key in ("3", "2", "1"):
-                assert "주문 취소" not in _cell(app, key) and "한 일" not in _cell(app, key)
-            assert _cell(app, "1") == "첫 작업"
-
-    try:
-        _run(scenario())
-    finally:
-        store.close()
-
-
-def test_패널에서_자동_묶음_구성원으로_Enter_이동하고_다른_프로젝트면_옮겨_간다(env, tmp_path):
+def test_패널에서_다른_프로젝트의_채팅_차례로_Enter하면_그_프로젝트로_옮겨_간다(env, tmp_path):
     top = tmp_path / "mono"
     for sub in ("fe", "be"):
         (top / sub).mkdir(parents=True)
@@ -2505,7 +2605,8 @@ def test_패널에서_자동_묶음_구성원으로_Enter_이동하고_다른_�
         return made.id
 
     a, b, c = job(fe, "프론트 취소 버튼"), job(fe, "프론트 기타"), job(be, "백엔드 취소 API")
-    _auto(store, [a, c], "주문 취소")                              # 자동 묶음은 레포 기준이라 두 프로젝트에 걸친다
+    bundle = _bind(store, a, 0, name="주문 취소")                     # 묶음은 레포 기준이라 두 프로젝트에 걸친다
+    _bind(store, c, 0, bundle)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(top / "fe"))
@@ -2513,16 +2614,16 @@ def test_패널에서_자동_묶음_구성원으로_Enter_이동하고_다른_�
             assert app.scope == fe
             await _until(pilot, lambda: _keys(app) == [str(b), str(a)])
             await _to_key(pilot, app, str(a))
-            assert _bundle_ids(app) == [None, None, f"a:{c}", f"a:{a}", "menu"]
-            assert _bundle_texts(app)[2].endswith("(프로젝트 be)")
+            assert [i for i in _bundle_ids(app) if i and i.startswith("t:")] == [f"t:{c}:0", f"t:{a}:0"]
+            assert "(프로젝트 be)" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{c}:0")].split("\n")[0]
             panel = _panel(app)
             panel.focus()
-            _highlight(app, f"a:{c}")
+            _highlight(app, f"t:{c}:0")
             await pilot.press("enter")                                # 다른 프로젝트: 그 프로젝트로 옮겨 고른다
             await pilot.pause()
             assert app.scope == be and app.selected_id == c and _notified(app, "프로젝트 be 로 옮겼습니다")
-            assert app.focused is panel and f"a:{a}" in _bundle_ids(app)
-            _highlight(app, f"a:{a}")
+            assert app.focused is panel and panel.highlighted_option.id == f"t:{c}:0"
+            _highlight(app, f"t:{a}:0")
             await pilot.press("enter")
             await pilot.pause()
             assert app.scope == fe and app.selected_id == a
@@ -2533,75 +2634,30 @@ def test_패널에서_자동_묶음_구성원으로_Enter_이동하고_다른_�
         store.close()
 
 
-def test_ctrl_b_메뉴로_자동_묶음_이름을_바꾸고_다른_묶음으로_옮기고_새_묶음을_만든다(env, repo, monkeypatch):
-    monkeypatch.setattr(topics, "spawn_pending", lambda cfg: pytest.fail("묶기 프로세스를 띄우면 안 된다"))
+def test_실행_중인_차례는_분류_중_임시_묶음이고_묶지_못한_차례는_그렇게_보인다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
-    for prompt in ("첫 작업", "둘째 작업", "셋째 작업", "넷째 작업"):
-        _done(store, repo, prompt)
-    order = _auto(store, [1, 2], "주문 취소", "요약")
-    login = _auto(store, [3, 4], "로그인", "요약")
+    failed = _reported(store, repo, "묶기에 실패한 채팅", "한 일")
+    log = cfg.job_dir(failed) / "topic.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("TopicError: 시간 초과\n")
+    running = store.create_job(prompt="배포 스크립트 고쳐 줘", repo=str(repo), workdir=str(repo), model=None)
+    assert store.start_job(running.id, os.getpid())                  # 살아 있는 pid: 정리되지 않는다
+    store.update_job(running.id, phase="coder 가 고치는 중")
+    assert store.queue_message(running.id, "버튼 색도 바꿔 줘")
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: "a:4" in _bundle_ids(app))
-            await _to_key(pilot, app, "2")
-            await pilot.press("ctrl+b")
-            await pilot.pause()
-            menu = _menu_ids(app)
-            assert menu[-3:] == ["topic_move", "topic_rename", "topic_sort"]   # 그룹·파생 항목 뒤
-            assert "자동 묶음 이름 바꾸기 (주문 취소)" in str(app.screen.query_one(OptionList).get_option("topic_rename").prompt)
-            assert app.screen.query_one(OptionList).get_option("topic_sort").disabled   # 안 묶인 끝난 작업이 없다
+            await _until(pilot, lambda: app.selected_id == running.id)
+            await _until(pilot, lambda: _bundle_ids(app)[:1] == [f"u:{running.id}:0"])
+            text = _bundle_texts(app)[0]
+            assert text.startswith('◌ 분류 중 · "배포 스크립트 고쳐 줘"')
+            assert "      ◆ AI ⟳ 실행 중" in text and "일하는 중 — coder 가 고치는 중" in text
+            assert any(t.startswith("  ⏳ 대기: 버튼 색도 바꿔 줘") for t in _bundle_texts(app))
 
-            await _choose(pilot, app, "topic_rename")                 # 이름 바꾸기
-            assert isinstance(app.screen, TopicScreen) and app.screen.query_one("#name", Input).value == "주문 취소"
-            app.screen.query_one("#name", Input).value = "주문 [취소]"
-            await pilot.press("enter")
-            await pilot.pause()
-            assert [(t.name, t.manual_name) for t in store.topics() if t.id == order] == [("주문 [취소]", True)]
-            await _until(pilot, lambda: "자동 묶음: 주문 [취소] (2)" in _bundle_texts(app))
-
-            await pilot.press("ctrl+b")                               # 다른 자동 묶음으로 옮기기
-            await pilot.pause()
-            await _choose(pilot, app, "topic_move")
-            from textual.widgets import Select
-            select = app.screen.query_one("#topic", Select)
-            assert select.value == order and not app.screen.query_one("#name").display
-            select.value = login
-            await pilot.pause()
-            await pilot.click("#save")
-            await pilot.pause()
-            assert store.job_topic(2).topic_id == login and store.job_topic(2).manual
-            await _until(pilot, lambda: "자동 묶음: 로그인 (3)" in _bundle_texts(app))
-            await _until(pilot, lambda: _notified(app, "자동 묶음 '로그인' (으)로 옮겼습니다"))
-
-            await pilot.press("ctrl+b")                               # 새 자동 묶음으로 떼어 내기
-            await pilot.pause()
-            await _choose(pilot, app, "topic_move")
-            app.screen.query_one("#topic", Select).value = 0
-            await pilot.pause()
-            name = app.screen.query_one("#name", Input)
-            assert name.display
-            name.focus()
-            name.value = "결제"
-            await pilot.press("enter")
-            await pilot.pause()
-            new = store.job_topic(2).topic_id
-            assert new not in (order, login) and [t.manual_name for t in store.topics() if t.id == new] == [True]
-            assert order in {t.id for t in store.topics()}             # '주문 [취소]' 는 #1 이 남아 있다
-            await _until(pilot, lambda: "자동 묶음: 결제 (1)" in _bundle_texts(app))   # 사람이 만든 것은 혼자여도 보인다
-
-            await _to_key(pilot, app, "1")                             # #1 도 옮기면 비게 된 '주문 [취소]' 는 사라진다
-            await pilot.press("ctrl+b")
-            await pilot.pause()
-            await _choose(pilot, app, "topic_move")
-            app.screen.query_one("#topic", Select).value = new
-            await pilot.pause()
-            await pilot.click("#save")
-            await pilot.pause()
-            assert order not in {t.id for t in store.topics()}
-            await _until(pilot, lambda: "자동 묶음: 결제 (2)" in _bundle_texts(app))
+            await _to_key(pilot, app, str(failed))
+            assert _bundle_texts(app)[0].startswith('◌ 묶지 못함 · "묶기에 실패한 채팅"  · #1 1번째\n  Ctrl+B → 안 묶인 차례 묶기\n')
 
     try:
         _run(scenario())
@@ -2609,32 +2665,523 @@ def test_ctrl_b_메뉴로_자동_묶음_이름을_바꾸고_다른_묶음으로_
         store.close()
 
 
-def test_ctrl_b_메뉴의_안_묶인_작업_묶기는_확인_후_spawn_pending을_부른다(env, repo, monkeypatch):
+def test_주기_갱신_뒤에도_펼침과_하이라이트가_유지되고_바뀌면_다시_그려도_그대로다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    a, b, t2, t3, cancel, session = _two_bundles(store, repo)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
+            panel = _panel(app)
+            panel.focus()
+            _highlight(app, f"b:{session}")
+            await pilot.press("right")
+            await pilot.pause()
+            _highlight(app, f"t:{b}:{t2}")
+            await pilot.press("enter")                                # 차례도 펼친다
+            await pilot.pause()
+            drawn = list(panel._options)
+            await pilot.pause(2.5)                                    # 1초 새로고침을 두 번 넘게 지나도
+            assert panel._options == drawn and panel.highlighted_option.id == f"t:{b}:{t2}"   # 다시 그리지 않는다
+            store.rename_bundle(cancel, "주문 취소 흐름")              # 다른 터미널이 바꿨다: 다시 그려도 상태는 그대로
+            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 주문 취소 흐름"))
+            assert panel.highlighted_option.id == f"t:{b}:{t2}" and f"t:{b}:{t2}" in app._panel_parent
+            assert "세션 연장" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t2}")]
+            assert (b, t2) in app._turn_open and app._bundle_open[session]
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_미분류_차례가_7개_이상이면_더_보기로_이전_차례를_읽고_수동_이동할_수_있다(env, repo):
+    from textual.widgets import Select
+
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    target_job = _reported(store, repo, "옮겨 놓을 묶인 일")
+    target_bundle = _bind(store, target_job, 0, name="수동 분류 대상")
+    job = _reported(store, repo, "오래된 미분류 요청")
+    turn_ids = [0] + [_follow(store, job, f"미분류 {n}번째 요청") for n in range(2, 9)]
+    log = cfg.job_dir(job) / "topic.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("TopicError: 분류 실패\n")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == job and "loose-more" in _bundle_ids(app))
+            assert len([key for key in _bundle_ids(app) if key and key.startswith(f"u:{job}:")]) == 6
+            _panel(app).focus()
+            _highlight(app, "loose-more")
+            await pilot.press("enter")
+            await pilot.pause(1.5)  # 주기 갱신을 지나도 펼친 범위가 유지된다
+            assert "loose-more" not in _bundle_ids(app)
+            assert all(f"u:{job}:{turn_id}" in _bundle_ids(app) for turn_id in turn_ids)
+            assert _panel(app).highlighted_option.id == f"u:{job}:{turn_ids[1]}"
+            oldest = f"u:{job}:0"
+            assert _bundle_texts(app)[_bundle_ids(app).index(oldest)].startswith('◌ 묶지 못함 · "오래된 미분류 요청"')
+
+            _highlight(app, oldest)
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert f"(#{job} 1번째: '오래된 미분류 요청')" in _menu_text(app, "turn_move")
+            await _choose(pilot, app, "turn_move")
+            app.screen.query_one("#topic", Select).value = target_bundle
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            link = store.turn_links([job])[(job, 0)]
+            assert (link.bundle_id, link.manual, link.source) == (target_bundle, True, "manual")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_13번째_묶음은_더_보기로_제목_전체_보기와_작업에_접근한다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    job = _reported(store, repo, "1번째 일")
+    turn_ids = [0] + [_follow(store, job, f"{n}번째 일") for n in range(2, 14)]
+    bundles = [_bind(store, job, turn_id, name=f"묶음 {n}") for n, turn_id in enumerate(turn_ids, 1)]
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == job and "bundle-more" in _bundle_ids(app))
+            assert len([key for key in _bundle_ids(app) if key and key.startswith("b:")]) == 12
+            assert f"b:{bundles[0]}" not in _bundle_ids(app)
+            _panel(app).focus()
+            _highlight(app, "bundle-more")
+            await pilot.press("enter")
+            await pilot.pause(1.5)  # 주기 갱신 후에도 13번째 묶음을 계속 본다
+            oldest = f"b:{bundles[0]}"
+            assert "bundle-more" not in _bundle_ids(app) and oldest in _bundle_ids(app)
+            assert _panel(app).highlighted_option.id == oldest
+
+            _highlight(app, oldest)
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert _menu_text(app, "bundle_rename") == "묶음 이름 바꾸기 (묶음 1)"
+            assert _menu_text(app, "bundle_view") == "묶음 전체 보기 (묶음 1)"
+            await pilot.press("escape")
+            await pilot.pause()
+            _highlight(app, oldest)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, BundleScreen) and app.screen._bundle.id == bundles[0]
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_차례가_많은_묶음은_최근_6개와_이_채팅의_3개만_보이고_마지막_줄까지_스크롤된다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    mine = _reported(store, repo, "옛 채팅의 첫 요청")
+    mine_turns = [0] + [_follow(store, mine, f"옛 채팅 {n}번째") for n in range(2, 6)]
+    busy = _reported(store, repo, "바쁜 채팅의 첫 요청")
+    busy_turns = [0] + [_follow(store, busy, f"바쁜 채팅 {n}번째") for n in range(2, 101)]
+    bundle = store.assign_turns(busy, [TurnAnswer(t, None, "큰 일") for t in busy_turns], expect={})[0]
+    store.assign_turns(mine, [TurnAnswer(t, bundle) for t in mine_turns], expect={})
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: _keys(app) == [str(busy), str(mine)])
+            await _to_key(pilot, app, str(mine))
+            ids = _bundle_ids(app)
+            shown = [i for i in ids if i and i.startswith("t:")]
+            assert len(shown) == 9                                     # 묶음 전체의 최근 6 + 이 채팅의 3
+            assert sum(i.startswith(f"t:{mine}:") for i in shown) == 3
+            assert _bundle_texts(app)[0].startswith("▼ 큰 일  · 차례 105 · 채팅 #2 #1")
+            assert _bundle_texts(app)[ids.index(f"more:{bundle}")] == "  … 이전 차례 96개 — Enter 로 전체 보기"
+            panel = _panel(app)
+            panel.focus()
+            await pilot.pause()
+            await pilot.press("end")                                   # 마지막 줄(메뉴)까지 잘리지 않고 닿는다
+            await pilot.pause()
+            assert panel.highlighted_option.id == "menu" and panel.scroll_y == panel.max_scroll_y > 0
+            await pilot.press("home")
+            _highlight(app, f"t:{mine}:{mine_turns[2]}")
+            await pilot.pause()
+            before = panel.scroll_y
+            assert before > 0
+            store.rename_bundle(bundle, "아주 큰 일")                  # 다시 그려도 보던 자리 그대로 (맨 위로 튀지 않는다)
+            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 아주 큰 일"))
+            assert panel.scroll_y == before and panel.highlighted_option.id == f"t:{mine}:{mine_turns[2]}"
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_패널에_포커스가_있으면_패널이_3배로_커지고_변경_사항에_포커스면_그쪽이_커진다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    _reported(store, repo, "첫 작업")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == 1)
+            await pilot.pause()
+            panel, diff = _panel(app), app.query_one("#diff-pane")
+            assert abs(panel.outer_size.height - diff.outer_size.height) <= 1          # 평소에는 반씩
+            panel.focus()
+            await pilot.pause()
+            assert panel.outer_size.height >= 2.5 * diff.outer_size.height              # 패널 포커스: 3fr : 1fr
+            await pilot.press("ctrl+b")                                                 # 메뉴가 떠도 그대로
+            await pilot.pause()
+            assert app.query_one("#right").has_class("-bundle-focus")
+            await pilot.press("escape")
+            await pilot.pause()
+            diff.focus()
+            await pilot.pause()
+            assert diff.outer_size.height >= 2.5 * panel.outer_size.height              # 변경 사항 포커스: 그쪽이 3fr
+            app.query_one("#jobs", DataTable).focus()
+            await pilot.pause()
+            assert abs(panel.outer_size.height - diff.outer_size.height) <= 1
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_제목_줄에서_Enter하면_전체_보기가_열리고_전문을_보이며_Enter로_그_채팅으로_간다(env, repo, monkeypatch):
+    copied = []
+    monkeypatch.setattr(ColidayApp, "copy_to_clipboard", lambda self, text: copied.append(text))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    question = "\n".join(f"긴 요청 [{n}] 줄" for n in range(30))
+    report = "## 결과\n" + "\n".join(f"- 보고 {n}번째 줄" for n in range(40))
+    other = _reported(store, repo, question, report, members=("architect",))
+    mine = _reported(store, repo, "첫 요청")
+    later = [0] + [_follow(store, mine, f"이어서 {n}") for n in range(2, 25)]
+    bundle = _bind(store, other, 0, name="긴 일", line="긴 보고를 남김")
+    store.assign_turns(mine, [TurnAnswer(t, bundle) for t in later], expect={})
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == mine and f"b:{bundle}" in _bundle_ids(app))
+            panel = _panel(app)
+            panel.focus()
+            _highlight(app, f"b:{bundle}")
+            await pilot.press("enter")                               # 제목 줄: 전체 보기
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BundleScreen)
+            blocks = list(screen.query(TurnBlock))
+            assert len(blocks) == 20                                  # 최근 20 차례부터
+            assert [b.view.turn.index for b in blocks[-2:]] == [23, 24]   # 위가 오래된 것 (대화 순서)
+            assert screen.focused is blocks[-1]
+            more = screen.query_one("#bv-more")
+            assert more.display and "남은 5개" in str(more.label)
+            more.press()                                              # 이전 차례 더 보기
+            await pilot.pause()
+            blocks = list(screen.query(TurnBlock))
+            assert len(blocks) == 25 and not more.display
+            first = blocks[0]
+            assert first.view.turn.job_id == other
+            ask = str(first.query_one(".ask", Static).content)
+            assert ask.startswith(f"나 #{other} · 1번째 요청") and "긴 요청 [29] 줄" in ask      # 질문 전문 (대괄호 그대로)
+            assert first.query_one(".ask").styles.border_left[0] == "thick"                    # 질문은 왼쪽 굵은 막대
+            assert str(first.query_one(".ai-head", Static).content).startswith("◆ AI ✓ 완료 · 팀원 architect")
+            assert first.query_one(Markdown).source.endswith("- 보고 39번째 줄")               # 보고 전문 (Markdown)
+
+            await pilot.press("ctrl+y")                               # 전체 복사
+            await pilot.pause()
+            assert copied and copied[-1].startswith("■ 긴 일") and f"▌나 #{other} · 1번째 요청" in copied[-1]
+            assert "    ◆ AI ✓ 완료" in copied[-1] and "보고 39번째 줄" in copied[-1]
+
+            first.focus()
+            await pilot.press("down")                                 # ↓ 다음 차례
+            await pilot.pause()
+            assert screen.focused is blocks[1]
+            await pilot.press("up", "up")                             # 맨 위에서 ↑ 는 그대로
+            await pilot.pause()
+            assert screen.focused is blocks[0]
+            await pilot.press("enter")                                # 그 차례의 채팅으로 (다른 채팅)
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and app.selected_id == other
+            assert panel.highlighted_option.id == f"t:{other}:0"
+
+            _highlight(app, f"more:{bundle}")                         # '이전 차례 N개' 줄도 전체 보기
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, BundleScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1 and app.focused is panel
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_전체_복사는_화면에_불러오지_않은_이전_페이지까지_복사한다(env, repo, monkeypatch):
+    copied = []
+    monkeypatch.setattr(ColidayApp, "copy_to_clipboard", lambda self, text: copied.append(text))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    job = _reported(store, repo, "가장 오래된 요청", "가장 오래된 보고")
+    turn_ids = [0] + [
+        _follow(store, job, f"{n}번째 요청", f"{n}번째 보고") for n in range(2, 24)
+    ]
+    bundle = store.assign_turns(
+        job, [TurnAnswer(turn_id, None, "전체 복사 묶음") for turn_id in turn_ids], expect={},
+    )
+    bundle_id = bundle[0]
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == job and f"b:{bundle_id}" in _bundle_ids(app))
+            _panel(app).focus()
+            _highlight(app, f"b:{bundle_id}")
+            await pilot.press("enter")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BundleScreen)
+            assert len(list(screen.query(TurnBlock))) == 20 and screen.query_one("#bv-more").display
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert len(list(screen.query(TurnBlock))) == 20  # 복사를 위해 화면 위젯은 늘리지 않는다
+            assert copied and "가장 오래된 요청" in copied[-1] and "23번째 보고" in copied[-1]
+            assert copied[-1].count("▌나 #") == 23
+            assert _notified(app, "차례 23개를 복사했습니다")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_전체_보기에서_고른_미리보기_밖_차례가_패널과_ctrl_b의_정확한_대상이_된다(env, repo):
+    from textual.widgets import Select
+
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    destination_job = _reported(store, repo, "옮길 묶음의 차례")
+    destination = _bind(store, destination_job, 0, name="옮길 묶음")
+    job = _reported(store, repo, "가장 오래된 요청", "가장 오래된 보고")
+    turn_ids = [0] + [_follow(store, job, f"{n}번째 요청", f"{n}번째 보고") for n in range(2, 24)]
+    bundle = store.assign_turns(
+        job, [TurnAnswer(turn_id, None, "정확한 포커스 묶음") for turn_id in turn_ids], expect={},
+    )[0]
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == job and f"b:{bundle}" in _bundle_ids(app))
+            _panel(app).focus()
+            _highlight(app, f"b:{bundle}")
+            await pilot.press("enter")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BundleScreen)
+            screen.query_one("#bv-more").press()
+            await pilot.pause()
+            oldest = list(screen.query(TurnBlock))[0]
+            assert oldest.view.turn.turn_id == 0
+            oldest.focus()
+            await pilot.press("enter")
+            await pilot.pause(1.5)  # 주기 갱신 뒤에도 미리보기 밖의 정확한 차례를 유지한다
+            assert app.screen is app.screen_stack[0]
+            assert _panel(app).highlighted_option.id == f"t:{job}:0"
+            assert f"t:{job}:0" in _bundle_ids(app)
+
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert f"(#{job} 1번째: '가장 오래된 요청')" in _menu_text(app, "turn_move")
+            await _choose(pilot, app, "turn_move")
+            app.screen.query_one("#topic", Select).value = destination
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            assert store.turn_links([job])[(job, 0)].bundle_id == destination
+            assert _panel(app).highlighted_option.id == f"t:{job}:0"
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_전체_보기는_연_시점의_멤버십과_내용을_더_보기와_복사에서_공유한다(env, repo, monkeypatch):
+    copied = []
+    monkeypatch.setattr(ColidayApp, "copy_to_clipboard", lambda self, text: copied.append(text))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    job = _reported(store, repo, "스냅샷의 가장 오래된 요청", "스냅샷의 가장 오래된 보고")
+    turn_ids = [0] + [_follow(store, job, f"{n}번째 요청", f"{n}번째 보고") for n in range(2, 24)]
+    bundle = store.assign_turns(
+        job, [TurnAnswer(turn_id, None, "스냅샷 묶음") for turn_id in turn_ids], expect={},
+    )[0]
+    destination_job = _reported(store, repo, "옮길 곳")
+    destination = _bind(store, destination_job, 0, name="다른 묶음")
+    other_terminal = Store(cfg.db_path)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == destination_job)
+            await _to_key(pilot, app, str(job))
+            _panel(app).focus()
+            _highlight(app, f"b:{bundle}")
+            await pilot.press("enter")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BundleScreen)
+            assert "차례 23" in str(screen.query_one("#bv-title", Label).content)
+
+            assert other_terminal.move_turns(job, [0], destination) == destination
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert copied[-1].count("▌나 #") == 23
+            assert "스냅샷의 가장 오래된 요청" in copied[-1]
+            assert _notified(app, "차례 23개를 복사했습니다")
+
+            screen.query_one("#bv-more").press()
+            await pilot.pause()
+            blocks = list(screen.query(TurnBlock))
+            assert len(blocks) == 23
+            assert blocks[0].view.turn.question == "스냅샷의 가장 오래된 요청"
+
+    try:
+        _run(scenario())
+    finally:
+        other_terminal.close()
+        store.close()
+
+
+def test_ctrl_b_메뉴로_차례를_옮기고_채팅의_차례를_모두_옮기고_묶음_이름을_바꾼다(env, repo, monkeypatch):
+    monkeypatch.setattr(topics, "spawn_pending", lambda cfg: pytest.fail("묶기 프로세스를 띄우면 안 된다"))
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    a, b, t2, t3, cancel, session = _two_bundles(store, repo)
+    from textual.widgets import Select
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
+            await pilot.press("ctrl+b")                               # 하이라이트가 제목 줄이면: 마지막 끝난 차례, 그 묶음
+            await pilot.pause()
+            menu = _menu_ids(app)
+            assert menu[-5:] == ["turn_move", "chat_move", "bundle_rename", "bundle_view", "bundle_sort"]   # 그룹·파생 항목 뒤
+            assert f"(#{b} 3번째: '취소 주문은 회색으로" in _menu_text(app, "turn_move")
+            assert _menu_text(app, "chat_move") == f"이 채팅의 차례 모두 옮기기 → … (#{b} · 차례 3)"
+            assert _menu_text(app, "bundle_rename") == "묶음 이름 바꾸기 (주문 취소)"
+            assert app.screen.query_one(OptionList).get_option("bundle_sort").disabled   # 안 묶인 차례가 없다
+            await pilot.press("escape")
+            await pilot.pause()
+
+            _highlight(app, f"t:{b}:0")                               # 하이라이트한 차례를 옮긴다
+            await pilot.press("ctrl+b")
+            await pilot.pause()
+            assert f"(#{b} 1번째: '환불 계산 고쳐 줘')" in _menu_text(app, "turn_move")
+            await _choose(pilot, app, "turn_move")
+            assert isinstance(app.screen, TopicScreen)
+            select = app.screen.query_one("#topic", Select)
+            assert select.value == cancel and not app.screen.query_one("#name").display
+            select.value = session
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            link = store.turn_links()[(b, 0)]
+            assert (link.bundle_id, link.manual, link.source) == (session, True, "manual")
+            await _until(pilot, lambda: _notified(app, f"#{b} 1번째 차례 을(를) 묶음 '세션' (으)로 옮겼습니다"))
+
+            await pilot.press("ctrl+b")                               # 새 묶음으로 떼어 내기
+            await pilot.pause()
+            await _choose(pilot, app, "turn_move")
+            app.screen.query_one("#topic", Select).value = 0
+            await pilot.pause()
+            name = app.screen.query_one("#name", Input)
+            assert name.display
+            name.focus()
+            name.value = "환불 [계산]"
+            await pilot.press("enter")
+            await pilot.pause()
+            new = store.turn_links()[(b, 0)].bundle_id
+            assert new not in (cancel, session) and store.bundle(new).manual_name
+            await _until(pilot, lambda: any(t.startswith("▶ 환불 [계산]") or t.startswith("▼ 환불 [계산]")
+                                            for t in _bundle_texts(app)))   # 사람이 만든 묶음도 혼자 보인다
+
+            await pilot.press("ctrl+b")                               # 이 채팅의 차례를 모두 한 묶음으로
+            await pilot.pause()
+            await _choose(pilot, app, "chat_move")
+            app.screen.query_one("#topic", Select).value = cancel
+            await pilot.pause()
+            await pilot.click("#save")
+            await pilot.pause()
+            assert {k: v.bundle_id for k, v in store.turn_links([b]).items()} == {(b, 0): cancel, (b, t2): cancel, (b, t3): cancel}
+            assert store.bundle(session) is None and store.bundle(new) is None      # 비게 된 묶음은 사라진다
+            await _until(pilot, lambda: str(_panel(app).border_title) == f"묶음 · #{b} 의 일 1개")
+
+            await pilot.press("ctrl+b")                               # 묶음 이름 바꾸기
+            await pilot.pause()
+            await _choose(pilot, app, "bundle_rename")
+            assert isinstance(app.screen, TopicScreen) and app.screen.query_one("#name", Input).value == "주문 취소"
+            app.screen.query_one("#name", Input).value = "주문 [취소]"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert (store.bundle(cancel).name, store.bundle(cancel).manual_name) == ("주문 [취소]", True)
+            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 주문 [취소]"))
+
+            await pilot.press("ctrl+b")                               # 묶음 전체 보기
+            await pilot.pause()
+            await _choose(pilot, app, "bundle_view")
+            assert isinstance(app.screen, BundleScreen)
+            await pilot.press("escape")
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_ctrl_b_메뉴의_안_묶인_차례_묶기는_호출_수를_보이고_확인_후_spawn_pending을_부른다(env, repo, monkeypatch):
     calls = []
     monkeypatch.setattr(topics, "spawn_pending", lambda cfg: calls.append(cfg))
     cfg = config.load()
     store = Store(cfg.db_path)
-    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
-        _done(store, repo, prompt)
-    _auto(store, [1], "혼자")
-    running = store.create_job(prompt="실행 중", repo=str(repo), workdir=str(repo), model=None)   # 끝나지 않은 작업은 빼고 센다
+    one = _reported(store, repo, "첫 작업")
+    two = _reported(store, repo, "둘째 작업")
+    _follow(store, two, "둘째의 둘째")
+    done = _reported(store, repo, "묶인 작업")
+    _bind(store, done, 0, name="혼자")
+    running = store.create_job(prompt="실행 중", repo=str(repo), workdir=str(repo), model=None)   # 끝나지 않은 채팅은 빼고 센다
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: str(running.id) in _keys(app))
-            await _to_key(pilot, app, "2")
+            await _to_key(pilot, app, str(one))
             await pilot.press("ctrl+b")
             await pilot.pause()
-            assert "(2개)" in str(app.screen.query_one(OptionList).get_option("topic_sort").prompt)
-            await _choose(pilot, app, "topic_sort")
-            assert isinstance(app.screen, ConfirmScreen) and "2개를 팀장 모델로 묶을까요" in app.screen._question
+            assert _menu_text(app, "bundle_sort") == "안 묶인 차례 자동으로 묶기 (채팅 2 · 차례 3 · 호출 약 2번)"
+            await _choose(pilot, app, "bundle_sort")
+            assert isinstance(app.screen, ConfirmScreen)
+            assert "안 묶인 끝난 차례 3개(채팅 2개)" in app.screen._question and "모델 호출 약 2번" in app.screen._question
             await pilot.press("n")
             await pilot.pause()
             assert calls == []
             await pilot.press("ctrl+b")
             await pilot.pause()
-            await _choose(pilot, app, "topic_sort")
+            await _choose(pilot, app, "bundle_sort")
             await pilot.press("y")
             await pilot.pause()
             assert calls == [cfg] and _notified(app, "묶음 패널에 나타납니다")
@@ -2645,32 +3192,57 @@ def test_ctrl_b_메뉴의_안_묶인_작업_묶기는_확인_후_spawn_pending�
         store.close()
 
 
-def test_작업_목록과_패널의_ctrl_e_ctrl_x는_TopicScreen을_열지_않는다(env, repo):
+def test_작업_목록과_패널의_방향키_ctrl_e_ctrl_x는_묶음을_바꾸지_않는다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     for prompt in ("첫 작업", "둘째 작업"):
-        _done(store, repo, prompt)
-    topic = _auto(store, [1, 2], "주문 취소")
+        _reported(store, repo, prompt)
+    bundle = _bind(store, 1, 0, name="주문 취소")
+    _bind(store, 2, 0, bundle)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: "a:1" in _bundle_ids(app))
+            await _until(pilot, lambda: "t:1:0" in _bundle_ids(app))
             await _to_key(pilot, app, "2")
-            for key in ("ctrl+e", "ctrl+x", "left", "right"):          # 작업 목록: 자동 묶음 키가 없다
+            drawn = list(_panel(app)._options)
+            for key in ("ctrl+e", "ctrl+x", "left", "right"):          # 작업 목록: 묶음 키가 없다
                 await pilot.press(key)
                 await pilot.pause()
                 assert len(app.screen_stack) == 1
+            assert _panel(app)._options == drawn                       # →/← 는 패널에서만 펼치고 접는다
             panel = _panel(app)
             panel.focus()
-            _highlight(app, "a:1")
+            _highlight(app, "t:1:0")
             await pilot.press("ctrl+x")                                # 패널: 그룹 줄이 아니면 안내만
             await pilot.pause()
-            assert _notified(app, "그룹에서 뺄 작업을") and store.job_topic(1).topic_id == topic
+            assert _notified(app, "그룹에서 뺄 작업을") and store.turn_links()[(1, 0)].bundle_id == bundle
             await pilot.press("ctrl+e")                                # 패널: 그룹 이름 (그룹이 없으면 안내)
             await pilot.pause()
             assert len(app.screen_stack) == 1 and _notified(app, "그룹에 들어 있지 않습니다")
-            assert [t.name for t in store.topics()] == ["주문 취소"]
+            assert [x.name for x in store.bundles()] == ["주문 취소"]
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_작업_목록에는_묶음_표시가_없다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
+        _reported(store, repo, prompt)
+    bundle = _bind(store, 1, 0, name="주문 취소", line="한 일")
+    _bind(store, 3, 0, bundle)
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: _keys(app) == ["3", "2", "1"])     # 순서는 그대로 (묶음으로 모으지 않는다)
+            for key in ("3", "2", "1"):
+                assert "주문 취소" not in _cell(app, key) and "한 일" not in _cell(app, key)
+            assert _cell(app, "1") == "첫 작업"
 
     try:
         _run(scenario())
@@ -2682,18 +3254,21 @@ def test_다른_터미널이_분류하면_다음_tick에_패널이_갱신되고_
     cfg = config.load()
     store = Store(cfg.db_path)
     for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
-        _done(store, repo, prompt)
+        _reported(store, repo, prompt)
     store.set_group([3, 1], store.create_group("결제", project=str(repo.resolve())).id)
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: "m:1" in _bundle_ids(app) and app.selected_id == 3)
+            assert _bundle_ids(app)[0] == "u:3:0"
             _highlight(app, "m:1")
-            _auto(store, [3, 2], "주문", "요약", lines={3: "셋째에서 한 일"})   # worker 가 분류를 마쳤다
-            await _until(pilot, lambda: "a:2" in _bundle_ids(app))
-            assert _panel(app).highlighted_option.id == "m:1"
-            assert any("#3 셋째에서 한 일" in t for t in _bundle_texts(app))
+            bundle = _bind(store, 3, 0, name="주문", line="셋째에서 한 일")   # worker 가 분류를 마쳤다
+            _bind(store, 2, 0, bundle)
+            await _until(pilot, lambda: f"b:{bundle}" in _bundle_ids(app))
+            assert _panel(app).highlighted_option.id == "m:1" and "u:3:0" not in _bundle_ids(app)
+            assert "셋째에서 한 일" in _bundle_texts(app)[_bundle_ids(app).index("t:3:0")]
+            assert "t:2:0" in _bundle_ids(app)
 
     try:
         _run(scenario())
@@ -2701,44 +3276,93 @@ def test_다른_터미널이_분류하면_다음_tick에_패널이_갱신되고_
         store.close()
 
 
-def test_메뉴를_연_사이_자동_묶음이_지워지면_이름_바꾸기는_알리기만_한다(env, repo):
+def test_옛_버전이_채팅_단위로_묶은_것은_화면이_차례_단위로_옮겨_보인다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    a = _reported(store, repo, "옛 작업 하나")
+    b = _reported(store, repo, "옛 작업 둘")
+    # 옛 버전(worker·TUI)이 쓰던 표에 직접 쓴다 (새 코드는 이 표를 읽기만 한다)
+    store._conn.execute("INSERT INTO topics(repo, name, summary, manual_name) VALUES (?, '옛 묶음', '옛 요약', 0)", (str(repo),))
+    store._conn.executemany("INSERT INTO job_topics(job_id, topic_id, manual, line) VALUES (?, 1, 0, ?)",
+                            [(a, "하나에서 한 일"), (b, "")])
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == b and any(t.startswith("▼ 옛 묶음") for t in _bundle_texts(app)))
+            assert [i for i in _bundle_ids(app) if i and i.startswith("t:")] == [f"t:{b}:0", f"t:{a}:0"]
+            assert "하나에서 한 일" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{a}:0")]
+            assert store._conn.execute("SELECT COUNT(*) FROM job_topics").fetchone()[0] == 2   # 옛 표는 그대로
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
+
+def test_메뉴를_연_사이_묶음이_지워지면_이름_바꾸기는_알리기만_한다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     for prompt in ("첫 작업", "둘째 작업", "셋째 작업"):
-        _done(store, repo, prompt)
-    topic = _auto(store, [1, 2], "주문 취소")
+        _reported(store, repo, prompt)
+    bundle = _bind(store, 1, 0, name="주문 취소")
+    _bind(store, 2, 0, bundle)
 
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: "1" in _keys(app))
             await _open_menu_on(pilot, app, "2")
-            assert store.delete_job(1) and store.delete_job(2)          # 다른 터미널에서 구성 작업을 모두 지웠다
-            assert topic not in {t.id for t in store.topics()}
-            await _choose(pilot, app, "topic_rename")
-            assert len(app.screen_stack) == 1 and _notified(app, "자동 묶음 '주문 취소' 이(가) 그사이 없어져")
+            assert store.delete_job(1) and store.delete_job(2)          # 다른 터미널에서 구성 채팅을 모두 지웠다
+            assert store.bundle(bundle) is None
+            await _choose(pilot, app, "bundle_rename")
+            assert len(app.screen_stack) == 1 and _notified(app, "묶음 '주문 취소' 이(가) 그사이 없어져")
 
-            await _open_menu_on(pilot, app, "3")                       # 이름 창이 열린 사이 없어져도 만들지 않는다
-            other = _auto(store, [3], "혼자")
-            store.update_topic(other, name="혼자", manual_name=True)
-            await pilot.press("escape")
+            other = _bind(store, 3, 0, name="혼자")
+            await _until(pilot, lambda: f"b:{other}" in _bundle_ids(app))
+            await pilot.press("ctrl+b")                                 # 이름 창이 열린 사이 없어져도 만들지 않는다
             await pilot.pause()
-            await _until(pilot, lambda: "a:3" in _bundle_ids(app))
-            await pilot.press("ctrl+b")
-            await pilot.pause()
-            await _choose(pilot, app, "topic_rename")
+            await _choose(pilot, app, "bundle_rename")
             assert isinstance(app.screen, TopicScreen)
-            store._conn.execute("DELETE FROM job_topics")
-            store._conn.execute("DELETE FROM topics")
+            store._conn.execute("DELETE FROM turn_bundles")
+            store._conn.execute("DELETE FROM bundles")
             app.screen.query_one("#name", Input).value = "새 이름"
             await pilot.press("enter")
             await pilot.pause()
-            assert store.topics() == [] and _notified(app, "자동 묶음 '혼자' 이(가) 그사이 없어져")
+            assert store.bundles() == [] and _notified(app, "묶음 '혼자' 이(가) 그사이 없어져")
 
     try:
         _run(scenario())
     finally:
         store.close()
+
+
+def test_타임라인에서도_내_질문과_AI_보고가_같은_기호로_구분된다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    job = _reported(store, repo, "첫 요청 [v1]", "## 첫 보고")
+    _follow(store, job, "이어서 둘째 요청", "둘째 보고")
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: app.selected_id == job and "둘째 보고" in _timeline_text(app))
+            timeline = app.query_one("#timeline")
+            asks = list(timeline.query(".ask"))
+            assert [str(w.content).split("\n")[1] for w in asks] == ["첫 요청 [v1]", "이어서 둘째 요청"]
+            assert all(str(w.content).startswith("나 · ") and w.styles.border_left[0] == "thick" for w in asks)
+            heads = [str(w.content) for w in timeline.query(".ai-head")]
+            assert len(heads) == 2 and all(h.startswith("◆ AI 보고 (") for h in heads)
+            reports = list(timeline.query(Markdown))
+            assert [m.source for m in reports] == ["## 첫 보고", "둘째 보고"] and all(m.has_class("ai-report") for m in reports)
+            assert all(m.styles.padding.left == 4 for m in reports)              # AI 보고는 들여쓴다
+            assert "사용자" not in _timeline_text(app)                           # 이어서 시킨 요청은 로그 줄이 아니라 질문 블록
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
+
 
 
 # ── 이전 리뷰 [P3] 회귀 ─────────────────────────────────────────────
@@ -2779,7 +3403,7 @@ def test_다른_프로젝트의_작업이_최근_100개_밖이면_옮겼다고�
     mine = _job_in(store, repo, "이 프로젝트 작업", parent_id=far.id)
 
     async def scenario():
-        app = ColidayApp(cfg, store, default_dir=str(repo))
+        app = _app(cfg, store, repo)
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.selected_id == mine.id and f"p:{far.id}" in _bundle_ids(app))
             panel = _panel(app)

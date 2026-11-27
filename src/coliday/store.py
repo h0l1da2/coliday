@@ -10,8 +10,9 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Collection, Iterable, Iterator
+from typing import Collection, Iterable, Iterator, Mapping
 
+from . import turns
 from .joblist import JobGroup, JobMeta
 
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
@@ -73,7 +74,7 @@ _GROUPS_TABLE = """CREATE TABLE IF NOT EXISTS job_groups (
     UNIQUE(project, name)
 )"""
 
-# 자동 묶음: 작업이 끝날 때 팀장 모델이 비슷한 작업끼리 묶는다 (topics.py). 묶음은 레포(job.repo)에 속하고 작업 하나는 묶음 하나.
+# 옛 버전의 채팅 단위 자동 묶음 (작업 하나는 묶음 하나). 이 버전은 쓰지 않고 sync_legacy 가 읽어 bundles 로 옮기기만 한다.
 _TOPICS_TABLES = """
 CREATE TABLE IF NOT EXISTS topics (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +91,38 @@ CREATE TABLE IF NOT EXISTS job_topics (
 );
 """
 
-_SCHEMA += _TOPICS_TABLES + _GROUPS_TABLE + ";\n"
+# 차례 단위 자동 묶음 (topics.py). 묶음 하나 = 한 가지 일, 채팅의 차례(turns.Turn) 하나는 묶음 하나.
+# 옛 표(topics·job_topics)와 따로 둔다: 옛 버전 코드의 _drop_empty_topics 는 job_topics 가 가리키지 않는 topics 를 지우므로
+# 같은 표에 차례 묶음을 두면 옛 worker·TUI 가 새 묶음을 지운다. 옛 표는 sync_legacy 가 읽기만 한다.
+_BUNDLE_TABLES = """
+CREATE TABLE IF NOT EXISTS bundles (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo         TEXT    NOT NULL,
+    name         TEXT    NOT NULL,
+    summary      TEXT    NOT NULL DEFAULT '',
+    manual_name  INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL    NOT NULL,
+    legacy_topic INTEGER UNIQUE
+);
+CREATE TABLE IF NOT EXISTS turn_bundles (
+    job_id    INTEGER NOT NULL,
+    turn_id   INTEGER NOT NULL,
+    bundle_id INTEGER NOT NULL,
+    asked_at  REAL    NOT NULL,
+    manual    INTEGER NOT NULL DEFAULT 0,
+    line      TEXT    NOT NULL DEFAULT '',
+    source    TEXT    NOT NULL DEFAULT 'model',
+    PRIMARY KEY (job_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_turn_bundles_bundle ON turn_bundles(bundle_id, asked_at);
+CREATE INDEX IF NOT EXISTS idx_events_job_kind ON events(job_id, kind, id);
+"""
+
+_LIVE_BUNDLE_LINK = (
+    "EXISTS (SELECT 1 FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id WHERE tb.bundle_id = b.id)"
+)
+
+_SCHEMA += _TOPICS_TABLES + _BUNDLE_TABLES + _GROUPS_TABLE + ";\n"
 
 # 실행 중에 보낸 요청(QUEUED)은 전달될 때 FOLLOW_UP 으로 바뀐다. 둘 다 사용자가 이어서 시킨 것이다.
 _SELECT_JOBS = (
@@ -137,25 +169,6 @@ class Job:
 
 
 @dataclass(frozen=True)
-class Topic:
-    """자동 묶음: 작업이 끝날 때 팀장 모델이 비슷한 작업끼리 묶은 것. 같은 레포(job.repo) 안에서만 묶는다."""
-
-    id: int
-    repo: str
-    name: str
-    summary: str
-    manual_name: bool  # 사람이 이름을 정했다: AI 가 다시 바꾸지 않는다
-
-
-@dataclass(frozen=True)
-class JobTopic:
-    job_id: int
-    topic_id: int
-    manual: bool  # 사람이 이 자동 묶음으로 옮겼다
-    line: str  # 이 작업이 한 일 한 줄 (모델이 쓴다)
-
-
-@dataclass(frozen=True)
 class EventRow:
     id: int
     job_id: int
@@ -165,7 +178,41 @@ class EventRow:
     message: str
 
 
-ANY_TOPIC = object()  # assign_topic(expect=…) 를 주지 않았다: 지금 어느 묶음에 있든 옮긴다
+@dataclass(frozen=True)
+class Bundle:
+    """차례 단위 자동 묶음: 한 가지 일. 같은 레포(job.repo) 안의 여러 채팅 차례가 모인다."""
+
+    id: int
+    repo: str
+    name: str  # 일을 요약한 짧은 제목
+    summary: str
+    manual_name: bool  # 사람이 이름을 정했다: 모델이 다시 바꾸지 않는다
+
+
+@dataclass(frozen=True)
+class TurnLink:
+    """차례 하나가 든 묶음."""
+
+    job_id: int
+    turn_id: int  # turns.Turn.turn_id
+    bundle_id: int
+    asked_at: float  # 차례 시각 (묶음 안 정렬용)
+    manual: bool  # 사람이 옮겼다: 모델이 다시 바꾸지 않는다
+    line: str  # AI 가 이 차례에 한 일 한 문장 (모델)
+    source: str  # model | legacy(옛 채팅 단위 분류, 나눠 볼 대상) | manual
+
+
+@dataclass(frozen=True)
+class TurnAnswer:
+    """모델이 정한 차례 하나의 묶음 (assign_turns 에 넘긴다)."""
+
+    turn_id: int
+    bundle_id: int | None  # 기존 묶음. None 이거나 쓸 수 없는 번호면 name 으로 새 묶음
+    name: str = ""  # 새 묶음 이름 (비어 있고 bundle_id 도 쓸 수 없으면 그 차례는 묶지 않는다)
+    line: str = ""
+
+
+TURN_SOURCES = ("model", "legacy", "manual")
 
 
 class Store:
@@ -430,6 +477,8 @@ class Store:
                 self._conn.execute("DELETE FROM job_meta WHERE job_id = ?", (job_id,))
                 self._conn.execute("DELETE FROM job_topics WHERE job_id = ?", (job_id,))
                 self._drop_empty_topics()
+                self._conn.execute("DELETE FROM turn_bundles WHERE job_id = ?", (job_id,))
+                self._drop_empty_bundles()
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
@@ -448,6 +497,45 @@ class Store:
             (job_id, after_id),
         ).fetchall()
         return [EventRow(**dict(r)) for r in rows]
+
+    def turn_events(self, job_id: int) -> list[EventRow]:
+        """차례를 나누는 데 필요한 이벤트만 (turns.split 에 넘긴다). 시작·오류는 본문 없이 (수천 줄 채팅도 수십 줄만 읽는다)."""
+        rows = self._conn.execute(
+            "SELECT id, job_id, ts, actor, kind, CASE WHEN kind IN (?, ?) THEN '' ELSE message END AS message "
+            f"FROM events WHERE job_id = ? AND kind IN ({', '.join('?' * len(turns.KINDS))}) ORDER BY id",
+            (turns.START, turns.ERROR, job_id, *turns.KINDS),
+        ).fetchall()
+        return [EventRow(**dict(r)) for r in rows]
+
+    def job_turn_snapshot(self, job_id: int) -> tuple[Job, list[EventRow]]:
+        """차례 이벤트와 작업 상태를 같은 읽기 스냅샷에서 가져온다. 없는 작업은 KeyError."""
+        with self._transaction(write=False):
+            rows = self.turn_events(job_id)
+            return self.get_job(job_id), rows
+
+    def refresh_turn_snapshots(
+        self, job_ids: Collection[int], cached_stamps: Mapping[int, tuple[int, str]],
+    ) -> tuple[dict[int, tuple[int, str]], list[tuple[Job, list[EventRow]]]]:
+        """같은 읽기 스냅샷에서 전체 stamp와 바뀐 작업의 차례 자료를 가져온다."""
+        with self._transaction(write=False):
+            stamps = self.turn_stamps(job_ids)
+            stale = [job_id for job_id, stamp in stamps.items() if cached_stamps.get(job_id) != stamp]
+            changed = [(job, self.turn_events(job.id)) for job in self.get_jobs(stale).values()]
+        return stamps, changed
+
+    def turn_stamps(self, job_ids: Collection[int]) -> dict[int, tuple[int, str]]:
+        """작업별 (마지막 이벤트 id, 상태). 같으면 차례를 다시 나눌 필요가 없다 (화면의 캐시용). 없는 작업은 빠진다."""
+        ids = list(dict.fromkeys(job_ids))
+        found: dict[int, tuple[int, str]] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self._conn.execute(
+                "SELECT j.id, j.status, COALESCE((SELECT MAX(e.id) FROM events e WHERE e.job_id = j.id), 0) AS last "
+                f"FROM jobs j WHERE j.id IN ({', '.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+            found.update({r["id"]: (int(r["last"]), r["status"]) for r in rows})
+        return found
 
     def last_result(self, job_id: int) -> str | None:
         """마지막 팀장 보고. 보고를 이벤트로 남기기 전 버전에서 끝난 작업이면 jobs.result."""
@@ -551,90 +639,290 @@ class Store:
             cur = self._conn.execute("DELETE FROM job_groups WHERE id = ?", (group_id,))
         return cur.rowcount == 1
 
-    # ── 자동 묶음 (topics.py 가 채운다) ─────────────────────────
-    def topics(self, repo: str | None = None) -> list[Topic]:
-        rows = self._conn.execute(
-            "SELECT * FROM topics WHERE (? IS NULL OR repo = ?) ORDER BY id", (repo, repo)
-        ).fetchall()
-        return [Topic(r["id"], r["repo"], r["name"], r["summary"], bool(r["manual_name"])) for r in rows]
+    # ── 옛 채팅 단위 자동 묶음 (topics·job_topics) ─────────────────────────
+    # 이 버전은 옛 표에 쓰지 않는다 (sync_legacy 가 읽어 옮기기만 한다). 옛 버전 코드가 같은 DB 를 계속 쓸 수 있어 표는 남기고,
+    # 작업을 지울 때만 옛 버전과 같은 방식으로 정리한다.
+    def _drop_empty_topics(self) -> None:
+        # 이전 버전이 작업만 지우고 남긴 줄도 함께 치운다 (트랜잭션 안에서 부른다).
+        self._conn.execute("DELETE FROM job_topics WHERE job_id NOT IN (SELECT id FROM jobs)")
+        self._conn.execute("DELETE FROM topics WHERE id NOT IN (SELECT topic_id FROM job_topics)")
 
-    def job_topics(self) -> dict[int, JobTopic]:
-        """있는 작업의 자동 묶음. 이전 버전이 작업만 지우고 남긴 줄은 빠진다 (job_meta 와 같은 원칙)."""
-        rows = self._conn.execute(
-            "SELECT jt.* FROM job_topics jt JOIN jobs j ON j.id = jt.job_id"
-        ).fetchall()
-        return {r["job_id"]: JobTopic(r["job_id"], r["topic_id"], bool(r["manual"]), r["line"]) for r in rows}
+    # ── 차례 단위 자동 묶음 (topics.py 가 채운다. 옛 topics·job_topics 는 sync_legacy 가 읽기만 한다) ──────────
+    def bundles(self, repo: str | None = None, *, recent: int | None = None) -> list[Bundle]:
+        """살아 있는 채팅의 차례가 든 묶음 (번호 순). recent 를 주면 차례가 가장 최근에 들어간 묶음 recent 개만."""
+        if recent is None:
+            rows = self._conn.execute(
+                f"SELECT b.* FROM bundles b WHERE (? IS NULL OR b.repo = ?) AND {_LIVE_BUNDLE_LINK} ORDER BY b.id",
+                (repo, repo),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT b.* FROM bundles b JOIN ("
+                "  SELECT tb.bundle_id, MAX(tb.asked_at) AS last FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id "
+                "  GROUP BY tb.bundle_id"
+                ") u ON u.bundle_id = b.id WHERE (? IS NULL OR b.repo = ?) "
+                "ORDER BY u.last DESC, b.id DESC LIMIT ?",
+                (repo, repo, recent),
+            ).fetchall()
+            rows = sorted(rows, key=lambda r: r["id"])
+        return [_bundle(r) for r in rows]
 
-    def job_topic(self, job_id: int) -> JobTopic | None:
+    def bundle(self, bundle_id: int) -> Bundle | None:
         row = self._conn.execute(
-            "SELECT jt.* FROM job_topics jt JOIN jobs j ON j.id = jt.job_id WHERE jt.job_id = ?", (job_id,)
+            f"SELECT b.* FROM bundles b WHERE b.id = ? AND {_LIVE_BUNDLE_LINK}", (bundle_id,)
         ).fetchone()
-        return JobTopic(row["job_id"], row["topic_id"], bool(row["manual"]), row["line"]) if row else None
+        return _bundle(row) if row else None
 
-    def assign_topic(
-        self, job_id: int, topic_id: int | None, *, name: str = "", line: str | None = None, manual: bool = False,
-        expect: int | None | object = ANY_TOPIC, summary: str | None = None,
-    ) -> int | None:
-        """작업을 자동 묶음에 넣는다. topic_id 가 None 이면 name 으로 새 묶음을 만든다. 넣은 묶음의 id (작업·묶음이 없으면 None).
+    def bundle_counts(self, repo: str | None = None) -> dict[int, tuple[int, int]]:
+        """묶음별 (차례 수, 채팅 수). 지워진 작업의 차례는 세지 않는다."""
+        rows = self._conn.execute(
+            "SELECT tb.bundle_id, COUNT(*) AS turns, COUNT(DISTINCT tb.job_id) AS chats "
+            "FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id JOIN bundles b ON b.id = tb.bundle_id "
+            "WHERE (? IS NULL OR b.repo = ?) GROUP BY tb.bundle_id",
+            (repo, repo),
+        ).fetchall()
+        return {r["bundle_id"]: (int(r["turns"]), int(r["chats"])) for r in rows}
 
-        묶음 만들기와 넣기, 비게 된 묶음 지우기를 한 트랜잭션으로 묶는다 (그사이 작업이 삭제돼 빈 묶음만 남지 않게).
-        다른 레포의 묶음에는 넣지 않는다. line 을 주지 않으면 이전 한 줄 요약을 그대로 둔다. summary 를 주면 넣은 묶음의 요약도 바꾼다.
+    def turn_links(self, job_ids: Collection[int] | None = None) -> dict[tuple[int, int], TurnLink]:
+        """(작업, 차례) → 묶음. job_ids 를 주면 그 작업들만. 이전 버전이 작업만 지우고 남긴 줄은 빠진다."""
+        sql = "SELECT tb.* FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id"
+        if job_ids is None:
+            rows = self._conn.execute(sql).fetchall()
+        else:
+            ids = list(dict.fromkeys(job_ids))
+            rows = []
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                rows += self._conn.execute(f"{sql} WHERE tb.job_id IN ({', '.join('?' * len(chunk))})", chunk).fetchall()
+        return {(r["job_id"], r["turn_id"]): _turn_link(r) for r in rows}
 
-        expect 는 모델에게 묻기 전에 읽어 둔 이 작업의 묶음 id 다 (아직 안 묶였으면 None). 모델의 답을 기다리는 사이 사람이
-        작업을 다른 묶음으로 옮겼으면(지금 묶음이 expect 와 다르면) 묶음과 사람이 옮겼다는 표시는 건드리지 않고 line 만 고친 뒤
-        지금 든 묶음의 id 를 돌려준다. 새 묶음도 만들지 않고 summary 도 쓰지 않는다 (다른 묶음을 두고 쓴 요약이다).
-        expect 를 주면 사람이 옮겼다는 표시(manual)는 지우지 않는다.
+    def bundle_turns(self, bundle_id: int, limit: int, before: TurnLink | None = None) -> list[TurnLink]:
+        """묶음의 차례를 최근 것부터 limit 개. before 를 주면 그 차례보다 오래된 것만 (다음 쪽을 읽는다)."""
+        where, params = "", ()
+        if before is not None:
+            where = (
+                " AND (tb.asked_at < ? OR (tb.asked_at = ? AND (tb.job_id < ? OR (tb.job_id = ? AND tb.turn_id < ?))))"
+            )
+            params = (before.asked_at, before.asked_at, before.job_id, before.job_id, before.turn_id)
+        rows = self._conn.execute(
+            "SELECT tb.* FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id "
+            f"WHERE tb.bundle_id = ?{where} ORDER BY tb.asked_at DESC, tb.job_id DESC, tb.turn_id DESC LIMIT ?",
+            (bundle_id, *params, limit),
+        ).fetchall()
+        return [_turn_link(r) for r in rows]
+
+    def bundle_jobs(self, bundle_id: int) -> list[int]:
+        """묶음에 차례가 있는 채팅 번호 (가장 최근 차례가 든 채팅부터)."""
+        rows = self._conn.execute(
+            "SELECT tb.job_id FROM turn_bundles tb JOIN jobs j ON j.id = tb.job_id WHERE tb.bundle_id = ? "
+            "GROUP BY tb.job_id ORDER BY MAX(tb.asked_at) DESC, tb.job_id DESC",
+            (bundle_id,),
+        ).fetchall()
+        return [r["job_id"] for r in rows]
+
+    def turn_backlog(self, job_ids: Collection[int]) -> dict[int, int]:
+        """작업별 아직 묶지 않은 차례 수 (0 인 작업은 빠진다). 옛 채팅 단위 분류(legacy)로 묶인 차례도 센다.
+
+        차례 수는 events 본문을 파이썬으로 읽지 않고 SQL 로 센다: 1(첫 요청) + .env 허용 안내문만 있는 것을 뺀 FOLLOW_UP 수
+        (turns.question_text 와 같은 기준). 실행 중인 차례도 세므로 끝난 작업에만 쓴다.
+        """
+        ids = list(dict.fromkeys(job_ids))
+        found: dict[int, int] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self._conn.execute(
+                "SELECT j.id, 1 + (SELECT COUNT(*) FROM events e WHERE e.job_id = j.id AND e.kind = ? "
+                "    AND TRIM(REPLACE(e.message, ?, ''), ' ' || char(9) || char(10) || char(13)) != '') AS total, "
+                "  (SELECT COUNT(*) FROM turn_bundles tb WHERE tb.job_id = j.id AND tb.source != 'legacy') AS sorted "
+                f"FROM jobs j WHERE j.id IN ({', '.join('?' * len(chunk))})",
+                (turns.FOLLOW_UP, turns.ALLOWED_NOTE, *chunk),
+            ).fetchall()
+            found.update({r["id"]: int(r["total"]) - int(r["sorted"]) for r in rows if r["total"] > r["sorted"]})
+        return found
+
+    def _turn_asked_at(self, job_id: int, turn_id: int) -> float | None:
+        """차례의 시각. 그런 차례가 없으면 None (트랜잭션 안에서 부른다)."""
+        if turn_id == 0:
+            row = self._conn.execute("SELECT created_at FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return float(row["created_at"]) if row else None
+        row = self._conn.execute(
+            "SELECT ts, message FROM events WHERE id = ? AND job_id = ? AND kind = ?", (turn_id, job_id, turns.FOLLOW_UP)
+        ).fetchone()
+        if row is None or not turns.question_text(row["message"]):
+            return None
+        return float(row["ts"])
+
+    def assign_turns(
+        self, job_id: int, answers: Iterable[TurnAnswer], *, expect: dict[int, int | None],
+        summaries: dict[int | str, str] | None = None,
+    ) -> dict[int, int]:
+        """모델이 정한 대로 차례들을 묶음에 넣는다. {차례 id: 지금 든 묶음 id} (넣지 못한 차례는 빠진다). 한 트랜잭션.
+
+        - expect 는 모델에게 묻기 전에 읽어 둔 차례별 묶음 id (안 묶였으면 None). 답을 기다리는 사이 사람이 옮겨 지금 묶음이
+          expect 와 다르거나 사람이 옮긴(manual) 차례면 묶음은 건드리지 않고 line 만 고친다 (expect 에 없는 차례는 비교하지 않는다).
+        - bundle_id 가 없거나 다른 레포·비어 있는 묶음이면 name 으로 새 묶음을 만든다 (같은 답 안의 같은 이름은 하나로).
+          name 도 없으면 넣지 않는다.
+        - summaries: {기존 묶음 id 또는 이번에 만든 새 묶음 이름: 요약}. 이번에 차례를 넣은 묶음의 요약만 바꾼다
+          (사람이 옮겨 넣지 않은 묶음을 두고 쓴 요약은 버린다). 쓸 수 없는 번호로 쓴 요약은 그 대신 만든 새 묶음에 준다.
+          기존 묶음의 이름은 바꾸지 않는다.
+        - 끝에 빈 묶음을 지운다 (legacy 차례를 나눠 비게 된 옛 묶음 등).
+        """
+        result: dict[int, int] = {}
+        with self._transaction():
+            job = self._conn.execute("SELECT repo FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                return result
+            answers = list(answers)
+            # 모델 답이 온 시점의 후보를 확인한다. 같은 배치에서 앞 차례를 옮겨 잠시 비는 묶음도 쓸 수 있다.
+            target_ids = {answer.bundle_id for answer in answers if answer.bundle_id is not None}
+            targets = {b.id for b in map(self.bundle, target_ids) if b is not None and b.repo == job["repo"]}
+            created: dict[str, int] = {}
+            instead: dict[int, int] = {}  # 쓸 수 없는 묶음 번호 → 대신 만든 새 묶음 (그 번호로 쓴 요약도 새 묶음에 준다)
+            used: set[int] = set()
+            for answer in answers:
+                asked_at = self._turn_asked_at(job_id, answer.turn_id)
+                if asked_at is None:
+                    continue
+                row = self._conn.execute(
+                    "SELECT bundle_id, manual FROM turn_bundles WHERE job_id = ? AND turn_id = ?", (job_id, answer.turn_id)
+                ).fetchone()
+                current = int(row["bundle_id"]) if row else None
+                if (answer.turn_id in expect and current != expect[answer.turn_id]) or (row and row["manual"]):
+                    if row is None:
+                        continue  # 기다리는 사이 묶음에서 빠졌다: 다시 넣지 않는다
+                    if answer.line:
+                        self._conn.execute(
+                            "UPDATE turn_bundles SET line = ? WHERE job_id = ? AND turn_id = ?",
+                            (answer.line, job_id, answer.turn_id),
+                        )
+                    result[answer.turn_id] = int(row["bundle_id"])
+                    continue
+                target = answer.bundle_id if answer.bundle_id in targets else None
+                if target is None:
+                    name = " ".join(answer.name.split())
+                    if not name:
+                        continue
+                    if name not in created:
+                        created[name] = self._new_bundle(job["repo"], name, manual_name=False)
+                        targets.add(created[name])
+                    target = created[name]
+                    if answer.bundle_id is not None:
+                        instead.setdefault(answer.bundle_id, target)
+                self._conn.execute(
+                    "INSERT INTO turn_bundles(job_id, turn_id, bundle_id, asked_at, manual, line, source) "
+                    "VALUES (?, ?, ?, ?, 0, ?, 'model') ON CONFLICT(job_id, turn_id) DO UPDATE SET "
+                    "bundle_id = excluded.bundle_id, asked_at = excluded.asked_at, manual = 0, source = 'model', "
+                    "line = CASE WHEN excluded.line != '' THEN excluded.line ELSE turn_bundles.line END",
+                    (job_id, answer.turn_id, target, asked_at, answer.line),
+                )
+                used.add(target)
+                result[answer.turn_id] = target
+            for key, summary in (summaries or {}).items():
+                bundle_id = created.get(key) if isinstance(key, str) else instead.get(key, key)
+                if bundle_id in used and summary:
+                    self._conn.execute("UPDATE bundles SET summary = ? WHERE id = ?", (summary, bundle_id))
+            self._drop_empty_bundles()
+        return result
+
+    def move_turns(self, job_id: int, turn_ids: Iterable[int], bundle_id: int | None, name: str = "") -> int | None:
+        """사람이 차례들을 옮긴다 (manual: 모델이 다시 바꾸지 않는다). bundle_id 가 None 이면 name 으로 새 묶음 (이름은 사람이 정한 것).
+
+        옮긴 묶음 id. 작업이 없거나, 같은 레포의 묶음이 아니거나, 옮길 차례가 하나도 없으면 None (아무것도 바꾸지 않는다).
+        한 줄 요약(line)은 그대로 둔다. 비게 된 묶음은 지운다.
         """
         with self._transaction():
             job = self._conn.execute("SELECT repo FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
                 return None
-            if expect is not ANY_TOPIC:
-                row = self._conn.execute(
-                    "SELECT topic_id, manual FROM job_topics WHERE job_id = ?", (job_id,)
-                ).fetchone()
-                if (row["topic_id"] if row else None) != expect:
-                    if row is None:
-                        return None
-                    if line is not None:
-                        self._conn.execute("UPDATE job_topics SET line = ? WHERE job_id = ?", (line, job_id))
-                    return int(row["topic_id"])
-                manual = manual or bool(row and row["manual"])
-            if topic_id is None:
-                cur = self._conn.execute(
-                    "INSERT INTO topics(repo, name, manual_name) VALUES (?, ?, ?)", (job["repo"], name, int(manual))
+            moves = [(t, at) for t in dict.fromkeys(turn_ids) if (at := self._turn_asked_at(job_id, t)) is not None]
+            if not moves:
+                return None
+            if bundle_id is None:
+                name = " ".join(name.split())
+                if not name:
+                    return None
+                bundle_id = self._new_bundle(job["repo"], name, manual_name=True)
+            else:
+                target = self.bundle(bundle_id)
+                if target is None or target.repo != job["repo"]:
+                    return None
+            for turn_id, asked_at in moves:
+                self._conn.execute(
+                    "INSERT INTO turn_bundles(job_id, turn_id, bundle_id, asked_at, manual, line, source) "
+                    "VALUES (?, ?, ?, ?, 1, '', 'manual') ON CONFLICT(job_id, turn_id) DO UPDATE SET "
+                    "bundle_id = excluded.bundle_id, asked_at = excluded.asked_at, manual = 1, source = 'manual'",
+                    (job_id, turn_id, bundle_id, asked_at),
                 )
-                topic_id = int(cur.lastrowid)
-            elif not self._conn.execute(
-                "SELECT 1 FROM topics WHERE id = ? AND repo = ?", (topic_id, job["repo"])
-            ).fetchone():
-                return None  # 없어졌거나 다른 레포의 묶음
-            self._conn.execute(
-                "INSERT INTO job_topics(job_id, topic_id, manual, line) VALUES (?, ?, ?, COALESCE(?, '')) "
-                "ON CONFLICT(job_id) DO UPDATE SET topic_id = excluded.topic_id, manual = excluded.manual, "
-                "line = COALESCE(?, line)",
-                (job_id, topic_id, int(manual), line, line),
-            )
-            if summary is not None:
-                self._conn.execute("UPDATE topics SET summary = ? WHERE id = ?", (summary, topic_id))
-            self._drop_empty_topics()
-        return topic_id
+            self._drop_empty_bundles()
+        return bundle_id
 
-    def update_topic(
-        self, topic_id: int, *, name: str | None = None, summary: str | None = None, manual_name: bool = False,
-    ) -> None:
-        """자동 묶음의 이름·요약을 바꾼다. 사람이 정한 이름은 manual_name 으로 바꿀 때만 바뀐다."""
-        if summary is not None:
-            self._conn.execute("UPDATE topics SET summary = ? WHERE id = ?", (summary, topic_id))
-        if name and manual_name:
-            self._conn.execute("UPDATE topics SET name = ?, manual_name = 1 WHERE id = ?", (name, topic_id))
-        elif name:
-            self._conn.execute("UPDATE topics SET name = ? WHERE id = ? AND manual_name = 0", (name, topic_id))
+    def rename_bundle(self, bundle_id: int, name: str) -> bool:
+        """사람이 이름을 정한다 (manual_name: 모델이 다시 바꾸지 않는다). 없는 묶음이거나 이름이 비면 False."""
+        name = " ".join(name.split())
+        if not name:
+            return False
+        cur = self._conn.execute("UPDATE bundles SET name = ?, manual_name = 1 WHERE id = ?", (name, bundle_id))
+        return cur.rowcount == 1
 
-    def _drop_empty_topics(self) -> None:
-        # 이전 버전이 작업만 지우고 남긴 줄도 함께 치운다 (트랜잭션 안에서 부른다).
-        self._conn.execute("DELETE FROM job_topics WHERE job_id NOT IN (SELECT id FROM jobs)")
-        self._conn.execute("DELETE FROM topics WHERE id NOT IN (SELECT topic_id FROM job_topics)")
+    def update_bundle_summary(self, bundle_id: int, summary: str) -> bool:
+        cur = self._conn.execute("UPDATE bundles SET summary = ? WHERE id = ?", (summary, bundle_id))
+        return cur.rowcount == 1
+
+    def _new_bundle(self, repo: str, name: str, *, manual_name: bool, summary: str = "",
+                    legacy_topic: int | None = None) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO bundles(repo, name, summary, manual_name, created_at, legacy_topic) VALUES (?, ?, ?, ?, ?, ?)",
+            (repo, name, summary, int(manual_name), time.time(), legacy_topic),
+        )
+        return int(cur.lastrowid)
+
+    def _drop_empty_bundles(self) -> None:
+        # 이전 버전이 작업만 지우고 남긴 차례 줄도 함께 치운다 (트랜잭션 안에서 부른다).
+        self._conn.execute("DELETE FROM turn_bundles WHERE job_id NOT IN (SELECT id FROM jobs)")
+        self._conn.execute("DELETE FROM bundles WHERE id NOT IN (SELECT bundle_id FROM turn_bundles)")
+
+    _LEGACY_TODO = (
+        "SELECT jt.job_id, jt.topic_id, jt.manual, jt.line, t.repo, t.name, t.summary, t.manual_name "
+        "FROM job_topics jt JOIN jobs j ON j.id = jt.job_id JOIN topics t ON t.id = jt.topic_id "
+        "WHERE NOT EXISTS (SELECT 1 FROM turn_bundles tb WHERE tb.job_id = jt.job_id) ORDER BY jt.job_id"
+    )
+
+    def sync_legacy(self) -> int:
+        """옛 채팅 단위 묶음(topics·job_topics)을 차례 단위 묶음으로 옮긴다. 옮긴 채팅 수. 여러 번 불러도 같다 (멱등).
+
+        차례 줄이 하나도 없는 채팅만 옮긴다: 보통은 확인 쿼리 한 번으로 끝난다 (화면이 매 초 불러도 된다).
+        옛 묶음 하나는 새 묶음 하나(legacy_topic 으로 중복 방지). 채팅의 끝난 차례를 모두 그 묶음에 넣는다:
+        차례가 1개면 model(이미 맞는 분류), 여럿이면 legacy(topics --sort 로 나눠 볼 대상), 사람이 옮긴 채팅이면 manual.
+        line 은 마지막 차례에만 옮긴다. 옛 표는 읽기만 한다 (옛 버전 코드가 같은 DB 를 계속 쓴다).
+        """
+        if self._conn.execute(f"{self._LEGACY_TODO} LIMIT 1").fetchone() is None:
+            return 0
+        moved = 0
+        with self._transaction():
+            for row in self._conn.execute(self._LEGACY_TODO).fetchall():
+                job = self.get_job(row["job_id"])
+                manual = bool(row["manual"])
+                found, _ = turns.split(job, self.turn_events(job.id))
+                ready = [t for t in found if manual or not t.active]
+                if not ready:
+                    continue  # 아직 실행 중인 첫 차례뿐이다: 끝나면 새 분류가 묶는다
+                bundle = self._conn.execute(
+                    "SELECT id FROM bundles WHERE legacy_topic = ?", (row["topic_id"],)
+                ).fetchone()
+                bundle_id = int(bundle["id"]) if bundle else self._new_bundle(
+                    row["repo"], row["name"], manual_name=bool(row["manual_name"]), summary=row["summary"],
+                    legacy_topic=row["topic_id"],
+                )
+                source = "manual" if manual else ("model" if len(ready) == 1 else "legacy")
+                for turn in ready:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO turn_bundles(job_id, turn_id, bundle_id, asked_at, manual, line, source) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (job.id, turn.turn_id, bundle_id, turn.asked_at, int(manual),
+                         row["line"] if turn is ready[-1] else "", source),
+                    )
+                moved += 1
+        return moved
 
     def get_jobs(self, job_ids: Collection[int]) -> dict[int, Job]:
         """여러 작업을 한 번에 읽는다 (없는 번호는 빠진다)."""
@@ -649,14 +937,24 @@ class Store:
         return found
 
     @contextlib.contextmanager
-    def _transaction(self) -> Iterator[None]:
-        self._conn.execute("BEGIN IMMEDIATE")
+    def _transaction(self, *, write: bool = True) -> Iterator[None]:
+        self._conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
             yield
             self._conn.execute("COMMIT")
         except BaseException:
             self._conn.execute("ROLLBACK")
             raise
+
+
+def _bundle(row: sqlite3.Row) -> Bundle:
+    return Bundle(row["id"], row["repo"], row["name"], row["summary"], bool(row["manual_name"]))
+
+
+def _turn_link(row: sqlite3.Row) -> TurnLink:
+    return TurnLink(
+        row["job_id"], row["turn_id"], row["bundle_id"], row["asked_at"], bool(row["manual"]), row["line"], row["source"],
+    )
 
 
 def _group_name(name: str) -> str:

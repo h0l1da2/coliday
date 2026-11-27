@@ -14,7 +14,7 @@ import pytest
 
 from coliday import cli, config, gitops, jobs, remote, worker
 from coliday.joblist import JobMeta
-from coliday.store import Store
+from coliday.store import Store, TurnAnswer
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SRC = Path(__file__).parents[1] / "src"
@@ -412,6 +412,29 @@ def _tables(s: Store) -> set[str]:
     return {r[0] for r in s._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
+def _old_topic(s: Store, job_id: int, name: str = "", topic_id: int | None = None, *, line: str = "",
+               manual: bool = False, summary: str = "") -> int:
+    """옛 버전(채팅 단위 자동 묶음)이 쓰던 대로 topics·job_topics 에 쓴다. 이 버전에는 이 표에 쓰는 코드가 없다."""
+    if topic_id is None:
+        topic_id = s._conn.execute(
+            "INSERT INTO topics(repo, name, summary, manual_name) VALUES ((SELECT repo FROM jobs WHERE id = ?), ?, ?, ?)",
+            (job_id, name, summary, int(manual)),
+        ).lastrowid
+    s._conn.execute(
+        "INSERT INTO job_topics(job_id, topic_id, manual, line) VALUES (?, ?, ?, ?) ON CONFLICT(job_id) DO UPDATE SET "
+        "topic_id = excluded.topic_id, manual = excluded.manual, line = excluded.line",
+        (job_id, topic_id, int(manual), line),
+    )
+    s._conn.execute("DELETE FROM topics WHERE id NOT IN (SELECT topic_id FROM job_topics)")   # 옛 _drop_empty_topics
+    return int(topic_id)
+
+
+def _old_rows(s: Store) -> tuple[list[tuple], list[tuple]]:
+    """옛 표의 (topics, job_topics) 줄."""
+    return ([tuple(r) for r in s._conn.execute("SELECT id, name, summary, manual_name FROM topics ORDER BY id")],
+            [tuple(r) for r in s._conn.execute("SELECT job_id, topic_id, manual, line FROM job_topics ORDER BY job_id")])
+
+
 def test_자동_묶음만_있는_DB를_열면_그룹_표가_생기고_자동_묶음은_그대로다(tmp_path):
     path = tmp_path / "b.db"
     conn = sqlite3.connect(path)
@@ -426,13 +449,11 @@ def test_자동_묶음만_있는_DB를_열면_그룹_표가_생기고_자동_묶
     s = Store(path)
     assert {"job_meta", "job_groups", "topics", "job_topics"} <= _tables(s)
     assert "project" in {r["name"] for r in s._conn.execute("PRAGMA table_info(job_groups)")}
-    [topic] = s.topics()
-    assert (topic.name, topic.summary, topic.manual_name) == ("주문 취소", "요약", True)
-    assert s.job_topic(1).line == "한 일" and s.job_topic(2).topic_id == 1
+    assert _old_rows(s) == ([(1, "주문 취소", "요약", 1)], [(1, 1, 0, "한 일"), (2, 1, 0, "")])
     assert s.job_meta() == {} and s.list_groups() == []
     s.close()
     again = Store(path)                                       # 두 번 열어도 같다
-    assert len(again.topics()) == 1 and len(again.job_topics()) == 2
+    assert _old_rows(again) == ([(1, "주문 취소", "요약", 1)], [(1, 1, 0, "한 일"), (2, 1, 0, "")])
     again.close()
 
 
@@ -446,7 +467,7 @@ def test_자동_묶음_표가_없는_DB를_열면_표가_생긴다(tmp_path):
 
     s = Store(path)
     assert {"topics", "job_topics"} <= _tables(s)
-    assert s.topics() == [] and s.job_topics() == {} and s.job_meta()[a].pinned
+    assert _old_rows(s) == ([], []) and s.job_meta()[a].pinned
     s.close()
     Store(path).close()
 
@@ -456,7 +477,7 @@ def test_옛_그룹_표와_자동_묶음_표가_같이_있어도_그룹_표를_�
     path = tmp_path / "dev.db"
     a, b = _old_groups_db(path)
     s = Store(path)
-    s.assign_topic(a, None, name="주문 취소", line="한 일")
+    _old_topic(s, a, "주문 취소", line="한 일")
     s._conn.executescript(
         "DROP TABLE job_groups;"
         "CREATE TABLE job_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);"
@@ -465,49 +486,260 @@ def test_옛_그룹_표와_자동_묶음_표가_같이_있어도_그룹_표를_�
 
     s = Store(path)
     assert "project" in {r["name"] for r in s._conn.execute("PRAGMA table_info(job_groups)")}
-    assert [t.name for t in s.topics()] == ["주문 취소"] and s.job_topic(a).line == "한 일"
+    assert _old_rows(s) == ([(1, "주문 취소", "", 0)], [(a, 1, 0, "한 일")])
     assert s.create_group("새 그룹", project="/r").name == "새 그룹"
     s.close()
 
 
-def test_작업을_지우면_파생은_조부모로_올리고_자동_묶음에서도_빼고_빈_묶음은_지운다(store):
+def test_작업을_지우면_파생은_조부모로_올리고_옛_자동_묶음_줄도_옛_버전처럼_정리한다(store):
     a = _job(store)
     b = _job(store, parent_id=a)
     c = _job(store, parent_id=b)
-    alone = store.assign_topic(b, None, name="혼자")
-    shared = store.assign_topic(a, None, name="함께")
-    store.assign_topic(c, shared)
+    alone = _old_topic(store, b, "혼자")
+    shared = _old_topic(store, a, "함께")
+    _old_topic(store, c, topic_id=shared)
 
     assert store.delete_job(b)
     assert store.job_meta()[c].parent_id == a
-    assert store.job_topic(b) is None
-    assert [t.id for t in store.topics()] == [shared]          # 비게 된 '혼자' 는 지워졌다
-    assert alone not in {t.id for t in store.topics()}
+    assert _old_rows(store) == ([(shared, "함께", "", 0)], [(a, shared, 0, ""), (c, shared, 0, "")])   # '혼자' 는 지워졌다
+    assert alone != shared
     assert store.delete_job(a)
-    assert [t.id for t in store.topics()] == [shared] and set(store.job_topics()) == {c}
+    assert _old_rows(store) == ([(shared, "함께", "", 0)], [(c, shared, 0, "")])
 
 
-def test_이전_버전이_작업만_지워_남은_자동_묶음_줄은_보이지_않는다(store):
-    a = _job(store)
-    b = _job(store)
-    topic = store.assign_topic(a, None, name="주문")
-    store.assign_topic(b, topic)
-    store._conn.execute("DELETE FROM jobs WHERE id = ?", (a,))  # job_topics 를 모르는 이전 버전의 삭제
-
-    assert set(store.job_topics()) == {b} and store.job_topic(a) is None
-    c = _job(store)
-    assert c != a                                              # 번호를 다시 쓰지 않아 고아 줄이 새 작업에 붙지 않는다
-    store.assign_topic(c, topic)                               # 다음 쓰기에서 고아 줄이 정리된다
-    assert store._conn.execute("SELECT COUNT(*) FROM job_topics WHERE job_id = ?", (a,)).fetchone()[0] == 0
-
-
-def test_다른_레포의_자동_묶음에는_넣지_않고_get_jobs는_한_번에_읽는다(store):
+def test_get_jobs는_여러_작업을_한_번에_읽고_없는_번호는_뺀다(store):
     a = _job(store)
     other = store.create_job(prompt="q", repo="/other", workdir="/other", model=None).id
-    topic = store.assign_topic(a, None, name="주문")
-    assert store.assign_topic(other, topic) is None and store.job_topic(other) is None
-    assert store.assign_topic(999, topic) is None
     assert set(store.get_jobs([a, other, 999])) == {a, other} and store.get_jobs([]) == {}
+
+
+# ── 차례 단위 자동 묶음 (bundles·turn_bundles) ─────────────────────────────────────
+
+def _follow(store: Store, job_id: int, prompt: str, report: str = "보고") -> int:
+    """끝난 작업에 이어서 시킨 차례 하나를 만든다. 그 차례 id (FOLLOW_UP 이벤트 id)."""
+    assert store.requeue_job(job_id, prompt)
+    turn_id = store.last_follow_up(job_id).id
+    store.add_event(job_id, "팀장", "result", report)
+    store.finish_job(job_id, "succeeded")
+    return turn_id
+
+
+def _links(store: Store) -> dict[tuple[int, int], tuple[int, str, bool, str]]:
+    return {k: (v.bundle_id, v.source, v.manual, v.line) for k, v in store.turn_links().items()}
+
+
+def _columns(s: Store, table: str) -> list[tuple]:
+    return [tuple(r) for r in s._conn.execute(f"PRAGMA table_info({table})")]
+
+
+def test_옛_자동_묶음_DB를_열면_새_표만_더하고_옛_표는_그대로_둔다(tmp_path):
+    path = tmp_path / "b.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(_OLD_SCHEMA + _B_SCHEMA_EXTRA)
+    conn.close()
+    before = sqlite3.connect(path)
+    old = {t: [tuple(r) for r in before.execute(f"PRAGMA table_info({t})")] for t in ("topics", "job_topics")}
+    before.close()
+
+    s = Store(path)
+    assert {"bundles", "turn_bundles"} <= _tables(s)
+    assert {t: _columns(s, t) for t in old} == old
+    s.close()
+    Store(path).close()                                       # 여러 번 열어도 된다
+
+
+def test_sync_legacy는_차례_하나면_model_여럿이면_legacy_사람이_옮긴_채팅은_manual로_옮긴다(store):
+    one = _job(store)
+    many = _job(store)
+    second = _follow(store, many, "환불도")
+    moved = _job(store)
+    topic = _old_topic(store, one, "주문 취소", line="취소 한 일", summary="옛 요약")
+    _old_topic(store, many, topic_id=topic, line="환불 한 일")
+    mine = _old_topic(store, moved, "내 묶음", line="", manual=True)
+
+    assert store.sync_legacy() == 3
+    bundles = {b.name: b for b in store.bundles()}
+    assert set(bundles) == {"주문 취소", "내 묶음"} and bundles["주문 취소"].summary == "옛 요약"
+    assert bundles["내 묶음"].manual_name and not bundles["주문 취소"].manual_name
+    first = bundles["주문 취소"].id
+    assert _links(store) == {
+        (one, 0): (first, "model", False, "취소 한 일"),
+        (many, 0): (first, "legacy", False, ""),
+        (many, second): (first, "legacy", False, "환불 한 일"),       # line 은 마지막 차례에만
+        (moved, 0): (bundles["내 묶음"].id, "manual", True, ""),
+    }
+    snapshot = (_links(store), store.bundles())
+    assert store.sync_legacy() == 0 and (_links(store), store.bundles()) == snapshot   # 두 번 불러도 같다
+    # 옛 표는 읽기만 했다
+    assert _old_rows(store)[1] == [(one, topic, 0, "취소 한 일"), (many, topic, 0, "환불 한 일"), (moved, mine, 1, "")]
+
+
+def test_sync_legacy_뒤에_옛_표가_바뀌거나_지워져도_옮긴_묶음은_그대로다(store):
+    a, b = _job(store), _job(store)
+    topic = _old_topic(store, a, "주문")
+    store.sync_legacy()
+    snapshot = (_links(store), store.bundles())
+
+    _old_topic(store, a, "옛 worker 가 다시 묶음")                  # 이미 옮긴 채팅의 옛 분류가 바뀌어도 무시한다
+    store._conn.execute("DELETE FROM job_topics")                 # 옛 코드의 _drop_empty_topics 흉내
+    store._conn.execute("DELETE FROM topics WHERE id NOT IN (SELECT topic_id FROM job_topics)")
+    assert store.sync_legacy() == 0 and (_links(store), store.bundles()) == snapshot
+
+    _old_topic(store, b, "새 옛 묶음")                              # 아직 차례 줄이 없는 채팅은 옮긴다
+    assert store.sync_legacy() == 1
+    assert [x.name for x in store.bundles()] == ["주문", "새 옛 묶음"] and topic not in {r[0] for r in _old_rows(store)[0]}
+
+
+def test_sync_legacy는_실행_중인_차례를_옮기지_않고_같은_옛_묶음은_한_번만_만든다(store):
+    a, b = _job(store), _job(store)
+    topic = _old_topic(store, a, "주문")
+    _old_topic(store, b, topic_id=topic)
+    assert store.requeue_job(b, "이어서")                         # b 의 둘째 차례는 실행 대기 중
+    assert store.sync_legacy() == 2
+    [bundle] = store.bundles()
+    assert _links(store) == {(a, 0): (bundle.id, "model", False, ""), (b, 0): (bundle.id, "model", False, "")}
+    assert store.turn_backlog([a, b]) == {b: 1}                  # 둘째 차례는 아직 안 묶였다
+
+
+def test_assign_turns는_같은_이름을_하나로_만들고_다른_레포_번호면_이름으로_새로_만든다(store):
+    a = _job(store)
+    t2 = _follow(store, a, "둘째")
+    t3 = _follow(store, a, "셋째")
+    other = store.create_job(prompt="q", repo="/other", workdir="/other", model=None).id
+    foreign = store.assign_turns(other, [TurnAnswer(0, None, "남의 묶음")], expect={0: None})[0]
+
+    got = store.assign_turns(
+        a,
+        [TurnAnswer(0, None, "결제", "첫 일"), TurnAnswer(t2, None, " 결제 ", "둘째 일"), TurnAnswer(t3, foreign, "", "x"),
+         TurnAnswer(999, None, "없는 차례")],
+        expect={0: None, t2: None, t3: None}, summaries={"결제": "결제 요약", foreign: "남의 요약 덮기"},
+    )
+    pay = got[0]
+    assert got == {0: pay, t2: pay}                                # 이름 없이 남의 묶음을 고른 차례는 묶지 않는다
+    assert [(b.name, b.summary) for b in store.bundles("/r")] == [("결제", "결제 요약")]
+    assert store.bundle(foreign).summary == ""                    # 넣지 않은 묶음의 요약은 쓰지 않는다
+
+    got = store.assign_turns(a, [TurnAnswer(t3, foreign, "로그인", "셋째 일")], expect={t3: None})
+    assert store.bundle(got[t3]).name == "로그인" and store.bundle(got[t3]).repo == "/r"
+    assert store.bundle_counts("/r") == {pay: (2, 1), got[t3]: (1, 1)}
+
+
+def test_assign_turns는_기다리는_사이_사람이_옮긴_차례와_manual_차례는_line만_고친다(store):
+    a, b = _job(store), _job(store)
+    t2 = _follow(store, a, "둘째")
+    first = store.assign_turns(a, [TurnAnswer(0, None, "주문", "처음"), TurnAnswer(t2, None, "주문")], expect={0: None, t2: None})[0]
+    human = store.move_turns(b, [0], None, "결제")
+    assert store.bundle(human).manual_name
+
+    before = store.turn_links()[(a, 0)].bundle_id
+    assert store.move_turns(a, [0], human) == human              # 모델의 답을 기다리는 사이 사람이 옮겼다
+    got = store.assign_turns(
+        a, [TurnAnswer(0, None, "AI 묶음", "AI 한 줄"), TurnAnswer(t2, first, "", "둘째 AI")],
+        expect={0: before, t2: first}, summaries={"AI 묶음": "AI 요약", first: "주문 요약"},
+    )
+    assert got == {0: human, t2: first}
+    link = store.turn_links()[(a, 0)]
+    assert (link.bundle_id, link.manual, link.source, link.line) == (human, True, "manual", "AI 한 줄")
+    assert [(x.name, x.summary) for x in store.bundles()] == [("주문", "주문 요약"), ("결제", "")]   # 'AI 묶음' 은 생기지 않았다
+
+    got = store.assign_turns(a, [TurnAnswer(0, first, "", "또")], expect={0: human})   # expect 가 맞아도 manual 은 그대로
+    assert got == {0: human} and store.turn_links()[(a, 0)].line == "또"
+
+
+def test_legacy_차례를_모두_나누면_빈_옛_묶음은_지워진다(store):
+    a = _job(store)
+    t2 = _follow(store, a, "둘째")
+    _old_topic(store, a, "옛 묶음")
+    store.sync_legacy()
+    [old] = store.bundles()
+    assert store.turn_backlog([a]) == {a: 2}
+    got = store.assign_turns(a, [TurnAnswer(0, None, "일 하나"), TurnAnswer(t2, None, "일 둘")], expect={0: old.id, t2: old.id})
+    assert old.id not in {x.id for x in store.bundles()} and len(set(got.values())) == 2
+    assert store.turn_backlog([a]) == {}
+
+
+def test_사람이_차례를_옮기고_이름을_바꾸면_모델이_되돌리지_않는다(store):
+    a = _job(store)
+    t2 = _follow(store, a, "둘째")
+    got = store.assign_turns(a, [TurnAnswer(0, None, "주문", "한 일")], expect={0: None})
+    assert store.move_turns(a, [t2, 12345], got[0]) == got[0]    # 없는 차례는 건너뛴다
+    assert store.turn_links()[(a, t2)].source == "manual" and store.turn_links()[(a, 0)].line == "한 일"
+    assert store.move_turns(a, [12345], got[0]) is None and store.move_turns(a, [0], None, "  ") is None
+    assert store.move_turns(999, [0], got[0]) is None
+    assert store.rename_bundle(got[0], "사람 이름") and store.bundle(got[0]).manual_name
+    assert store.update_bundle_summary(got[0], "요약") and store.bundle(got[0]).name == "사람 이름"
+    assert not store.rename_bundle(999, "x") and not store.rename_bundle(got[0], " ")
+
+
+def test_bundle_turns는_최근_차례부터_쪽으로_읽는다(store):
+    a, b = _job(store), _job(store)
+    t2 = _follow(store, a, "둘째")
+    bundle = store.assign_turns(a, [TurnAnswer(0, None, "주문"), TurnAnswer(t2, None, "주문")], expect={})[0]
+    store.move_turns(b, [0], bundle)
+    page = store.bundle_turns(bundle, 2)
+    assert [(x.job_id, x.turn_id) for x in page] == [(a, t2), (b, 0)]
+    assert [(x.job_id, x.turn_id) for x in store.bundle_turns(bundle, 2, before=page[-1])] == [(a, 0)]
+    assert store.bundle_counts() == {bundle: (3, 2)}
+    assert set(store.turn_links([b])) == {(b, 0)}
+
+
+def test_작업을_지우면_차례_줄과_빈_묶음도_같이_지우고_다른_채팅의_차례는_남는다(store):
+    a, b = _job(store), _job(store)
+    shared = store.assign_turns(a, [TurnAnswer(0, None, "함께")], expect={})[0]
+    store.move_turns(b, [0], shared)
+    alone = store.assign_turns(a, [TurnAnswer(_follow(store, a, "둘째"), None, "혼자")], expect={})
+    assert store.delete_job(a)
+    assert set(store.turn_links()) == {(b, 0)} and [x.id for x in store.bundles()] == [shared]
+    assert set(alone.values()) & {x.id for x in store.bundles()} == set()
+
+
+def test_이전_버전이_작업만_지워_남은_차례_줄은_보이지_않고_다음_쓰기에서_정리된다(store):
+    a, b = _job(store), _job(store)
+    bundle = store.assign_turns(a, [TurnAnswer(0, None, "주문")], expect={})[0]
+    store.move_turns(b, [0], bundle)
+    store._conn.execute("DELETE FROM jobs WHERE id = ?", (a,))     # turn_bundles 를 모르는 이전 버전의 삭제
+    assert set(store.turn_links()) == {(b, 0)} and store.bundle_counts() == {bundle: (1, 1)}
+    assert [x.job_id for x in store.bundle_turns(bundle, 10)] == [b]
+    store.move_turns(b, [0], bundle)
+    assert store._conn.execute("SELECT COUNT(*) FROM turn_bundles WHERE job_id = ?", (a,)).fetchone()[0] == 0
+
+
+def test_마지막_채팅이_삭제된_묶음은_후보에서_빠지고_수동으로도_선택할_수_없다(store):
+    a, b, c = _job(store), _job(store), _job(store)
+    kept = store.move_turns(a, [0], None, "남은 수동 묶음")
+    stale = store.move_turns(b, [0], None, "사라진 수동 묶음")
+    store._conn.execute("DELETE FROM jobs WHERE id = ?", (b,))
+
+    assert store.bundle(stale) is None
+    assert [bundle.id for bundle in store.bundles("/r")] == [kept]
+    assert [bundle.id for bundle in store.bundles("/r", recent=1)] == [kept]
+    assert store.move_turns(c, [0], stale) is None
+    assert store.assign_turns(c, [TurnAnswer(0, stale, "")], expect={0: None}) == {}
+    assert (c, 0) not in store.turn_links()
+    assert store.assign_turns(c, [TurnAnswer(0, kept, "")], expect={0: None}) == {0: kept}
+    assert store.bundle(kept).manual_name
+
+
+def test_assign_turns는_같은_배치에서_앞_차례가_떠난_기존_묶음에_뒤_차례를_넣는다(store):
+    job = _job(store)
+    second = _follow(store, job, "둘째")
+    old = store.assign_turns(job, [TurnAnswer(0, None, "기존 묶음")], expect={})[0]
+
+    got = store.assign_turns(
+        job, [TurnAnswer(0, None, "새 묶음"), TurnAnswer(second, old, "")], expect={0: old, second: None},
+    )
+
+    assert got[second] == old and got[0] != old
+    assert store.bundle_counts() == {old: (1, 1), got[0]: (1, 1)}
+
+
+def test_turn_backlog는_env_안내문만_있는_요청을_차례로_세지_않는다(store):
+    from coliday.guard import ALLOWED_NOTE
+
+    a = _job(store)
+    _follow(store, a, ALLOWED_NOTE)
+    _follow(store, a, f"{ALLOWED_NOTE}\n\n사람 글")
+    assert store.turn_backlog([a, 999]) == {a: 2}
 
 
 # ── 파생 작업 실행 ─────────────────────────────────────────────────────────

@@ -13,7 +13,10 @@ if "--tools" in sys.argv and sys.argv[sys.argv.index("--output-format") + 1] == 
         with open(os.environ["FAKE_CLAUDE_TOPIC_ARGS"], "a") as f:
             f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin_prompt, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
     time.sleep(float(os.environ.get("FAKE_CLAUDE_TOPIC_DELAY", "0")))  # 묶기가 도는 동안의 상태를 보는 테스트용
-    answer = os.environ.get("FAKE_CLAUDE_TOPIC", '{"topic": null, "name": "주문 취소", "summary": "주문 취소 API 를 만들었다.", "line": "취소 API 추가"}')
+    answer = os.environ.get("FAKE_CLAUDE_TOPIC", json.dumps({
+        "turns": [{"turn": 1, "bundle": None, "name": "주문 취소", "line": "취소 API 추가"}],
+        "summaries": [{"bundle": None, "name": "주문 취소", "summary": "주문 취소 API 를 만들었다."}],
+    }, ensure_ascii=False))
     if answer == "fail":
         sys.stderr.write("topic boom\n")
         sys.exit(1)
