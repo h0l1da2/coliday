@@ -14,7 +14,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from coliday import guard, members, remote, review_gate, team, topics
+from coliday import guard, hooks, members, remote, review_gate, team, topics
 from coliday.jobs import one_line, organize as jobs_organize
 from coliday.config import Config
 from coliday.events import LEAD, CodexTranslator, Translator
@@ -57,7 +57,7 @@ def build_command(
         cmd += ["--resume", resume]
     for directory in add_dirs or []:
         cmd += ["--add-dir", directory]
-    if settings:  # .env 읽기를 막는 규칙과 샌드박스 (guard.py), 리뷰 상한 훅 (review_gate.py)
+    if settings:  # .env 읽기를 막는 규칙과 샌드박스 (guard.py), PreToolUse 훅 (hooks.py)
         cmd += ["--settings", settings]
     if allow:
         cmd += ["--allowedTools", *allow]
@@ -191,7 +191,10 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
                 # 서버를 다루는 실행 파일은 ssh 연결(네트워크, ~/.ssh)이 필요하다.
                 excluded=[f"{team.runner_command(path)} *" for path in [*scripts, *helpers]],
             ))
-        settings_obj |= review_gate.claude_hooks(review_counter)  # .env 를 허용한 작업에도 리뷰 상한은 건다
+        # 리뷰 상한과 Codex 래퍼의 명령 제한은 .env 를 허용한 작업에도 건다 (hooks.py)
+        hooks_config = job_dir / "hooks.json"
+        hooks.write_config(hooks_config, review_counter=review_counter, wrappers=runners, tasks_dir=tasks_dir)
+        settings_obj |= hooks.claude_hooks(hooks_config)
         settings = json.dumps(settings_obj, ensure_ascii=False)
         agents_json = json.dumps(team.claude_agents(resolved, runners, tasks_dir), ensure_ascii=False, indent=2)
         agents_file.write_text(agents_json, encoding="utf-8")

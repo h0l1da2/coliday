@@ -308,6 +308,10 @@ TUI 에서는 `ctrl+t` 창 맨 위에서 기본 에이전트를 고르고, 역�
   coliday 는 작업마다 그 팀원용 실행 파일(`~/.coliday/jobs/<id>/codex/`)을 만들고 그 파일만 권한 검사 없이 실행되게 허용한다
   (`--allowedTools`). 허용하지 않으면 auto 권한 모드가 Codex 실행을 "허가받지 않은 외부 전송"으로 보고 막는다.
   Codex 로 둔 팀원에게는 작업 명세와 저장소 내용이 Codex(OpenAI)로 전달된다.
+  이 래퍼는 Bash 로 그 실행 파일(`<파일> <명세>`, 끝날 때까지 기다리는 `<파일> --wait <명세>`), `git status --short`,
+  `git diff --stat`, `cat <명세>.done <명세>.out` 만 실행할 수 있고, 그 밖의 명령은 PreToolUse 훅이 막는다.
+  실행 파일은 끝날 때 `<명세>.done`(종료 코드)과 `<명세>.out`(답)을 남기므로, 오래 걸려 백그라운드로 넘어가도
+  `pgrep`·`sleep` 반복문 없이 끝났는지 안다 (그 반복문은 자기 자신과 팀장의 명령줄에 걸려 끝나지 않는다).
 - Codex 팀장은 샌드박스(workspace-write) 안에서 실행되고, 팀원에게는 셸 명령으로 일을 맡긴다. 팀원은 coliday 가 샌드박스 밖에서 실행한다.
 - Codex 로 실행하는 역할은 수정 도구(Edit/Write)가 없으면 읽기 전용 샌드박스로 돈다 (architect, reviewer).
   팀원 정의에 `"codex_sandbox": "workspace-write"` 를 두면 쓰기를 허용한다 (verifier 는 빌드 산출물 때문에 기본으로 허용).

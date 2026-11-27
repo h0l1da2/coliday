@@ -953,6 +953,12 @@ def test_codex_실행_파일은_역할_지침과_작업_명세를_넘기고_답�
     assert subprocess.run([str(runner), str(spec)], cwd=repo, capture_output=True, text=True).stdout == "코덱스 팀원 보고\n"
     # 백그라운드로 넘어가도 래퍼가 프로세스를 찾지 않고 끝났는지 알 수 있게 완료 표시와 답을 남긴다
     assert (repo / "spec.md.done").read_text() == "0\n" and (repo / "spec.md.out").read_text() == "코덱스 팀원 보고\n"
+    waited = subprocess.run([str(runner), "--wait", str(spec)], cwd=repo, capture_output=True, text=True)
+    assert (waited.returncode, waited.stdout) == (0, "코덱스 팀원 보고\n")   # 백그라운드로 넘어갔을 때 기다리는 길
+    pending = subprocess.run([str(runner), "--wait", str(repo / "아직.md")], cwd=repo, capture_output=True, text=True,
+                             env={**os.environ, "COLIDAY_WAIT_SEC": "0"})
+    assert pending.returncode == 75 and "아직 실행 중" in pending.stderr
+    assert len(_codex_calls(env)) == 2                 # 기다리기는 Codex 를 다시 부르지 않는다
     assert _codex_calls(env)[-1]["stdin"].endswith("\n\n# 작업 명세\n심각도 [P0]~[P3] `git diff` $(pwd)")
     missing = subprocess.run([str(runner), str(repo / "none.md")], cwd=repo, capture_output=True, text=True)
     assert missing.returncode == 2 and "작업 명세 파일이 없거나 비어 있습니다" in missing.stderr
@@ -981,6 +987,11 @@ def test_기본_codex_coder는_codex_래퍼다(env, repo, capsys):
     assert "Codex CLI" in agents["codex-coder"]["prompt"] and agents["codex-coder"]["model"] == "haiku"
     wrapper = agents["codex-coder"]["prompt"]
     assert ".done" in wrapper and "pgrep" in wrapper and "sleep 반복문으로 기다리지 않는다" in wrapper
+    assert "--wait" in wrapper and "coliday 가 막는다" in wrapper
+    hooks_config = json.loads((config.load().job_dir(1) / "hooks.json").read_text())   # 래퍼의 Bash 를 훅이 막는다
+    runner = next((config.load().job_dir(1) / "codex").glob("*-codex-coder"))
+    assert hooks_config["wrappers"] == {"codex-coder": str(runner)}
+    assert hooks_config["tasks_dir"] == str(config.load().job_dir(1) / "codex-tasks")
 
     capsys.readouterr()
     cli.main(["model"])

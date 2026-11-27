@@ -3,8 +3,8 @@
 팀장 지시문의 "리뷰 반복 상한"은 모델이 따르는 규칙이라 어길 수 있다. 재리뷰가 매번 새 문제를 찾아
 리뷰 → 재작업 → 재리뷰가 끝없이 돌면 작업 하나가 30분을 넘긴다. 그래서 프로그램이 직접 센다.
 
-- Claude 팀장: `--settings` 로 PreToolUse 훅을 건다. 훅은 `python -m coliday.review_gate <카운터 파일>` 이고,
-  Agent(Task) 도구로 리뷰 담당을 부를 때마다 센다. 상한을 넘으면 종료 코드 2 로 호출을 막고, 그 이유는 팀장에게 전달된다.
+- Claude 팀장: `--settings` 의 PreToolUse 훅(`hooks.py`)이 Agent(Task) 도구로 리뷰 담당을 부를 때마다 `take` 로 센다.
+  상한을 넘으면 종료 코드 2 로 호출을 막고, 그 이유는 팀장에게 전달된다.
 - Codex 팀장: 팀원 호출이 `members.Server` 를 거치므로 거기서 `take` 로 센다.
 
 리뷰 담당은 역할 이름에 "review" 가 든 팀원이다 (기본 `reviewer`). 카운터는 실행마다 `reset` 으로 0 에서 시작한다.
@@ -14,14 +14,9 @@ from __future__ import annotations
 
 import fcntl
 import json
-import shlex
-import sys
 from pathlib import Path
 
 from coliday.team import MAX_REVIEW_CALLS
-
-_DISPATCH_MATCHER = "Agent|Task"
-
 
 def is_review_role(role: str | None) -> bool:
     return bool(role) and "review" in str(role).lower()
@@ -69,30 +64,3 @@ def refused(path: Path) -> int:
         return int(json.loads(path.read_text(encoding="utf-8")).get("refused", 0))
     except (OSError, ValueError, AttributeError):
         return 0
-
-
-def claude_hooks(path: Path) -> dict:
-    """`claude --settings` 에 합칠 훅 설정."""
-    command = f"{shlex.quote(sys.executable)} -m coliday.review_gate {shlex.quote(str(path))}"
-    return {"hooks": {"PreToolUse": [{"matcher": _DISPATCH_MATCHER, "hooks": [{"type": "command", "command": command}]}]}}
-
-
-def hook_main(argv: list[str], stdin: str) -> tuple[int, str]:
-    """PreToolUse 훅. (종료 코드, stderr) 를 돌려준다. 2 면 Claude Code 가 그 호출을 막고 stderr 를 팀장에게 준다.
-
-    입력을 읽지 못하는 등 훅 자체의 문제로는 작업을 막지 않는다 (0).
-    """
-    try:
-        data = json.loads(stdin)
-        role = (data.get("tool_input") or {}).get("subagent_type")
-        reason = take(Path(argv[0]), role)
-    except (IndexError, ValueError, AttributeError, OSError):
-        return 0, ""
-    return (2, reason) if reason else (0, "")
-
-
-if __name__ == "__main__":
-    code, message = hook_main(sys.argv[1:], sys.stdin.read())
-    if message:
-        sys.stderr.write(message + "\n")
-    raise SystemExit(code)

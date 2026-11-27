@@ -703,6 +703,15 @@ def _codex_runner(
     return (
         "#!/bin/sh\n"
         "# coliday 가 만든 파일. 이 역할을 Codex CLI 로 실행한다: 작업 명세 파일(없으면 stdin)을 받아 Codex 의 답을 출력한다.\n"
+        # --wait <명세>: 백그라운드로 넘어간 실행이 끝나기를 기다린다 (프로세스를 찾지 않고 완료 표시 파일만 본다).
+        # Bash 도구의 시간 제한(10분) 안에 돌아오도록 최대 COLIDAY_WAIT_SEC(기본 540)초만 기다린다.
+        'if [ "$1" = "--wait" ]; then\n'
+        '  if [ -z "$2" ]; then echo "사용법: $0 --wait <작업 명세 파일>" >&2; exit 2; fi\n'
+        '  waited=0; limit=${COLIDAY_WAIT_SEC:-540}\n'
+        '  while [ ! -f "$2.done" ] && [ "$waited" -lt "$limit" ]; do sleep 5; waited=$((waited + 5)); done\n'
+        '  if [ ! -f "$2.done" ]; then echo "아직 실행 중입니다. 같은 명령으로 다시 기다리세요: $0 --wait $2" >&2; exit 75; fi\n'
+        '  cat "$2.out" 2>/dev/null; exit "$(cat "$2.done")"\n'
+        "fi\n"
         'if [ "$#" -gt 0 ] && [ ! -s "$1" ]; then echo "작업 명세 파일이 없거나 비어 있습니다: $1" >&2; exit 2; fi\n'
         'OUT=$(mktemp) && LOG=$(mktemp) || exit 1\n'
         "trap 'rm -f \"$OUT\" \"$LOG\"' EXIT\n"
@@ -810,10 +819,14 @@ def _codex_wrapper(spec: dict, runner: str, task_prefix: str) -> dict:
         "2. 다음 명령을 실행한다. 다른 명령과 묶지 않고(&&, ;, |, 리다이렉션 금지) 이 명령 하나만 그대로 실행한다. "
         "오래 걸릴 수 있으니 실행 시간 제한을 최대로 지정하고 끝날 때까지 기다린다:\n"
         f"{runner_command(runner)} <1에서 쓴 파일의 경로>\n"
-        "   명령이 백그라운드로 넘어갔으면 완료 알림을 기다린다. 명령은 끝날 때 <1에서 쓴 파일의 경로>.done(종료 코드)과 "
-        ".out(Codex 의 답)을 남기니, 확인이 필요하면 `cat <경로>.done <경로>.out` 처럼 그 두 파일만 읽는다. "
+        "   명령이 백그라운드로 넘어갔으면 완료 알림을 기다리거나, 다음 명령으로 끝날 때까지 기다린다 "
+        "(최대 9분. \"아직 실행 중\"이면 같은 명령을 다시 실행한다):\n"
+        f"{runner_command(runner)} --wait <1에서 쓴 파일의 경로>\n"
+        "   명령은 끝날 때 <1에서 쓴 파일의 경로>.done(종료 코드)과 .out(Codex 의 답)을 남긴다. "
         "pgrep·ps 로 프로세스를 찾거나 sleep 반복문으로 기다리지 않는다 "
         "(이 경로는 팀장과 그 반복문 자신의 명령줄에도 들어 있어 늘 찾아지므로 반복문이 끝나지 않는다).\n"
+        "   Bash 로는 이 실행 파일, `git status --short`, `git diff --stat`, `cat <경로>.done <경로>.out` 만 실행할 수 있다. "
+        "그 밖의 명령은 coliday 가 막는다.\n"
         "3. 끝나면 `git status --short`, `git diff --stat` 을 읽는다.\n"
         "4. 보고: 명령이 출력한 Codex 의 답을 빠짐없이 전하고, 변경 파일 목록과 Codex 가 보고한 검사 결과를 적는다 "
         "(직접 확인하지 않은 것은 그렇게 표시). 명령이 실패했거나 실행이 거부됐으면 오류 메시지를 그대로 보고하고 대신 일하지 않는다."
