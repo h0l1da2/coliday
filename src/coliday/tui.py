@@ -95,6 +95,9 @@ _STATUS_STYLE = {
     "queued": "dim", "running": "bold yellow", "succeeded": "green",
     "failed": "bold red", "cancelled": "dim",
 }
+# 작업 목록과 묶음 패널의 작업 줄에 쓰는 상태 표시. 끝난 작업도 실행 중과 같은 동그라미로, 색만 초록으로 보인다
+# (실행 중은 굵은 노랑). 색이 없는 `coliday ls` 출력은 STATUS_ICON 의 ✓ 를 그대로 쓴다.
+_LIST_ICON = {**STATUS_ICON, "succeeded": "●"}
 _ACTOR_COLORS = ["cyan", "green", "yellow", "blue", "magenta", "bright_cyan", "bright_green"]
 _KIND_STYLE = {
     "dispatch": "bold", "done": "green", "error": "bold red", "phase": "italic", "text": "dim",
@@ -1509,7 +1512,7 @@ class ColidayApp(App[None]):
         """작업 목록 한 줄. 요청 칸 앞에 📌 고정, ↳#부모, ▣그룹 표시를 붙인다 (group_names 는 보이는 그룹만)."""
         style = _STATUS_STYLE.get(job.status, "")
         status = Text("✔" if marked else " ", style="bold yellow")  # 선택 표시는 늘 한 칸을 차지한다 (열 너비가 변하지 않게)
-        status.append(STATUS_ICON.get(job.status, "?"), style=style)
+        status.append(_LIST_ICON.get(job.status, "?"), style=style)
         prompt: str | Text = jobs.one_line(job.prompt, 40)
         item = (meta or {}).get(job.id)
         marks: list[str] = []
@@ -2361,7 +2364,7 @@ class ColidayApp(App[None]):
 
         def line(job: Job, lead: str, suffix: str = "", bold: bool = False) -> Text:
             text = Text(lead)
-            text.append(STATUS_ICON.get(job.status, "?"), style=_STATUS_STYLE.get(job.status, ""))
+            text.append(_LIST_ICON.get(job.status, "?"), style=_STATUS_STYLE.get(job.status, ""))
             text.append(f" #{job.id} {jobs.one_line(job.prompt, 40)}", style="bold" if bold else "")
             if self._meta.get(job.id, joblist.JobMeta()).pinned:
                 text.append(" 📌")

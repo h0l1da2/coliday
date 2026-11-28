@@ -3460,3 +3460,32 @@ def test_다른_프로젝트의_작업이_최근_100개_밖이면_옮겼다고�
         _run(scenario())
     finally:
         store.close()
+
+
+def test_작업_목록은_끝난_작업도_동그라미로_보이고_색으로_실행_중과_구분한다(env, repo):
+    cfg = config.load()
+    store = Store(cfg.db_path)
+    done = _done(store, repo, "끝난 작업")
+    running = store.create_job(prompt="도는 작업", repo=str(repo), workdir=str(repo), model=None)
+    assert store.start_job(running.id, os.getpid())                  # 살아 있는 pid: 정리되지 않는다
+    failed = store.create_job(prompt="실패한 작업", repo=str(repo), workdir=str(repo), model=None)
+    store.finish_job(failed.id, "failed")
+
+    def cell(app, job_id):
+        text = app.query_one("#jobs", DataTable).get_cell(str(job_id), "st")
+        mark = text.plain.strip()
+        return mark, {str(span.style) for span in text.spans if text.plain[span.start:span.end] == mark}
+
+    async def scenario():
+        app = ColidayApp(cfg, store, default_dir=str(repo))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _until(pilot, lambda: len(_keys(app)) == 3)
+            done_id = done if isinstance(done, int) else done.id
+            assert cell(app, done_id) == ("●", {"green"})                # 끝난 작업: 초록 동그라미
+            assert cell(app, running.id) == ("●", {"bold yellow"})       # 실행 중: 굵은 노랑 동그라미
+            assert cell(app, failed.id) == ("✗", {"bold red"})           # 실패는 그대로
+
+    try:
+        _run(scenario())
+    finally:
+        store.close()
