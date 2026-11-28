@@ -12,7 +12,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from coliday import config, gitops, jobs, members, projects, remote, team, topics, turns, worker
+from coliday import config, gitops, jobs, lifeline, members, projects, remote, team, topics, turns, worker
 from coliday.jobs import STATUS_ICON, JobError
 from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 
@@ -20,6 +20,7 @@ from coliday.store import QUEUED, RESULT, EventRow, Job, Store
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    lifeline.watch()  # 테스트가 띄운 백그라운드 프로세스면 테스트가 끝날 때 함께 끝난다 (실사용에서는 아무 일도 하지 않는다)
     cfg = config.load()
     if args.cmd is None:
         args = parser.parse_args(["ui" if sys.stdin.isatty() and sys.stdout.isatty() else "ls"])
