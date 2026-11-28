@@ -443,10 +443,12 @@ class JobTable(DataTable):
 
 
 class BundlePanel(OptionList):
-    """선택한 채팅의 차례가 든 묶음(일 단위)들. 묶음마다 차례별 내 질문과 AI 가 한 일을 보인다.
+    """선택한 채팅의 차례가 든 묶음(일 단위)들. 기본은 묶음마다 `1. 이름` 한 줄이고, 내용은 제목을 클릭(Enter)해 전체 보기 창에서 본다.
+
+    → 로 펼친 묶음만 그 아래에 차례별 내 질문과 AI 가 한 일을 보인다.
 
     줄 id: 'b:묶음'(제목), 't:작업:차례'(묶인 차례), 'u:작업:차례'(아직 안 묶인 차례, 임시 묶음), 'more:묶음'(이전 차례),
-    'gd'(접힌 그룹·파생 구역 머리), 'm:/p:/c:번호'(그룹 구성·부모·자식 작업), 'menu'. 빈 줄·안내 줄은 고를 수 없다.
+    'gd'(접힌 그룹·파생 구역 머리), 'm:/p:/c:번호'(그룹 구성·부모·자식 작업). 빈 줄·안내 줄은 고를 수 없다.
     단축키는 패널에 포커스가 있을 때만 동작한다 (프로젝트 목록의 ctrl+e·ctrl+x 와 겹치지 않는다).
     """
 
@@ -1089,7 +1091,7 @@ class ColidayApp(App[None]):
         self._groups: list[joblist.JobGroup] = []
         self._turn_cache = topics.TurnCache()  # 채팅별 차례 나누기 (바뀐 채팅만 다시 읽는다)
         self._bundle_list: topics.BundleList | None = None  # 묶음 패널에 그린 것 (메뉴가 대상을 고를 때 쓴다)
-        self._bundle_open: dict[int, bool] = {}  # 사람이 펼치거나 접은 묶음 (없으면 맨 위 묶음만 펼침. 메모리만)
+        self._bundle_open: dict[int, bool] = {}  # 사람이 → 로 펼치거나 접은 묶음 (없으면 접힘: 제목 한 줄. 메모리만)
         self._turn_open: set[tuple[int, int]] = set()  # 펼친 차례 (작업, 차례)
         self._bundle_limits: dict[int, int] = {}  # 채팅별 패널에 보이는 묶음 수(더 보기 상태)
         self._loose_limits: dict[int, int] = {}  # 채팅별 패널에 보이는 미분류 차례 수
@@ -2173,7 +2175,9 @@ class ColidayApp(App[None]):
         panel.add_options([Option(text, id=key, disabled=not enabled) for key, text, enabled in options])
         ids = [key for key, _, _ in options]
         enabled = [i for i, (_, _, ok) in enumerate(options) if ok]
-        if prefer is not None and prefer in ids:
+        if not enabled:  # 고를 수 있는 줄이 없다 (차례를 읽지 못했다는 안내뿐)
+            index = None
+        elif prefer is not None and prefer in ids:
             index = ids.index(prefer)
         elif same_job and old_id is not None and old_id in ids:
             index = ids.index(old_id)
@@ -2202,7 +2206,8 @@ class ColidayApp(App[None]):
     def _bundle_options(self, job_id: int, width: int) -> list[tuple[str | None, Text, bool]]:
         """묶음 패널의 줄: (option id, 글, 고를 수 있음).
 
-        선택한 채팅의 일(묶음과 아직 안 묶인 차례)을 최근 것부터 → 그룹·파생 구역(접힘) → 메뉴 줄. 맨 위 묶음만 기본으로 펼친다.
+        선택한 채팅의 일(묶음과 아직 안 묶인 차례)을 오래된 것부터 한 줄씩 → 그룹·파생 구역(접힘).
+        묶음은 `1. 이름` 처럼 번호와 이름만 보인다 (번호는 이 채팅에서 다룬 순서). 내용은 제목을 클릭(Enter)해 전체 보기 창에서 본다.
         """
         view = topics.panel_bundles(
             self.store, job_id, recent=_BUNDLE_TURNS, extra=_BUNDLE_EXTRA,
@@ -2233,7 +2238,7 @@ class ColidayApp(App[None]):
         self._bundle_list = view
         self._panel_parent = {}
         options: list[tuple[str | None, Text, bool]] = []
-        # 묶음과 안 묶인 차례를 이 채팅에서 가장 최근에 다룬 순서로 늘어놓는다 (실행 중인 새 차례가 위에 온다).
+        # 묶음과 안 묶인 차례를 이 채팅에서 다룬 순서로 늘어놓는다 (오래된 일이 위, 실행 중인 새 차례가 아래).
         items: list[tuple[float, int, object]] = []
         for order, item in enumerate(view.bundles):
             own = [tv.turn.asked_at for tv in item.turns if tv.turn.job_id == job_id]
@@ -2241,47 +2246,45 @@ class ColidayApp(App[None]):
         loose_limit = self._loose_limits.get(job_id, _LOOSE_MAX)
         for order, loose in enumerate(view.loose[:loose_limit]):
             items.append((loose.turn.asked_at, -order, loose))
-        items.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        first_bundle = True
-        for _, _, item in items:
-            if isinstance(item, topics.BundleView):
-                options += self._bundle_rows(item, job_id, width, default_open=first_bundle)
-                first_bundle = False
-            else:
-                options += self._loose_rows(item, job_id, width)  # type: ignore[arg-type]
+        items.sort(key=lambda x: (x[0], x[1]))
+        if view.more:  # 더 오래된 묶음은 목록 위에 있다
+            options.append(("bundle-more", Text(
+                f"… 오래된 묶음 {min(view.more, _BUNDLE_MAX)}개 더 보기 (남은 {view.more}개)", style="dim",
+            ), True))
         if len(view.loose) > loose_limit:
             left = len(view.loose) - loose_limit
             options.append(("loose-more", Text(
                 f"◌ 이전 미분류 차례 {min(left, _LOOSE_MAX)}개 더 보기 (남은 {left}개)", style="dim",
             ), True))
+        number = view.more  # 번호는 이 채팅에서 다룬 순서: 가려진 오래된 묶음 다음부터 센다
+        for _, _, item in items:
+            if isinstance(item, topics.BundleView):
+                number += 1
+                options += self._bundle_rows(item, job_id, width, number)
+            else:
+                options += self._loose_rows(item, job_id, width)  # type: ignore[arg-type]
         for queued in view.queued:
             options.append((None, Text(f"  ⏳ 대기: {turns.clip(queued, max(10, width // 2 - 8))}", style="italic yellow"),
                             False))
-        if view.more:
-            options.append(("bundle-more", Text(
-                f"… 오래된 묶음 {min(view.more, _BUNDLE_MAX)}개 더 보기 (남은 {view.more}개)", style="dim",
-            ), True))
         if not items:
             options.append((None, Text("이 채팅의 차례를 읽지 못했습니다 — 그사이 지워졌을 수 있습니다", style="dim"), False))
         options += self._group_rows(job_id)
-        options.append(("menu", Text("⋯ 묶음 메뉴 (Ctrl+B)", style="italic"), True))
-        return options
+        return options  # 메뉴 줄은 두지 않는다: 메뉴는 Ctrl+B 로 연다 (패널 아래 테두리에 안내가 있다)
 
-    def _bundle_rows(self, item: topics.BundleView, job_id: int, width: int, *, default_open: bool) -> list:
+    def _bundle_rows(self, item: topics.BundleView, job_id: int, width: int, number: int) -> list:
+        """묶음 하나. 기본은 `1. 이름` 한 줄뿐이다 (부연 설명 없음). → 로 펼친 묶음만 요약과 차례를 아래에 보인다."""
         bundle = item.bundle
         key = f"b:{bundle.id}"
-        opened = self._bundle_open.get(bundle.id, default_open)
-        chats = " ".join(f"#{i}" for i in item.job_ids[:4]) + (f" 외 {len(item.job_ids) - 4}" if len(item.job_ids) > 4 else "")
+        opened = self._bundle_open.get(bundle.id, False)
         title = Text()
-        title.append(("▼ " if opened else "▶ ") + bundle.name, style="bold")
+        if not opened:
+            title.append(f"{number}. {bundle.name}", style="bold")
+            title.truncate(max(8, width), overflow="ellipsis")
+            return [(key, title, True)]
+        chats = " ".join(f"#{i}" for i in item.job_ids[:4]) + (f" 외 {len(item.job_ids) - 4}" if len(item.job_ids) > 4 else "")
+        title.append(f"▼ {number}. {bundle.name}", style="bold")
         title.append(f"  · 차례 {item.turn_count} · 채팅 {chats}", style="dim")
         title.truncate(max(8, width), overflow="ellipsis")
-        if not opened:
-            latest = next((tv for tv in item.turns if tv.turn.job_id == job_id), item.turns[0] if item.turns else None)
-            if latest is not None:
-                for line in _fit([f"마지막: {_did_short(latest)}"], width - 4, 1):
-                    title.append(f"\n    {line}", style="dim")
-            return [(key, title, True)]
         if bundle.summary:
             for line in _fit([f"요약: {bundle.summary}"], width - 2, _SUMMARY_LINES):
                 title.append(f"\n  {line}", style="dim")
@@ -2302,7 +2305,10 @@ class ColidayApp(App[None]):
         return rows
 
     def _loose_rows(self, tv: topics.TurnView, job_id: int, width: int) -> list:
-        """아직 안 묶인 차례 하나 = 임시 묶음 (◌). 실행 중이면 분류 중, 묶기에 실패했으면 묶지 못함."""
+        """아직 안 묶인 차례 하나 = 임시 묶음 (◌). 실행 중이면 분류 중, 묶기에 실패했으면 묶지 못함.
+
+        기본은 `◌ 상태 · "질문 첫 줄"` 한 줄이고, Enter·→ 로 펼친 차례만 질문과 AI 가 한 일을 아래에 보인다.
+        """
         turn = tv.turn
         hint = ""
         if turn.active:
@@ -2314,14 +2320,13 @@ class ColidayApp(App[None]):
         title = Text()
         title.append(f"◌ {state} · ", style="bold")
         title.append(f"\"{turns.clip(turn.question.splitlines()[0] if turn.question else '', 30)}\"", style="bold")
-        title.append(f"  · #{turn.job_id} {turn.index}번째", style="dim")
         title.truncate(max(8, width), overflow="ellipsis")
         if hint:
             title.append(f"\n{_ASK_INDENT}{hint}", style="dim")
-        title.append("\n")
-        opened = (turn.job_id, turn.turn_id) in self._turn_open
-        title.append_text(_turn_text(tv, width=width, mine=turn.job_id == job_id, opened=opened))
-        return [(f"u:{turn.job_id}:{turn.turn_id}", title, True), (None, Text(""), False)]
+        if (turn.job_id, turn.turn_id) in self._turn_open:
+            title.append("\n")
+            title.append_text(_turn_text(tv, width=width, mine=turn.job_id == job_id, opened=True))
+        return [(f"u:{turn.job_id}:{turn.turn_id}", title, True)]
 
     def _group_rows(self, job_id: int) -> list[tuple[str | None, Text, bool]]:
         """그룹·파생 구역. 기본은 한 줄 요약으로 접혀 있고 → 로 펼치면 그룹 구성·부모·자식 작업 줄이 나온다."""
@@ -2403,9 +2408,7 @@ class ColidayApp(App[None]):
         """Enter·클릭: 제목 줄·이전 차례 줄 → 전체 보기, 다른 채팅의 차례 → 그 채팅으로, 이 채팅의 차례 → 펼치기/접기."""
         key = event.option_id or ""
         kind, _, rest = key.partition(":")
-        if key == "menu":
-            self.action_bundle_menu()
-        elif key == "loose-more":
+        if key == "loose-more":
             job_id = self.selected_id
             if job_id is not None:
                 current = self._loose_limits.get(job_id, _LOOSE_MAX)
@@ -2637,7 +2640,7 @@ class ColidayApp(App[None]):
         for g in empty.values():
             items.append((f"delete_empty:{g.id}", f"빈 그룹 삭제 → {g.name}", True))
         # 묶음은 프로젝트가 아니라 레포 기준이라 기타를 보는 중에도 된다. 대상은 패널에서 하이라이트한 차례·묶음
-        # (없으면 선택한 채팅의 마지막 끝난 차례·맨 위 묶음). Space 선택은 무시한다.
+        # (없으면 선택한 채팅의 마지막 끝난 차례·가장 최근에 다룬 묶음). Space 선택은 무시한다.
         target = self._bundle_target(self.selected_id)
         items += self._bundle_menu_items(target)
         # 대상은 메뉴를 연 지금 정한다: 메뉴가 열려 있는 동안 다른 화면에서 지워 1초 새로고침이 커서를 옮겨도
@@ -2741,7 +2744,7 @@ class ColidayApp(App[None]):
 
     # ── 묶음 (모델이 차례를 일 단위로 묶은 것): 메뉴에서만 고친다 ────────────────────────
     def _bundle_target(self, job_id: int | None) -> _BundleTarget:
-        """메뉴의 묶음 항목 대상: 패널에서 하이라이트한 차례·묶음, 없으면 선택한 채팅의 마지막 끝난 차례와 맨 위 묶음."""
+        """메뉴의 묶음 항목 대상: 패널에서 하이라이트한 차례·묶음, 없으면 선택한 채팅의 마지막 끝난 차례와 가장 최근에 다룬 묶음."""
         view = self._bundle_list if self._bundle_job == job_id else None
         if job_id is None or view is None:
             return _BundleTarget(job_id)

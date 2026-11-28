@@ -1331,12 +1331,19 @@ def _bundle_texts(app) -> list[str]:
     return [str(o.prompt) for o in _panel(app)._options]
 
 
+async def _expand(pilot, app, bundle_id: int) -> None:
+    """묶음을 → 로 펼친 상태로 만든다 (기본은 `1. 이름` 한 줄뿐이다)."""
+    app._bundle_open[bundle_id] = True
+    app._show_panel(f"b:{bundle_id}")
+    await pilot.pause()
+
+
 def _gd_part(app) -> tuple[list, list[str]]:
-    """묶음 패널 아래 그룹·파생 구역(gd 머리 다음부터 메뉴 줄 앞까지)의 (id, 글)."""
+    """묶음 패널 아래 그룹·파생 구역(gd 머리 다음부터 끝까지)의 (id, 글)."""
     ids, texts = _bundle_ids(app), _bundle_texts(app)
     if "gd" not in ids:
         return [], []
-    start, end = ids.index("gd") + 1, ids.index("menu")
+    start, end = ids.index("gd") + 1, len(ids)  # 그룹·파생 구역이 패널의 마지막이다
     return ids[start:end], texts[start:end]
 
 
@@ -2230,23 +2237,31 @@ def test_묶음_패널은_혼자인_채팅도_묶음으로_보이고_그룹과_�
             await _until(pilot, lambda: app.selected_id == 3)
             panel = _panel(app)
             assert panel.has_class("-shown") and str(panel.border_title) == "묶음 · #3 의 일 1개"
-            # 아직 안 묶인 차례도 임시 묶음(◌)으로 보이고 안에 내 질문과 AI 가 한 일이 있다
-            assert _bundle_ids(app) == ["u:3:0", None, "menu"]
+            # 아직 안 묶인 차례도 임시 묶음(◌) 한 줄로 보인다. Enter 로 펼쳐야 내 질문과 AI 가 한 일이 나온다
+            assert _bundle_ids(app) == ["u:3:0"]                           # 메뉴 줄도 없다 (메뉴는 Ctrl+B)
+            assert _bundle_texts(app)[0] == '◌ 묶기 전 · "셋째 작업"'
+            panel.focus()
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
             text = _bundle_texts(app)[0]
             assert text.startswith('◌ 묶기 전 · "셋째 작업"') and "\n  ▌나 #3 · 1번째 요청 · " in text
             assert "\n      ◆ AI ✓ 완료" in text
 
             bundle = _bind(store, 3, 0, name="셋째 일", line="셋째에서 한 일")   # 다른 터미널(worker)이 묶었다
             await _until(pilot, lambda: f"b:{bundle}" in _bundle_ids(app))
-            assert _bundle_ids(app) == [f"b:{bundle}", None, "t:3:0", None, "menu"]        # 혼자인 묶음도 보인다
-            assert _bundle_texts(app)[0].startswith("▼ 셋째 일  · 차례 1 · 채팅 #3")
+            assert _bundle_ids(app) == [f"b:{bundle}"]                      # 혼자인 묶음도 보인다: 번호와 이름 한 줄뿐
+            assert _bundle_texts(app)[0] == "1. 셋째 일"
+            await _expand(pilot, app, bundle)                              # → 로 펼치면 요약과 차례가 아래에 나온다
+            assert _bundle_ids(app) == [f"b:{bundle}", None, "t:3:0", None]
+            assert _bundle_texts(app)[0].startswith("▼ 1. 셋째 일  · 차례 1 · 채팅 #3")
             assert "셋째에서 한 일" in _bundle_texts(app)[2]
 
             group = store.create_group("결제 [v1]", project=str(repo.resolve()))   # 그룹·파생은 아래 접힌 구역 하나로
             store.set_group([3, 1], group.id)
             await _until(pilot, lambda: "gd" in _bundle_ids(app))
-            assert _bundle_ids(app)[-2:] == ["gd", "menu"] and "m:3" not in _bundle_ids(app)
-            assert _bundle_texts(app)[-2] == '▸ 그룹 "결제 [v1]" (2)'                     # 대괄호도 그대로 보인다
+            assert _bundle_ids(app)[-1] == "gd" and "m:3" not in _bundle_ids(app)
+            assert _bundle_texts(app)[-1] == '▸ 그룹 "결제 [v1]" (2)'                     # 대괄호도 그대로 보인다
             panel.focus()
             await pilot.pause()
             _highlight(app, "gd")
@@ -2405,7 +2420,7 @@ def test_묶음_패널의_ctrl_e와_ctrl_x는_패널에서만_동작하고_프�
 
             panel.focus()
             await pilot.pause()
-            _highlight(app, "menu")                                      # 구성 작업 줄이 아니면 안내만
+            _highlight(app, "gd")                                        # 구성 작업 줄이 아니면 안내만
             await pilot.press("ctrl+x")
             await pilot.pause()
             assert _notified(app, "그룹에서 뺄 작업을") and store.job_meta()[2].group_id == group.id
@@ -2487,7 +2502,7 @@ def _two_bundles(store, repo):
     return a, b, t2, t3, cancel, session
 
 
-def test_한_채팅이_두_묶음에_걸치면_맨_위만_펼치고_나와_AI가_기호로_구분된다(env, repo):
+def test_한_채팅이_두_묶음에_걸치면_번호와_이름만_보이고_펼치면_나와_AI가_기호로_구분된다(env, repo):
     cfg = config.load()
     store = Store(cfg.db_path)
     a, b, t2, t3, cancel, session = _two_bundles(store, repo)
@@ -2498,12 +2513,17 @@ def test_한_채팅이_두_묶음에_걸치면_맨_위만_펼치고_나와_AI가
             await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
             ids, texts = _bundle_ids(app), _bundle_texts(app)
             assert str(_panel(app).border_title) == f"묶음 · #{b} 의 일 2개"
-            # 이 채팅의 가장 최근 차례가 든 묶음이 위에 펼쳐지고, 그 안에 다른 채팅(#1)의 차례도 섞여 있다
-            assert ids[0] == f"b:{cancel}" and ids.index(f"b:{session}") > ids.index(f"t:{a}:0")
+            # 기본은 부연 설명 없이 번호와 이름 한 줄씩: 이 채팅에서 다룬 순서대로 (가장 최근에 다룬 일이 아래)
+            assert ids == [f"b:{session}", f"b:{cancel}"]
+            assert texts[:2] == ["1. 세션", "2. 주문 취소"]
+            assert _panel(app).highlighted_option.id == f"b:{session}"
+
+            await _expand(pilot, app, cancel)                             # → 로 펼친 묶음에만 요약과 차례가 나온다
+            ids, texts = _bundle_ids(app), _bundle_texts(app)
+            assert ids[:2] == [f"b:{session}", f"b:{cancel}"] and texts[0] == "1. 세션"
+            # 펼친 묶음 안에는 다른 채팅(#1)의 차례도 섞여 있다
             assert [i for i in ids if i and i.startswith("t:")] == [f"t:{b}:{t3}", f"t:{b}:0", f"t:{a}:0"]
-            assert texts[0].startswith(f"▼ 주문 취소  · 차례 3 · 채팅 #{b} #{a}")
-            folded = texts[ids.index(f"b:{session}")]
-            assert folded.startswith("▶ 세션  · 차례 1") and "마지막: 세션 연장" in folded   # 접힌 묶음은 마지막 한 일
+            assert texts[1].startswith(f"▼ 2. 주문 취소  · 차례 3 · 채팅 #{b} #{a}")
             assert f"t:{b}:{t2}" not in ids
 
             turn = texts[ids.index(f"t:{b}:{t3}")].split("\n")
@@ -2523,8 +2543,9 @@ def test_한_채팅이_두_묶음에_걸치면_맨_위만_펼치고_나와_AI가
             assert ids[ids.index(f"t:{b}:{t3}") + 1] is None and texts[ids.index(f"t:{b}:{t3}") + 1] == ""
             assert _panel(app).highlighted_option.id == f"b:{cancel}"
 
-            await _to_key(pilot, app, str(a))                             # 다른 채팅에서도 같은 묶음이 보인다
+            await _to_key(pilot, app, str(a))                             # 다른 채팅에서도 같은 묶음이 보인다 (번호는 그 채팅 기준)
             assert _bundle_ids(app)[0] == f"b:{cancel}" and f"b:{session}" not in _bundle_ids(app)
+            assert _bundle_texts(app)[0].startswith("▼ 1. 주문 취소")
             assert "(다른 채팅)" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t3}")]
 
     try:
@@ -2545,6 +2566,10 @@ def test_다른_채팅의_차례에서_Enter는_그_채팅으로_이_채팅의_�
             panel = _panel(app)
             panel.focus()
             await pilot.pause()
+            _highlight(app, f"b:{cancel}")
+            await pilot.press("right")                                   # → : 묶음을 펼쳐야 차례 줄이 나온다
+            await pilot.pause()
+            assert f"t:{a}:0" in _bundle_ids(app) and panel.highlighted_option.id == f"b:{cancel}"
 
             _highlight(app, f"t:{a}:0")
             await pilot.press("enter")                                   # 다른 채팅의 차례: 그 채팅으로, 같은 차례에 커서
@@ -2569,7 +2594,7 @@ def test_다른_채팅의_차례에서_Enter는_그_채팅으로_이_채팅의_�
             await pilot.press("left")                                    # 한 번 더: 그 묶음을 접고 제목 줄로
             await pilot.pause()
             assert f"t:{b}:{t3}" not in _bundle_ids(app) and panel.highlighted_option.id == f"b:{cancel}"
-            assert _bundle_texts(app)[0].startswith("▶ 주문 취소")
+            assert _bundle_texts(app)[_bundle_ids(app).index(f"b:{cancel}")] == "2. 주문 취소"   # 접으면 다시 제목 한 줄
             _highlight(app, f"b:{session}")
             await pilot.press("right")                                   # → : 묶음을 펼친다
             await pilot.pause()
@@ -2614,6 +2639,8 @@ def test_패널에서_다른_프로젝트의_채팅_차례로_Enter하면_그_�
             assert app.scope == fe
             await _until(pilot, lambda: _keys(app) == [str(b), str(a)])
             await _to_key(pilot, app, str(a))
+            assert _bundle_ids(app)[0] == f"b:{bundle}" and _bundle_texts(app)[0] == "1. 주문 취소"
+            await _expand(pilot, app, bundle)
             assert [i for i in _bundle_ids(app) if i and i.startswith("t:")] == [f"t:{c}:0", f"t:{a}:0"]
             assert "(프로젝트 be)" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{c}:0")].split("\n")[0]
             panel = _panel(app)
@@ -2651,13 +2678,18 @@ def test_실행_중인_차례는_분류_중_임시_묶음이고_묶지_못한_�
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.selected_id == running.id)
             await _until(pilot, lambda: _bundle_ids(app)[:1] == [f"u:{running.id}:0"])
-            text = _bundle_texts(app)[0]
-            assert text.startswith('◌ 분류 중 · "배포 스크립트 고쳐 줘"')
-            assert "      ◆ AI ⟳ 실행 중" in text and "일하는 중 — coder 가 고치는 중" in text
+            assert _bundle_texts(app)[0] == '◌ 분류 중 · "배포 스크립트 고쳐 줘"'       # 기본은 한 줄
             assert any(t.startswith("  ⏳ 대기: 버튼 색도 바꿔 줘") for t in _bundle_texts(app))
+            _panel(app).focus()
+            await pilot.pause()
+            await pilot.press("enter")                                 # 펼치면 지금 하는 일이 보인다
+            await pilot.pause()
+            text = _bundle_texts(app)[0]
+            assert text.startswith('◌ 분류 중 · "배포 스크립트 고쳐 줘"\n')
+            assert "      ◆ AI ⟳ 실행 중" in text and "일하는 중 — coder 가 고치는 중" in text
 
             await _to_key(pilot, app, str(failed))
-            assert _bundle_texts(app)[0].startswith('◌ 묶지 못함 · "묶기에 실패한 채팅"  · #1 1번째\n  Ctrl+B → 안 묶인 차례 묶기\n')
+            assert _bundle_texts(app)[0] == '◌ 묶지 못함 · "묶기에 실패한 채팅"\n  Ctrl+B → 안 묶인 차례 묶기'
 
     try:
         _run(scenario())
@@ -2686,7 +2718,7 @@ def test_주기_갱신_뒤에도_펼침과_하이라이트가_유지되고_바�
             await pilot.pause(2.5)                                    # 1초 새로고침을 두 번 넘게 지나도
             assert panel._options == drawn and panel.highlighted_option.id == f"t:{b}:{t2}"   # 다시 그리지 않는다
             store.rename_bundle(cancel, "주문 취소 흐름")              # 다른 터미널이 바꿨다: 다시 그려도 상태는 그대로
-            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 주문 취소 흐름"))
+            await _until(pilot, lambda: "2. 주문 취소 흐름" in _bundle_texts(app))   # 펼치지 않은 묶음은 제목 한 줄
             assert panel.highlighted_option.id == f"t:{b}:{t2}" and f"t:{b}:{t2}" in app._panel_parent
             assert "세션 연장" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{b}:{t2}")]
             assert (b, t2) in app._turn_open and app._bundle_open[session]
@@ -2797,25 +2829,28 @@ def test_차례가_많은_묶음은_최근_6개와_이_채팅의_3개만_보이�
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: _keys(app) == [str(busy), str(mine)])
             await _to_key(pilot, app, str(mine))
+            assert _bundle_ids(app) == [f"b:{bundle}"] and _bundle_texts(app)[0] == "1. 큰 일"   # 차례가 많아도 한 줄
+            await _expand(pilot, app, bundle)
             ids = _bundle_ids(app)
             shown = [i for i in ids if i and i.startswith("t:")]
-            assert len(shown) == 9                                     # 묶음 전체의 최근 6 + 이 채팅의 3
+            assert len(shown) == 9                                     # 펼치면 묶음 전체의 최근 6 + 이 채팅의 3
             assert sum(i.startswith(f"t:{mine}:") for i in shown) == 3
-            assert _bundle_texts(app)[0].startswith("▼ 큰 일  · 차례 105 · 채팅 #2 #1")
+            assert _bundle_texts(app)[0].startswith("▼ 1. 큰 일  · 차례 105 · 채팅 #2 #1")
             assert _bundle_texts(app)[ids.index(f"more:{bundle}")] == "  … 이전 차례 96개 — Enter 로 전체 보기"
             panel = _panel(app)
             panel.focus()
             await pilot.pause()
-            await pilot.press("end")                                   # 마지막 줄(메뉴)까지 잘리지 않고 닿는다
+            await pilot.press("end")                                   # 마지막 줄까지 잘리지 않고 닿는다
             await pilot.pause()
-            assert panel.highlighted_option.id == "menu" and panel.scroll_y == panel.max_scroll_y > 0
+            # 고를 수 있는 마지막 줄 아래에는 빈 줄 하나뿐이다
+            assert panel.highlighted_option.id == f"more:{bundle}" and panel.scroll_y >= panel.max_scroll_y - 1 > 0
             await pilot.press("home")
             _highlight(app, f"t:{mine}:{mine_turns[2]}")
             await pilot.pause()
             before = panel.scroll_y
             assert before > 0
             store.rename_bundle(bundle, "아주 큰 일")                  # 다시 그려도 보던 자리 그대로 (맨 위로 튀지 않는다)
-            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 아주 큰 일"))
+            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 1. 아주 큰 일"))
             assert panel.scroll_y == before and panel.highlighted_option.id == f"t:{mine}:{mine_turns[2]}"
 
     try:
@@ -3077,6 +3112,7 @@ def test_ctrl_b_메뉴로_차례를_옮기고_채팅의_차례를_모두_옮기�
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
             await _until(pilot, lambda: app.selected_id == b and f"b:{session}" in _bundle_ids(app))
+            _highlight(app, f"b:{cancel}")
             await pilot.press("ctrl+b")                               # 하이라이트가 제목 줄이면: 마지막 끝난 차례, 그 묶음
             await pilot.pause()
             menu = _menu_ids(app)
@@ -3088,6 +3124,7 @@ def test_ctrl_b_메뉴로_차례를_옮기고_채팅의_차례를_모두_옮기�
             await pilot.press("escape")
             await pilot.pause()
 
+            await _expand(pilot, app, cancel)                         # 차례 줄은 펼친 묶음에만 있다
             _highlight(app, f"t:{b}:0")                               # 하이라이트한 차례를 옮긴다
             await pilot.press("ctrl+b")
             await pilot.pause()
@@ -3117,8 +3154,7 @@ def test_ctrl_b_메뉴로_차례를_옮기고_채팅의_차례를_모두_옮기�
             await pilot.pause()
             new = store.turn_links()[(b, 0)].bundle_id
             assert new not in (cancel, session) and store.bundle(new).manual_name
-            await _until(pilot, lambda: any(t.startswith("▶ 환불 [계산]") or t.startswith("▼ 환불 [계산]")
-                                            for t in _bundle_texts(app)))   # 사람이 만든 묶음도 혼자 보인다
+            await _until(pilot, lambda: any(t.startswith("▼ 1. 환불 [계산]") for t in _bundle_texts(app)))   # 옮긴 곳은 펼쳐 보인다 (대괄호 그대로)
 
             await pilot.press("ctrl+b")                               # 이 채팅의 차례를 모두 한 묶음으로
             await pilot.pause()
@@ -3139,7 +3175,7 @@ def test_ctrl_b_메뉴로_차례를_옮기고_채팅의_차례를_모두_옮기�
             await pilot.press("enter")
             await pilot.pause()
             assert (store.bundle(cancel).name, store.bundle(cancel).manual_name) == ("주문 [취소]", True)
-            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 주문 [취소]"))
+            await _until(pilot, lambda: _bundle_texts(app)[0].startswith("▼ 1. 주문 [취소]"))
 
             await pilot.press("ctrl+b")                               # 묶음 전체 보기
             await pilot.pause()
@@ -3203,8 +3239,10 @@ def test_작업_목록과_패널의_방향키_ctrl_e_ctrl_x는_묶음을_바꾸�
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: "t:1:0" in _bundle_ids(app))
+            await _until(pilot, lambda: f"b:{bundle}" in _bundle_ids(app))
+            await _expand(pilot, app, bundle)
             await _to_key(pilot, app, "2")
+            assert "t:1:0" in _bundle_ids(app)
             drawn = list(_panel(app)._options)
             for key in ("ctrl+e", "ctrl+x", "left", "right"):          # 작업 목록: 묶음 키가 없다
                 await pilot.press(key)
@@ -3267,6 +3305,8 @@ def test_다른_터미널이_분류하면_다음_tick에_패널이_갱신되고_
             _bind(store, 2, 0, bundle)
             await _until(pilot, lambda: f"b:{bundle}" in _bundle_ids(app))
             assert _panel(app).highlighted_option.id == "m:1" and "u:3:0" not in _bundle_ids(app)
+            assert _bundle_texts(app)[_bundle_ids(app).index(f"b:{bundle}")] == "1. 주문"   # 새 묶음도 제목 한 줄
+            await _expand(pilot, app, bundle)
             assert "셋째에서 한 일" in _bundle_texts(app)[_bundle_ids(app).index("t:3:0")]
             assert "t:2:0" in _bundle_ids(app)
 
@@ -3289,7 +3329,8 @@ def test_옛_버전이_채팅_단위로_묶은_것은_화면이_차례_단위로
     async def scenario():
         app = ColidayApp(cfg, store, default_dir=str(repo))
         async with app.run_test(size=(160, 45)) as pilot:
-            await _until(pilot, lambda: app.selected_id == b and any(t.startswith("▼ 옛 묶음") for t in _bundle_texts(app)))
+            await _until(pilot, lambda: app.selected_id == b and "1. 옛 묶음" in _bundle_texts(app))
+            await _expand(pilot, app, store.turn_links([b])[(b, 0)].bundle_id)
             assert [i for i in _bundle_ids(app) if i and i.startswith("t:")] == [f"t:{b}:0", f"t:{a}:0"]
             assert "하나에서 한 일" in _bundle_texts(app)[_bundle_ids(app).index(f"t:{a}:0")]
             assert store._conn.execute("SELECT COUNT(*) FROM job_topics").fetchone()[0] == 2   # 옛 표는 그대로
