@@ -1350,7 +1350,7 @@ def test_codex_팀장과_그_팀원도_env를_읽지_못하게_막는다(env, re
     profile = next(a for a in lead["argv"] if a.startswith("permissions.coliday.filesystem="))
     assert 'default_permissions="coliday"' in lead["argv"] and not any("sandbox_mode" in a for a in lead["argv"])
     assert '":project_roots"={"."="write","**/.env*"="none"}' in profile
-    assert f'"{members.rpc_dir(1).resolve()}"="write"' in profile             # 팀원에게 맡기는 요청 폴더는 쓸 수 있어야 한다
+    assert f'"{members.rpc_dir(env / "home", 1).resolve()}"="write"' in profile             # 팀원에게 맡기는 요청 폴더는 쓸 수 있어야 한다
     argv, _ = json.loads((env / "args.json").read_text())["argv"], None      # Claude 팀원(coder)
     assert _settings(argv)["sandbox"]["enabled"] is True
 
@@ -1441,6 +1441,7 @@ def test_리뷰_반복_상한은_팀장_지시문을_고쳐_써도_늘_한_번�
                  team.codex_lead_prompt({}, "coliday _agent 1", template=custom)):
         assert lead.count("## 리뷰 반복 상한") == 1 and "옛 규칙" not in lead
         assert f"최대 {team.MAX_REVIEW_ROUNDS}차례" in lead and "남은 문제" in lead and "차단 문제 남음" in lead
+        assert "검증 담당이 아직 돌고 있어도 기다리지 말고 바로 재작업을 맡긴다" in lead
         assert lead.count("## 실패한 작업 정리") == 1
 
 
@@ -2213,3 +2214,11 @@ def test_codex_팀장의_리뷰_호출도_상한을_넘으면_막는다(env, rep
     assert "리뷰 반복 상한" in reports[-1]
     assert sum(e.kind == "dispatch" and e.message.startswith("reviewer에게") for e in events) == limit
     assert any(e.message.startswith(f"리뷰 반복 상한({limit}번)") for e in events)
+
+
+def test_팀원_요청_폴더는_coliday_홈마다_다르다(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    assert members.rpc_dir(a, 1) != members.rpc_dir(b, 1)          # 홈이 다르면 같은 작업 번호라도 겹치지 않는다
+    assert members.rpc_dir(a, 1) == members.rpc_dir(tmp_path / "x" / ".." / "a", 1)  # 같은 홈은 같은 폴더
+    assert members.rpc_dir(a, 1) != members.rpc_dir(a, 2)
+    assert str(members.rpc_dir(a, 1)) in members.agent_command(a, 1)

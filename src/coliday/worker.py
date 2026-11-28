@@ -154,7 +154,7 @@ def _run_turn(cfg: Config, store: Store, job_id: int) -> int | None:
         )
         cmd = build_codex_command(cfg, job.model, resume, server.directory, artifacts, env_guard, network=host is not None)
         lead = team.codex_lead_prompt(
-            resolved, members.agent_command(job_id), cfg.max_attempts, artifacts, custom.lead_prompt
+            resolved, members.agent_command(cfg.home, job_id), cfg.max_attempts, artifacts, custom.lead_prompt
         ) + env_rule + server_note
         prompt = f"{lead}\n# 사용자 요청\n{prompt}"
         translator = CodexTranslator(hide=members.MARKER)

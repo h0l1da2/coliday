@@ -12,6 +12,7 @@ Claude 팀장은 Claude Code 의 서브에이전트 도구로 팀원을 부르�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -33,13 +34,18 @@ _POLL_SEC = 0.3
 MARKER = "coliday _agent"  # 팀장의 분배 명령을 타임라인에서 숨길 때 찾는 문자열
 
 
-def rpc_dir(job_id: int) -> Path:
-    """작업별 요청·응답 폴더. 임시 디렉토리 아래라 Codex 샌드박스 안에서도 쓸 수 있다."""
-    return Path(tempfile.gettempdir()) / f"coliday-rpc-{os.getuid()}-{job_id}"
+def rpc_dir(home: Path, job_id: int) -> Path:
+    """작업별 요청·응답 폴더. 임시 디렉토리 아래라 Codex 샌드박스 안에서도 쓸 수 있다.
+
+    작업 번호는 coliday 홈(COLIDAY_HOME)마다 1 부터 매겨진다. 이름에 홈 경로의 해시를 넣지 않으면
+    홈이 다른 두 실행(동시에 돈 두 테스트 묶음 등)이 같은 폴더를 써서 서로의 요청을 가져가고 멈춘다.
+    """
+    tag = hashlib.sha256(str(Path(home).resolve()).encode("utf-8")).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / f"coliday-rpc-{os.getuid()}-{tag}-{job_id}"
 
 
-def agent_command(job_id: int) -> str:
-    return f"{sys.executable} -m {MARKER} {rpc_dir(job_id)}"
+def agent_command(home: Path, job_id: int) -> str:
+    return f"{sys.executable} -m {MARKER} {rpc_dir(home, job_id)}"
 
 
 # ── 팀장 쪽 (샌드박스 안에서 실행되는 클라이언트) ──────────────────────────
@@ -76,7 +82,7 @@ class Server:
         self.guard = guard  # 있으면 팀원도 .env 를 읽지 못한다
         self.cwd = cwd or job.workdir  # 팀원이 실행되는 폴더 (서버의 프로젝트면 이 컴퓨터의 작업 폴더)
         self.helpers = list(helpers)  # 서버의 프로젝트를 다루는 실행 파일 (있으면 서버 작업이다)
-        self.directory = rpc_dir(job.id)
+        self.directory = rpc_dir(cfg.home, job.id)
         self.cost_usd = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
